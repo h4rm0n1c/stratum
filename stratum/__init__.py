@@ -1,5 +1,7 @@
 """Stratum — multi-GPU layer-parallel training."""
 
+import importlib
+
 from stratum.assign import assign_layers_to_devices
 from stratum.stage import DeviceStage
 from stratum.pipeline import StratumPipeline
@@ -10,9 +12,19 @@ from stratum.model.registry import build_pipeline
 from stratum.upload import prepare_nf4, upload_stream, NF4Stats, estimate_module_upload_gib
 from stratum.nf4_linear import NF4Linear
 
-# Import model architectures so their @register decorators fire
-import stratum.model.lfm25  # noqa: F401 — registers "lfm25-8b-a1b"
-import stratum.model.qwen35  # noqa: F401 — registers "qwen3.5"
+
+def _register_builtin_architectures() -> None:
+    """Import built-in adapters when their optional model deps are installed."""
+    for module_name in ("stratum.model.lfm25", "stratum.model.qwen35"):
+        try:
+            importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("transformers"):
+                continue
+            raise
+
+
+_register_builtin_architectures()
 
 __all__ = [
     "assign_layers_to_devices",
@@ -23,5 +35,9 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "build_pipeline",
-    "upload_to_device",
+    "prepare_nf4",
+    "upload_stream",
+    "NF4Stats",
+    "estimate_module_upload_gib",
+    "NF4Linear",
 ]

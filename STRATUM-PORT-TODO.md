@@ -401,9 +401,9 @@ Current Stratum registers only `lfm25-8b-a1b` and `qwen3.5`.
 These came from the audit and are not RoundPipe feature gaps, but they affect
 parity quality.
 
-- [ ] Fix `stratum/__init__.py` exporting `"upload_to_device"` even though no
+- [x] Fix `stratum/__init__.py` exporting `"upload_to_device"` even though no
   such symbol is imported.
-- [ ] Validate `HostStagingPool.transfer()` destination-stream ordering. It
+- [x] Validate `HostStagingPool.transfer()` destination-stream ordering. It
   currently launches H2D on a side stream and returns without an explicit wait
   by the default compute stream.
 - [ ] Verify Qwen35 prefix/mask behavior against RoundPipe Qwen3: RoundPipe
@@ -413,7 +413,7 @@ parity quality.
   parameter objects, but prefix/postfix are deep copies. This is intentional
   for frozen weights, but any future trainable prefix/postfix params would need
   explicit handling.
-- [ ] Add lightweight unit tests for `assign_layers_to_devices`, NF4 payload
+- [~] Add lightweight unit tests for `assign_layers_to_devices`, NF4 payload
   lifecycle, checkpoint metadata, and microbatch loss normalization. Current
   validation is mostly GPU smoke scripts.
 
