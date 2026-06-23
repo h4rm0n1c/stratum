@@ -338,7 +338,7 @@ Current Stratum uses PyTorch checkpointing in some wrappers, but lacks a
 generic recompute context and Qwen35 does not implement decoder-layer
 checkpointing at all.
 
-- [ ] Add Qwen35 `checkpoint_decoder_layer` support matching LFM25.
+- [x] Add Qwen35 `checkpoint_decoder_layer` support matching LFM25.
 - [A] Add a lightweight Stratum recompute context for non-grad per-layer data
   such as causal masks, RoPE tensors, router token counts, and MoE metadata.
 - [A] Preserve RNG state explicitly for any custom recompute path that is not

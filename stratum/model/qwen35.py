@@ -142,22 +142,46 @@ class Qwen35ForCausalLMPrefix(nn.Module):
 
 
 class Qwen35ForCausalLMWrappedLayer(nn.Module):
-    """One decoder layer wrapper."""
+    """One decoder layer wrapper with optional checkpointing."""
 
-    def __init__(self, layer, *, idx: int, use_flash_attention: bool = False):
+    def __init__(
+        self,
+        layer,
+        *,
+        idx: int,
+        checkpoint_decoder_layer: bool = False,
+        use_flash_attention: bool = False,
+    ):
         super().__init__()
         self.layer = layer
         self.idx = idx
+        self.checkpoint_decoder_layer = checkpoint_decoder_layer
         self.use_flash_attention = use_flash_attention
 
     def forward(self, input_data):
         hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, _lk = input_data
         attn_mask = causal_mask.get("full_attention", causal_mask.get("linear_attention"))
-        hidden = self.layer(
-            hidden, attention_mask=attn_mask, position_ids=pos_ids,
-            past_key_value=None, use_cache=False, cache_position=None,
-            position_embeddings=pos_embeds,
-        )
+
+        layer_kwargs = dict(kwargs)
+        layer_kwargs.pop("return_logits", None)
+
+        def run_layer(hs):
+            return self.layer(
+                hs,
+                attention_mask=attn_mask,
+                position_ids=pos_ids,
+                past_key_value=None,
+                use_cache=False,
+                cache_position=None,
+                position_embeddings=pos_embeds,
+                **layer_kwargs,
+            )
+
+        if self.checkpoint_decoder_layer and self.training:
+            hidden = checkpoint(run_layer, hidden, use_reentrant=False)
+        else:
+            hidden = run_layer(hidden)
+
         if isinstance(hidden, tuple):
             hidden = hidden[0]
         return (hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, 0)
@@ -269,8 +293,13 @@ class Qwen35Arch(ModelArch):
     def build_prefix(self, model, **kwargs):
         return Qwen35ForCausalLMPrefix(model)
 
-    def build_wrapped_layer(self, layer, idx):
-        return Qwen35ForCausalLMWrappedLayer(layer, idx=idx, use_flash_attention=True)
+    def build_wrapped_layer(self, layer, idx, **kwargs):
+        return Qwen35ForCausalLMWrappedLayer(
+            layer,
+            idx=idx,
+            checkpoint_decoder_layer=kwargs.get("checkpoint_decoder_layer", False),
+            use_flash_attention=True,
+        )
 
     def build_postfix(self, model, **kwargs):
         return Qwen35ForCausalLMPostfix(
