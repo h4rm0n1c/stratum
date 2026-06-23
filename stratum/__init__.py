@@ -16,6 +16,13 @@ from stratum.batch import (
 )
 from stratum.planner import estimate_module_bytes, split_layers_by_memory_limit
 from stratum.timing import TimingRecorder
+from stratum.transfer import (
+    PinnedUpload,
+    RegisterBackwardEvent,
+    TransferResult,
+    async_d2h,
+    async_h2d,
+)
 from stratum.model.registry import build_pipeline
 from stratum.upload import prepare_nf4, upload_stream, NF4Stats, estimate_module_upload_gib
 from stratum.nf4_linear import NF4Linear
@@ -49,6 +56,11 @@ __all__ = [
     "estimate_module_bytes",
     "split_layers_by_memory_limit",
     "TimingRecorder",
+    "PinnedUpload",
+    "RegisterBackwardEvent",
+    "TransferResult",
+    "async_d2h",
+    "async_h2d",
     "build_pipeline",
     "prepare_nf4",
     "upload_stream",

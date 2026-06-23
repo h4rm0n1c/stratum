@@ -219,7 +219,7 @@ There is no current race in synchronous `ensure_weights() -> forward`, but
 the event-guarding capability becomes necessary once Stratum overlaps stage
 weight upload, activation movement, or optimizer copies.
 
-- [A] Keep a Stratum-local equivalent ready for any async stage prefetch or
+- [x] Keep a Stratum-local equivalent ready for any async stage prefetch or
   async host-staged activation path.
 - [/] Do not add it to the current synchronous weight path; there is no event
   to guard today.
@@ -237,9 +237,9 @@ Core of RoundPipe's overlapping strategy.
 stream ordering, event return values, reusable async H2D/D2H helpers, and
 explicit pinned fallback for pageable tensors.
 
-- [A] Extend `HostStagingPool.transfer()` to synchronize destination stream
+- [x] Extend `HostStagingPool.transfer()` to synchronize destination stream
   correctness explicitly or return an event that callers must wait on.
-- [A] Implement generic `async_h2d` / `async_d2h` helpers for Stratum internal
+- [x] Implement generic `async_h2d` / `async_d2h` helpers for Stratum internal
   tensors, using pinned fallback and stream/event ordering.
 - [A] Use these helpers for boundary hidden-state transfers and future
   activation offload.
@@ -446,8 +446,8 @@ Recommended order for reaching practical parity:
 | 11. PinnedUpload | **ADAPT** | Useful for activation/offload transfer paths, not current sync NF4 upload |
 | 12. pin_model | **PORTED** | --pin-model {alloc,register,off}, both strategies in stratum/memory.py |
 | 13. Chunked upload | **ADAPT** | Needed for non-NF4 and no-NF4 large tensors, not every NF4 payload |
-| 14. RegisterBackwardEvent | **ADAPT** | Needed when Stratum adds async prefetch/offload; not current sync path |
-| 15. async_d2h/h2d | **ADAPT** | HostStagingPool covers part of it but lacks generic helpers and full event semantics |
+| 14. RegisterBackwardEvent | **UTILITY PORTED / ADAPT** | Helper exists for future async prefetch/offload; not current sync path |
+| 15. async_d2h/h2d | **UTILITY PORTED / ADAPT** | HostStagingPool covers boundary transfers; generic helpers now exist but are not runtime-wired |
 | 16. upload_layers/download_layer | **ADAPT** | ensure/free covers frozen NF4 only; grad/offload/buffer behavior still missing |
 | 17. ModelExecutePlan | **PARTIAL / ADAPT** | Stage memory splitting is ported; timing-fed placement remains |
 | 20. Batch API | **PARTIAL / ADAPT** | Fixed training tensors use token-weighted helpers; generic pytrees remain |

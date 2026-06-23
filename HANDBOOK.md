@@ -76,13 +76,13 @@ useful capability should be adapted where it helps Stratum:
 |---|---|---|---|
 | `upload_layers()` | Copies layers to GPU with chunked async upload | `ensure_weights()` + `free_weights()` handle frozen NF4 only | Add optional prefetch/chunked non-NF4 upload |
 | `download_layer()` | Async gradient D2H after backward | Grads stay on GPU for `PerDeviceOptimizer` | Add optional CPU/offloaded LoRA optimizer path |
-| `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | NF4 payloads already pinned; sync upload path | Reuse for host-staged activation/offload transfers |
-| `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | No current race in sync weight path | Add when async prefetch/offload exists |
+| `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | `stratum.transfer.PinnedUpload` exists; sync NF4 path does not need it | Wire into host-staged activation/offload transfers only when those paths become async |
+| `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | `stratum.transfer.RegisterBackwardEvent` exists; no current race in sync weight path | Use when async prefetch/offload introduces upload→backward ordering hazards |
 | `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` plus optional stage memory splitting; timing JSONL is available | Feed timing into automatic placement |
 | `DeviceManager` | Per-device stream management (upstream/downstream/compute) | `HostStagingPool` covers boundary transfers only | Add explicit stream/event semantics for async paths |
 | `ParamAttribute` / `LayerAttribute` | Per-param upload/grad state tracking | `roundpipe_nf4_payload` attr tracks frozen NF4 | Add richer state only for async/offloaded modes |
 | `pin_module_alloc` / `pin_module_register` | CPU memory pinning strategies | **PORTED** to `stratum/memory.py` | Same |
-| `async_d2h` / `async_h2d` | Async host-device with event sync | `HostStagingPool` covers part of the data path | Add generic helpers with event fencing |
+| `async_d2h` / `async_h2d` | Async host-device with event sync | `HostStagingPool` plus `stratum.transfer` generic helpers cover this utility layer | Reuse helpers for future async boundary/offload paths |
 | `batch.py` | Pytree microbatch split/merge/reduce | Fixed training tensors use token-weighted helpers | Add generic split specs if future wrappers need them |
 
 ### Why some things are different
