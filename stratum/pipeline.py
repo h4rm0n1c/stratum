@@ -9,6 +9,7 @@ from stratum.assign import assign_layers_to_devices
 from stratum.stage import DeviceStage
 from stratum.host_staging import HostStagingPool
 from stratum.grad_hooks import make_boundary_hook
+from stratum.upload import ensure_weights, free_weights
 from stratum.utils import log_event
 
 
@@ -80,6 +81,9 @@ class StratumPipeline(nn.Module):
         pool_idx = 0
         prev_device = 0
 
+        # Stream prefix weights to device 0 (embed_tokens)
+        ensure_weights(self.prefix, 0)
+
         for stage in self.stages:
             next_device = stage.device_id
 
@@ -128,12 +132,16 @@ class StratumPipeline(nn.Module):
 
                 pool_idx += 1
 
-            # Run this stage's layers — they consume and return the full tuple
+            # Stream this stage's weights from NF4 to FP16 on its device,
+            # run forward, then keep FP16 alive for backward's checkpoint recompute.
+            # free_weights() is called by the training script after loss.backward().
+            ensure_weights(stage, stage.device_id)
             tuple_data = stage(tuple_data)
             prev_device = next_device
 
-        # Postfix on last device — consumes the tuple, returns loss
+        # Stream postfix weights (lm_head), then compute loss
         last_device = self.stages[-1].device_id if self.stages else 0
+        ensure_weights(self.postfix, last_device)
 
         # Ensure hidden state is on the correct device for postfix
         if tuple_data[0].device.index != last_device:
@@ -142,6 +150,12 @@ class StratumPipeline(nn.Module):
 
         output = self.postfix(tuple_data)
         return output
+
+    def free_all_weights(self) -> None:
+        """Free FP16 weight data for all stages. Call after backward()."""
+        for stage in self.stages:
+            free_weights(stage)
+        free_weights(self.postfix)
 
     def save_pretrained(self, out_dir):
         """Save LoRA adapter weights only (trainable params per device).

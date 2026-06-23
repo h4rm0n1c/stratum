@@ -148,27 +148,20 @@ def upload_stream(
                 blocksize=64, quant_type="nf4", dtype=dtype,
             )
 
-            # Find the parent module (the nn.Linear holding this weight)
+            # Find the parent module
             parts = name.split(".")
-            # parts[-1] is "weight" — parent is the Linear
-            # For PEFT: ["...", "base_layer", "weight"] → replace base_layer
-            # For non-PEFT: ["...", "q_proj", "weight"] → replace q_proj
-            parent_path = parts[:-1]  # path to the Linear module
-            parent_attr = parent_path[-1]  # attribute name of Linear
+            parent_path = parts[:-1]
+            parent_attr = parent_path[-1]
             grandparent_path = parts[:-2]
             grandparent = module
             for p in grandparent_path:
                 grandparent = getattr(grandparent, p)
+            parent_mod = getattr(grandparent, parent_attr)
 
-            # Get the bias if it exists
-            bias = None
-            linear = getattr(grandparent, parent_attr)
-            if hasattr(linear, "bias") and linear.bias is not None:
-                bias = linear.bias.to(device, non_blocking=False)
-
-            # Replace with NF4Linear (4-bit on GPU, JIT dequant)
-            nf4_linear = NF4Linear(q_gpu, q_state, bias)
-            setattr(grandparent, parent_attr, nf4_linear)
+            # Dequant NF4 to FP16 on GPU (same as RoundPipe's upload_layers_nf4)
+            from bitsandbytes.functional import dequantize_4bit
+            weight = dequantize_4bit(q_gpu, q_state).contiguous()
+            param.data = weight
             tensors += 1
 
             if verbose:
@@ -187,4 +180,53 @@ def upload_stream(
     log_event("upload_stream", device=device_id, tensors=tensors, seconds=round(dt, 1))
     if verbose:
         print(f"  device {device_id}: {tensors} tensors in {dt:.1f}s", flush=True)
+    return tensors
+
+
+@torch.no_grad()
+def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
+    """Upload NF4 payloads to GPU and dequant to FP16 for all params in *module*.
+
+    Opposite of free_weights(). Called before a stage's forward pass.
+    Only affects params that still have NF4 payload attached and empty data.
+    """
+    from bitsandbytes.functional import dequantize_4bit
+
+    device = torch.device(f"cuda:{device_id}")
+    tensors = 0
+    for name, param in module.named_parameters():
+        if param.data.numel() > 0:
+            continue  # already has FP16 data
+        payload = getattr(param, NF4_ATTR, None)
+        if payload is None:
+            continue
+        quantized_cpu, absmax_cpu, code_cpu, shape, dtype, _ = payload
+        q_gpu = quantized_cpu.to(device, non_blocking=False)
+        a_gpu = absmax_cpu.to(device, non_blocking=False)
+        c_gpu = code_cpu.to(device, non_blocking=False)
+        from bitsandbytes.functional import QuantState
+        q_state = QuantState(
+            absmax=a_gpu, shape=shape, code=c_gpu,
+            blocksize=64, quant_type="nf4", dtype=dtype,
+        )
+        param.data = dequantize_4bit(q_gpu, q_state).contiguous()
+        tensors += 1
+    return tensors
+
+
+@torch.no_grad()
+def free_weights(module: torch.nn.Module) -> int:
+    """Free FP16 weight data for NF4-eligible params in *module*.
+
+    Opposite of ensure_weights(). Called after a stage's backward pass.
+    Resets param.data to empty(0), keeping NF4 payload for next upload.
+    """
+    tensors = 0
+    for name, param in module.named_parameters():
+        if not hasattr(param, NF4_ATTR):
+            continue
+        if param.data.numel() == 0:
+            continue
+        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        tensors += 1
     return tensors

@@ -292,26 +292,36 @@ class LFM25ForCausalLMPostfix(nn.Module):
         if labels is not None and not kwargs.get("return_logits", False):
             shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss(reduction="mean")
 
-            # Chunked loss computation to avoid OOM on long sequences
-            # (>4K tokens cause 10+ GiB logits from lm_head).
+            # Count non-ignored tokens for normalization (same as
+            # RoundPipe's ChunkedCompileLinearForCausalLMLoss).
+            flat_labels = shift_labels.reshape(-1)
+            num_items = (flat_labels != -100).sum()
+            if num_items == 0:
+                return CausalLMOutputWithPast(
+                    loss=shift_hidden.new_zeros(()), logits=None
+                )
+
+            # Chunked loss: split into 4096-token chunks for lm_head
+            # to avoid OOM from full [seq_len, 124893] logits matrix.
+            # Uses reduction="sum" per chunk, normalizes by num_items
+            # (same pattern as RoundPipe's BlockedPostfixCausalLMLoss).
             chunk_size = 4096
             seq_len = shift_hidden.shape[1]
-            if seq_len <= chunk_size:
-                logits = self.lm_head(shift_hidden)
-                loss = loss_fct(logits.view(-1, self.vocab_size), shift_labels.view(-1))
-            else:
-                loss = None
-                n_chunks = 0
-                for start in range(0, seq_len, chunk_size):
-                    end = min(start + chunk_size, seq_len)
-                    chunk = self.lm_head(shift_hidden[:, start:end, :].contiguous())
-                    cl = loss_fct(chunk.reshape(-1, self.vocab_size),
-                                  shift_labels[:, start:end].contiguous().reshape(-1))
-                    loss = cl if loss is None else loss + cl
-                    n_chunks += 1
-                loss = loss / n_chunks
+            loss_sum = shift_hidden.new_zeros(())
+            for start in range(0, seq_len, chunk_size):
+                end = min(start + chunk_size, seq_len)
+                chunk_h = shift_hidden[:, start:end, :].contiguous()
+                chunk_l = shift_labels[:, start:end].contiguous()
+                logits = self.lm_head(chunk_h)
+                cl = nn.functional.cross_entropy(
+                    logits.reshape(-1, self.vocab_size),
+                    chunk_l.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                loss_sum = loss_sum + cl
+            loss = loss_sum / num_items
 
         return CausalLMOutputWithPast(loss=loss, logits=None)
 

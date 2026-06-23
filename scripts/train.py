@@ -36,7 +36,7 @@ from peft import LoraConfig, get_peft_model
 from stratum import build_pipeline
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
-from stratum.utils import get_device_info
+from stratum.utils import get_device_info, gpu_memory_snapshot
 
 
 class PretokJsonlDataset(Dataset):
@@ -240,7 +240,11 @@ def main():
         total=args.steps, initial=start_step,
         desc="Training", unit="step",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        ncols=100,
     )
+
+    # Open log file for structured JSON logging
+    log_file = open(Path(args.out) / "training.jsonl", "w") if args.out else None
 
     for step in range(start_step + 1, args.steps + 1):
         batch = next(data_cycle)
@@ -250,10 +254,14 @@ def main():
         attention_mask = batch["attention_mask"].cuda(input_device)
         labels = batch["labels"].cuda(input_device)
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         optimizer.zero_grad()
 
         # Microbatching: split batch into microbatches, accumulate gradients
         nmb = max(1, args.num_microbatch)
+        loss = None
         if nmb > 1 and input_ids.shape[0] >= nmb:
             mb_size = max(1, input_ids.shape[0] // nmb)
             for i in range(0, input_ids.shape[0], mb_size):
@@ -263,28 +271,59 @@ def main():
                 mb_labels = labels[i:mb_end].contiguous()
                 mb_out = pipeline(mb_in, attention_mask=mb_attn, labels=mb_labels)
                 (mb_out.loss / nmb).backward()
+                if loss is None:
+                    loss = mb_out.loss.detach()
+                else:
+                    loss = loss + mb_out.loss.detach()
         else:
             output = pipeline(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = output.loss
+            loss = output.loss.detach()
             loss.backward()
 
         optimizer.step()
         optimizer.scheduler_step()
 
+        # Free streamed weights after backward
+        pipeline.free_all_weights()
+
         dt = time.time() - iter_t0
         total_tokens = int(attention_mask.sum().item())
         trainable_tokens = int((labels != -100).sum().item())
+        iter_loss = loss.item()
 
+        # Structured step log (same format as RoundPipe)
+        log_entry = {
+            "step": step,
+            "loss": round(iter_loss, 4),
+            "sec": round(dt, 2),
+            "tokens_total": total_tokens,
+            "tokens_trainable": trainable_tokens,
+            "tok_s": round(total_tokens / max(dt, 1e-9), 2),
+            "elapsed_min": round((time.time() - t0) / 60, 2),
+        }
+        for d in devices:
+            vs = gpu_memory_snapshot(d["id"])
+            if vs:
+                log_entry[f"gpu{d['id']}_used"] = round(vs["alloc"], 2)
+                log_entry[f"gpu{d['id']}_peak"] = round(vs.get("peak_alloc", 0), 2)
+
+        # Print to stdout every 10 steps (matching RoundPipe)
+        if step == 1 or step % 10 == 0:
+            print(json.dumps(log_entry), flush=True)
+
+        # Write to log file every step
+        if log_file:
+            log_file.write(json.dumps(log_entry) + "\n")
+            log_file.flush()
+
+        # tqdm progress bar
+        current_lr = list(optimizer.get_lr().values())[0] if optimizer.get_lr() else args.lr
         pbar.set_postfix({
-            "loss": f"{loss.item() if 'loss' in dir() else '?'}",
-            "tok_s": f"{total_tokens / max(dt, 1e-9):.0f}",
-            "tokens": total_tokens,
+            "loss": f"{iter_loss:.2f}",
+            "tok/s": f"{total_tokens/max(dt,1e-9):.0f}",
+            "lr": f"{current_lr:.2e}",
         })
         pbar.update(1)
-
-        # Log LR every 500 steps
-        if step % 500 == 0:
-            optimizer.log_lr(step)
 
         # Periodic save
         if args.save_every > 0 and step % args.save_every == 0:
@@ -295,6 +334,8 @@ def main():
     # Final save
     save_dir = Path(args.out) / "final"
     save_checkpoint(modules_by_device, optimizer, step, save_dir)
+    if log_file:
+        log_file.close()
     print(f"Training complete. Final model saved to {save_dir}", flush=True)
 
 

@@ -8,7 +8,8 @@ import torch.nn as nn
 from stratum.pipeline import StratumPipeline
 from stratum.assign import assign_layers_to_devices
 from stratum.stage import DeviceStage
-from stratum.upload import prepare_nf4, upload_stream
+from stratum.upload import prepare_nf4, upload_stream, ensure_weights, free_weights, NF4_ATTR
+from stratum.nf4_linear import NF4Linear
 
 
 class ModelArch:
@@ -101,11 +102,24 @@ class ModelArch:
                 prepare_nf4(stage, cache_dir=nf4_cache_dir, verbose=verbose)
             prepare_nf4(pipeline.postfix, cache_dir=nf4_cache_dir, verbose=verbose)
 
-        # Phase 2: Stream to GPUs (NF4 compressed, JIT dequant; or FP16 direct)
-        upload_stream(pipeline.prefix, device_ids[0], verbose=verbose)
-        for stage in stages:
-            upload_stream(stage, stage.device_id, verbose=verbose)
-        upload_stream(pipeline.postfix, last_device, verbose=verbose)
+        # Phase 2: Upload non-NF4 params (trainable, norms, biases) permanently.
+        # NF4-eligible frozen weights stay on CPU and are streamed per-step
+        # by ensure_weights()/free_weights() in the pipeline.
+        for name, param in pipeline.prefix.named_parameters():
+            if not hasattr(param, NF4_ATTR):
+                param.data = param.data.to(f"cuda:{device_ids[0]}", non_blocking=False)
+        for dev in set(s.device_id for s in stages):
+            for s in stages:
+                if s.device_id != dev:
+                    continue
+                for name, param in s.named_parameters():
+                    if not hasattr(param, NF4_ATTR):
+                        param.data = param.data.to(f"cuda:{dev}", non_blocking=False)
+                for buf in s.buffers():
+                    buf.data = buf.data.to(f"cuda:{dev}", non_blocking=False)
+        for name, param in pipeline.postfix.named_parameters():
+            if not hasattr(param, NF4_ATTR):
+                param.data = param.data.to(f"cuda:{last_device}", non_blocking=False)
 
         return pipeline
 

@@ -56,6 +56,31 @@ def has_peer_access(dev_a: int, dev_b: int) -> bool:
         return False
 
 
+def gpu_memory_snapshot(device_id: int | None = None) -> dict:
+    """Snapshot of GPU memory allocator state for one device.
+
+    Ported from RoundPipe's gpu_memory_snapshot().
+    """
+    if not torch.cuda.is_available():
+        return {}
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+    snap = {
+        "dev": device_id,
+        "alloc": round(torch.cuda.memory_allocated(device_id) / 1024**3, 3),
+        "reserved": round(torch.cuda.memory_reserved(device_id) / 1024**3, 3),
+        "peak_alloc": round(torch.cuda.max_memory_allocated(device_id) / 1024**3, 3),
+        "peak_reserved": round(torch.cuda.max_memory_reserved(device_id) / 1024**3, 3),
+    }
+    try:
+        free, total = torch.cuda.mem_get_info(device_id)
+        snap["free"] = round(free / 1024**3, 3)
+        snap["total"] = round(total / 1024**3, 3)
+    except RuntimeError:
+        pass
+    return snap
+
+
 def get_optimal_tensor_split(
     device_ids: list[int] | None = None,
 ) -> list[float]:

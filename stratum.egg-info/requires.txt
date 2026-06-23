@@ -1,7 +1,0 @@
-torch>=2.11
-bitsandbytes
-transformers
-peft
-tqdm
-py-cpuinfo
-ninja
