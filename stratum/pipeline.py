@@ -10,6 +10,7 @@ from stratum.stage import DeviceStage
 from stratum.host_staging import HostStagingPool
 from stratum.grad_hooks import make_boundary_hook
 from stratum.upload import ensure_weights, free_weights
+from stratum.timing import TimingRecorder
 from stratum.utils import log_event
 
 
@@ -32,6 +33,7 @@ class StratumPipeline(nn.Module):
         self.prefix = prefix
         self.stages = nn.ModuleList(stages)
         self.postfix = postfix
+        self.timing_recorder: Optional[TimingRecorder] = None
 
         # Build boundary transfer infrastructure
         self.boundary_pools: list[HostStagingPool] = []
@@ -58,6 +60,16 @@ class StratumPipeline(nn.Module):
         device_ids.add(0)  # prefix is on device 0
         return len(device_ids)
 
+    def set_timing_recorder(self, recorder: Optional[TimingRecorder]) -> None:
+        """Attach a timing recorder used by forward/free spans."""
+        self.timing_recorder = recorder
+
+    def _time(self, name: str, *, device_id: Optional[int] = None, **fields: Any):
+        if self.timing_recorder is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        return self.timing_recorder.span(name, device_id=device_id, **fields)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -66,13 +78,18 @@ class StratumPipeline(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward through all stages. Returns loss if labels provided."""
+        # Stream prefix weights to device 0 before embedding lookup.
+        with self._time("prefix_upload", device_id=0):
+            ensure_weights(self.prefix, 0)
+
         # Prefix on device 0 — returns the full 7-tuple
-        tuple_data = self.prefix(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            **kwargs,
-        )
+        with self._time("prefix_forward", device_id=0):
+            tuple_data = self.prefix(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
 
         if not isinstance(tuple_data, tuple):
             raise TypeError(f"prefix expected to return tuple, got {type(tuple_data)}")
@@ -80,9 +97,6 @@ class StratumPipeline(nn.Module):
         # Run each stage with boundary transfers
         pool_idx = 0
         prev_device = 0
-
-        # Stream prefix weights to device 0 (embed_tokens)
-        ensure_weights(self.prefix, 0)
 
         for stage in self.stages:
             next_device = stage.device_id
@@ -95,9 +109,17 @@ class StratumPipeline(nn.Module):
                           src=prev_device, dst=next_device,
                           hidden_shape=list(hidden.shape),
                           hidden_dtype=str(hidden.dtype))
-                hidden = pool.transfer(
-                    hidden, dst_device=next_device, src_device=prev_device,
-                )
+                with self._time(
+                    "boundary_transfer",
+                    device_id=next_device,
+                    src=prev_device,
+                    dst=next_device,
+                    shape=list(hidden.shape),
+                    dtype=str(hidden.dtype),
+                ):
+                    hidden = pool.transfer(
+                        hidden, dst_device=next_device, src_device=prev_device,
+                    )
 
                 # Move position_embeddings (tuple_data[3]) and position_ids
                 # (tuple_data[2]) to the new device — they were computed on
@@ -135,28 +157,51 @@ class StratumPipeline(nn.Module):
             # Stream this stage's weights from NF4 to FP16 on its device,
             # run forward, then keep FP16 alive for backward's checkpoint recompute.
             # free_weights() is called by the training script after loss.backward().
-            ensure_weights(stage, stage.device_id)
-            tuple_data = stage(tuple_data)
+            with self._time(
+                "stage_upload",
+                device_id=stage.device_id,
+                stage_device=stage.device_id,
+                layers=len(stage.layers),
+            ):
+                ensure_weights(stage, stage.device_id)
+            with self._time(
+                "stage_forward",
+                device_id=stage.device_id,
+                stage_device=stage.device_id,
+                layers=len(stage.layers),
+            ):
+                tuple_data = stage(tuple_data)
             prev_device = next_device
 
         # Stream postfix weights (lm_head), then compute loss
         last_device = self.stages[-1].device_id if self.stages else 0
-        ensure_weights(self.postfix, last_device)
+        with self._time("postfix_upload", device_id=last_device):
+            ensure_weights(self.postfix, last_device)
 
         # Ensure hidden state is on the correct device for postfix
-        if tuple_data[0].device.index != last_device:
+        if tuple_data[0].is_cuda and tuple_data[0].device.index != last_device:
             hidden = tuple_data[0].to(f"cuda:{last_device}")
             tuple_data = (hidden,) + tuple_data[1:]
 
-        output = self.postfix(tuple_data)
+        with self._time("postfix_forward", device_id=last_device):
+            output = self.postfix(tuple_data)
         return output
 
     def free_all_weights(self) -> None:
         """Free FP16 weight data for all stages. Call after backward()."""
-        free_weights(self.prefix)
+        with self._time("prefix_free", device_id=0):
+            free_weights(self.prefix)
         for stage in self.stages:
-            free_weights(stage)
-        free_weights(self.postfix)
+            with self._time(
+                "stage_free",
+                device_id=stage.device_id,
+                stage_device=stage.device_id,
+                layers=len(stage.layers),
+            ):
+                free_weights(stage)
+        last_device = self.stages[-1].device_id if self.stages else 0
+        with self._time("postfix_free", device_id=last_device):
+            free_weights(self.postfix)
 
     def save_pretrained(self, out_dir):
         """Save LoRA adapter weights only (trainable params per device).

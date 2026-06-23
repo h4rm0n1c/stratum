@@ -53,7 +53,7 @@ order.
 | Chunked lm_head loss | `ChunkedCompileLinearForCausalLMLoss` custom autograd | `ChunkedLinearCrossEntropyFunction` in postfix | Equivalent custom per-chunk backward |
 | Blocked postfix loss | `BlockedPostfixCausalLMLoss` (batch=1 only) | Same, ported to `blocked_loss.py` | Identical |
 | Microbatching | `num_microbatch` plus pytree split/merge hooks | Manual loop in `train.py` | Basic training path only |
-| Activation checkpointing | `checkpoint(run_layer, ...)` per decoder layer | LFM25 only | Qwen35 still missing |
+| Activation checkpointing | `checkpoint(run_layer, ...)` per decoder layer | LFM25 and Qwen35 | Identical for current adapters |
 | MLP checkpointing | `CheckpointedModule` | Same, in `mlp_opt.py` | Identical |
 | MLP token chunking | `TokenChunkedModule` | Same, in `mlp_opt.py` | Identical |
 | Memory-flat frozen MLP | `MemoryFlatFrozenMLP` custom autograd | Same, in `mlp_opt.py` | Identical |
@@ -78,7 +78,7 @@ useful capability should be adapted where it helps Stratum:
 | `download_layer()` | Async gradient D2H after backward | Grads stay on GPU for `PerDeviceOptimizer` | Add optional CPU/offloaded LoRA optimizer path |
 | `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | NF4 payloads already pinned; sync upload path | Reuse for host-staged activation/offload transfers |
 | `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | No current race in sync weight path | Add when async prefetch/offload exists |
-| `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` only places layers | Add Stratum stage-memory planner and timing feedback |
+| `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` places layers; timing JSONL is available | Add Stratum stage-memory planner |
 | `DeviceManager` | Per-device stream management (upstream/downstream/compute) | `HostStagingPool` covers boundary transfers only | Add explicit stream/event semantics for async paths |
 | `ParamAttribute` / `LayerAttribute` | Per-param upload/grad state tracking | `roundpipe_nf4_payload` attr tracks frozen NF4 | Add richer state only for async/offloaded modes |
 | `pin_module_alloc` / `pin_module_register` | CPU memory pinning strategies | **PORTED** to `stratum/memory.py` | Same |
@@ -430,6 +430,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--operator-telemetry-modules` | `input_layernorm,self_attn,post_attention_layernorm,mlp` | Module names for operator telemetry |
 | `--debug-finite` | False | Assert tensor values are finite |
 | `--cuda-memory-summary-on-exception` | False | Print CUDA memory summary on RuntimeError |
+| `--timing-jsonl` | `""` | Write pipeline timing spans to JSONL |
 | `--host-ram-limit-gib` | 0.0 | Abort when host RSS exceeds this (0 = disabled) |
 
 ## Known Quirks and Sharp Edges

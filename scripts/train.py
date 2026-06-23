@@ -36,7 +36,9 @@ from peft import LoraConfig, get_peft_model
 from stratum import build_pipeline
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
+from stratum.timing import TimingRecorder
 from stratum.utils import get_device_info, gpu_memory_snapshot
+from stratum.watchdog import mark_phase, mark_memory_phase
 
 
 class PretokJsonlDataset(Dataset):
@@ -161,6 +163,8 @@ def main():
                     help="Assert tensor values are finite after norm/loss/layer output")
     ap.add_argument("--cuda-memory-summary-on-exception", action="store_true",
                     help="Print CUDA memory summary when forward/backward raises RuntimeError")
+    ap.add_argument("--timing-jsonl", default="",
+                    help="Write pipeline timing spans to this JSONL file")
     # Memory watchdog
     ap.add_argument("--host-ram-limit-gib", type=float, default=0.0,
                     help="Abort when host RSS exceeds this many GiB (0 = disabled)")
@@ -307,6 +311,8 @@ def main():
         dense_attention_masks=args.dense_attention_masks,
         torch_compile_loss=args.torch_compile_loss,
     )
+    timing_recorder = TimingRecorder(args.timing_jsonl, enabled=bool(args.timing_jsonl))
+    pipeline.set_timing_recorder(timing_recorder if args.timing_jsonl else None)
 
     # Pin model memory for faster H2D (if enabled)
     if args.pin_model != "off":
@@ -355,7 +361,6 @@ def main():
         print(f"Memory watchdog: {args.host_ram_limit_gib} GiB limit", flush=True)
 
     # Phase marker (same as RoundPipe)
-    from stratum.watchdog import mark_phase, mark_memory_phase
     mark_phase("after_pipeline_build")
 
     # Load dataset
@@ -500,6 +505,7 @@ def main():
         tqdm.write("Skipping final save (--no-save)")
     if log_file:
         log_file.close()
+    timing_recorder.close()
     tqdm.write("Training complete")
 
 

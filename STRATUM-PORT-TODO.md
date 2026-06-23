@@ -373,11 +373,12 @@ then smooths estimates for scheduler decisions.
 Current Stratum logs step-level throughput and optional allocator telemetry,
 but it does not produce per-layer or per-stage timing estimates.
 
-- [A] Add `StageTimer` / `LayerTimer` instrumentation with CUDA events around
-  prefix, each wrapped layer, each stage, postfix, NF4 upload, and boundary
-  transfers.
-- [A] Emit timing to JSONL so long runs can tune tensor split and stage
-  memory limits empirically.
+- [x] Add `TimingRecorder` instrumentation with CUDA events around prefix,
+  stages, postfix, NF4 upload/free, and boundary transfers.
+- [x] Emit timing to JSONL via `--timing-jsonl` so long runs can tune tensor
+  split and stage memory limits empirically.
+- [A] Add per-layer wrapped-layer timing if stage-level timings are too coarse
+  for planner decisions.
 - [A] Feed timing into future automatic placement/stage planning.
 
 ## 24. Model Adapter Parity
@@ -425,7 +426,7 @@ Recommended order for reaching practical parity:
    stream wait, unit tests.
 2. [x] Port RoundPipe's custom chunked linear CE autograd behavior, because this
    directly affects long-context VRAM.
-3. Add Stratum timing instrumentation so later scheduler work is evidence-based.
+3. [x] Add Stratum timing instrumentation so later scheduler work is evidence-based.
 4. Add stage-memory-limit planning and intra-device sub-stages.
 5. Add generic microbatch split/reduce helpers.
 6. Add async transfer helpers and event fencing; then experiment with NF4
@@ -452,5 +453,5 @@ Recommended order for reaching practical parity:
 | 20. Batch API | **ADAPT** | Current fixed train loop lacks RoundPipe's pytree split/merge/reduce flexibility |
 | 21. Recompute context/RNG | **ADAPT** | Needed for Qwen checkpointing, MoE metadata, and mask/RoPE recompute avoidance |
 | 22. Optimizer stream/scaler | **ADAPT** | Optional CPU/offloaded optimizer has value; async step should come later |
-| 23. Timing/profiling | **ADAPT** | Needed to make scheduler decisions evidence-based |
+| 23. Timing/profiling | **PARTIAL / ADAPT** | TimingRecorder JSONL is ported; scheduler feedback remains |
 | 24. Model adapters | **PENDING** | Llama/Qwen3/MoE/GPT-OSS parity not present in Stratum |

@@ -284,22 +284,26 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
     Opposite of free_weights(). Called before a stage's forward pass.
     Only affects params that still have NF4 payload attached and empty data.
     """
-    from bitsandbytes.functional import dequantize_4bit
-
     device = torch.device(f"cuda:{device_id}")
     tensors = 0
+    dequantize_4bit = None
+    QuantState = None
     for name, param in module.named_parameters():
         if param.data.numel() > 0:
             continue  # already has FP16 data
         payload = getattr(param, NF4_ATTR, None)
         if payload is None:
             continue
+        if dequantize_4bit is None or QuantState is None:
+            from bitsandbytes.functional import QuantState as _QuantState
+            from bitsandbytes.functional import dequantize_4bit as _dequantize_4bit
+            QuantState = _QuantState
+            dequantize_4bit = _dequantize_4bit
         quantized_cpu, absmax_cpu, code_cpu = payload.quantized, payload.absmax, payload.code
         shape, dtype = payload.shape, payload.dtype
         q_gpu = quantized_cpu.to(device, non_blocking=False)
         a_gpu = absmax_cpu.to(device, non_blocking=False)
         c_gpu = code_cpu.to(device, non_blocking=False)
-        from bitsandbytes.functional import QuantState
         q_state = QuantState(
             absmax=a_gpu, shape=shape, code=c_gpu,
             blocksize=64, quant_type="nf4", dtype=dtype,
