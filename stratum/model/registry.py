@@ -47,6 +47,7 @@ class ModelArch:
         nf4_cache_dir: Optional[str] = None,
         checkpoint_decoder_layer: bool = False,
         stage_memory_limit_gib: float = 0.0,
+        prefetch_nf4: bool = False,
         verbose: bool = True,
     ) -> StratumPipeline:
         """Build a StratumPipeline from a HuggingFace model.
@@ -109,7 +110,7 @@ class ModelArch:
         last_device = stages[-1].device_id if stages else device_ids[0]
         postfix = self.build_postfix(core, **kwargs)
 
-        pipeline = StratumPipeline(prefix, stages, postfix)
+        pipeline = StratumPipeline(prefix, stages, postfix, prefetch_nf4=prefetch_nf4)
 
         # Phase 1: NF4 preparation (quantize frozen 2D weights, drop originals)
         if use_nf4:
@@ -171,6 +172,7 @@ def build_pipeline(
     mlp_token_chunk_size: int = 0,
     torch_compile_loss: bool = False,
     stage_memory_limit_gib: float = 0.0,
+    prefetch_nf4: bool = False,
     volta_layers: str = "",
     volta_window_left: int = -1,
     volta_window_right: int = 0,
@@ -196,6 +198,7 @@ def build_pipeline(
         mlp_token_chunk_size=mlp_token_chunk_size,
         torch_compile_loss=torch_compile_loss,
         stage_memory_limit_gib=stage_memory_limit_gib,
+        prefetch_nf4=prefetch_nf4,
         volta_layers=volta_layers,
         volta_window_left=volta_window_left,
         volta_window_right=volta_window_right,

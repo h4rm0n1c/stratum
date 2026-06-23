@@ -147,6 +147,8 @@ def main():
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
     ap.add_argument("--stratum-stage-memory-limit-gib", type=float, default=0.0,
                     help="Split per-device layer groups into substages below this upload footprint (0 = disabled)")
+    ap.add_argument("--prefetch-nf4", action="store_true",
+                    help="Experimentally prefetch next stage NF4 payloads on a side stream before use")
     ap.add_argument("--nf4-cache-dir", default=None,
                     help="Directory to cache quantised NF4 payloads")
     ap.add_argument("--resume", default="",
@@ -320,6 +322,7 @@ def main():
         dense_attention_masks=args.dense_attention_masks,
         torch_compile_loss=args.torch_compile_loss,
         stage_memory_limit_gib=args.stratum_stage_memory_limit_gib,
+        prefetch_nf4=args.prefetch_nf4,
     )
     timing_recorder = TimingRecorder(args.timing_jsonl, enabled=bool(args.timing_jsonl))
     pipeline.set_timing_recorder(timing_recorder if args.timing_jsonl else None)

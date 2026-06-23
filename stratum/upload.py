@@ -76,6 +76,62 @@ class NF4Payload:
     source_bytes: int
 
 
+@dataclass
+class _PrefetchEntry:
+    param: torch.nn.Parameter
+    payload: NF4Payload
+    quantized: torch.Tensor
+    absmax: torch.Tensor
+    code: torch.Tensor
+
+
+@dataclass
+class NF4Prefetch:
+    """Pending async NF4 payload upload for one module.
+
+    `finalize()` fences the copy stream and dequantizes the prefetched payloads
+    into parameter data. This mirrors RoundPipe's upload-before-use event model
+    while preserving Stratum's existing in-place module layout.
+    """
+    entries: list[_PrefetchEntry]
+    device: torch.device
+    stream: Optional[torch.cuda.Stream] = None
+    event: Optional[torch.cuda.Event] = None
+
+    def finalize(self) -> int:
+        if not self.entries:
+            return 0
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA is not available for NF4 prefetch finalize on {self.device}")
+
+        from bitsandbytes.functional import QuantState, dequantize_4bit
+
+        current = torch.cuda.current_stream(device=self.device)
+        if self.event is not None:
+            current.wait_event(self.event)
+
+        tensors = 0
+        with torch.cuda.device(self.device), torch.cuda.stream(current), torch.no_grad():
+            for entry in self.entries:
+                if entry.param.data.numel() > 0:
+                    continue
+                payload = entry.payload
+                q_state = QuantState(
+                    absmax=entry.absmax,
+                    shape=payload.shape,
+                    code=entry.code,
+                    blocksize=64,
+                    quant_type="nf4",
+                    dtype=payload.dtype,
+                )
+                entry.param.data = dequantize_4bit(entry.quantized, q_state).contiguous()
+                tensors += 1
+        return tensors
+
+    def wait(self) -> int:
+        return self.finalize()
+
+
 def _cache_path(cache_dir: Path, name: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[-160:]
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
@@ -311,6 +367,70 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
         param.data = dequantize_4bit(q_gpu, q_state).contiguous()
         tensors += 1
     return tensors
+
+
+@torch.no_grad()
+def prefetch_weights(module: torch.nn.Module, device_id: int) -> NF4Prefetch:
+    """Start async NF4 payload H2D copies for empty streamed params.
+
+    This does not mutate parameter data. Call `NF4Prefetch.finalize()` before
+    running the module to fence the copy stream and dequantize into FP16 data.
+    If there is nothing to upload, the returned object is a cheap no-op.
+    """
+    device = torch.device(f"cuda:{device_id}")
+    entries: list[_PrefetchEntry] = []
+    for name, param in module.named_parameters():
+        if param.data.numel() > 0:
+            continue
+        payload = getattr(param, NF4_ATTR, None)
+        if payload is None:
+            continue
+        entries.append(
+            _PrefetchEntry(
+                param=param,
+                payload=cast(NF4Payload, payload),
+                quantized=cast(NF4Payload, payload).quantized,
+                absmax=cast(NF4Payload, payload).absmax,
+                code=cast(NF4Payload, payload).code,
+            )
+        )
+
+    if not entries:
+        return NF4Prefetch([], device)
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA is not available for NF4 prefetch to {device}")
+
+    stream = torch.cuda.Stream(device=device)
+    prefetched: list[_PrefetchEntry] = []
+    with torch.cuda.device(device), torch.cuda.stream(stream):
+        for entry in entries:
+            prefetched.append(
+                _PrefetchEntry(
+                    param=entry.param,
+                    payload=entry.payload,
+                    quantized=entry.quantized.to(device, non_blocking=True),
+                    absmax=entry.absmax.to(device, non_blocking=True),
+                    code=entry.code.to(device, non_blocking=True),
+                )
+            )
+        event = torch.cuda.Event()
+        stream.record_event(event)
+    return NF4Prefetch(prefetched, device=device, stream=stream, event=event)
+
+
+@torch.no_grad()
+def ensure_prefetched_weights(
+    module: torch.nn.Module,
+    device_id: int,
+    prefetch: Optional[NF4Prefetch],
+) -> int:
+    """Finalize a matching prefetch or fall back to synchronous ensure."""
+    if prefetch is None:
+        return ensure_weights(module, device_id)
+    if prefetch.device != torch.device(f"cuda:{device_id}"):
+        raise ValueError(f"prefetch device {prefetch.device} does not match cuda:{device_id}")
+    return prefetch.finalize()
 
 
 @torch.no_grad()

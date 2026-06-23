@@ -239,6 +239,10 @@ ensure_weights() — at each step, before stage forward
   ├── dequantize_4bit() on GPU     ← FP16 on GPU
   └── param.data = dequantized     ← ready for forward
   │
+  ├── optional --prefetch-nf4:
+  │     prefetch_weights(next stage) copies NF4 payloads on a side stream,
+  │     then ensure_prefetched_weights() fences and dequants before use
+  │
   ▼
   [ forward runs with FP16 weights ]
   │
@@ -399,6 +403,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--nf4-cache-dir` | None | Directory to cache NF4 payloads |
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
 | `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
+| `--prefetch-nf4` | False | Experimental side-stream NF4 payload prefetch for the next stage/postfix |
 | `--checkpoint-mlp` | False | Wrap MLP in activation checkpointing |
 | `--mlp-token-chunk-size` | 0 | Split MLP forward into token chunks (0 = disabled) |
 | `--memory-flat-frozen-mlp` | False | Frozen MLP with token-chunked backward recompute |

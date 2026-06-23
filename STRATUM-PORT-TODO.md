@@ -270,7 +270,7 @@ yet wired into the active runtime.
   device, and re-upload updated trainable params before the next forward.
 - [A] Add buffer snapshot/restore support for recompute paths that mutate or
   depend on buffers.
-- [A] Add an async stage prefetch experiment: upload next stage's NF4 payloads
+- [x] Add an async stage prefetch experiment: upload next stage's NF4 payloads
   while the current stage computes, with event fencing before use.
 - [/] Keep permanent in-place `DeviceStage` modules as the default; full
   RoundPipe module-copy semantics are expensive and not required for the
@@ -451,7 +451,7 @@ Recommended order for reaching practical parity:
 | 13. Chunked upload | **ADAPT** | Needed for non-NF4 and no-NF4 large tensors, not every NF4 payload |
 | 14. RegisterBackwardEvent | **UTILITY PORTED / ADAPT** | Helper exists for future async prefetch/offload; not current sync path |
 | 15. async_d2h/h2d | **UTILITY PORTED / ADAPT** | HostStagingPool covers boundary transfers; generic helpers now exist but are not runtime-wired |
-| 16. upload_layers/download_layer | **ADAPT** | ensure/free covers frozen NF4 only; grad/offload/buffer behavior still missing |
+| 16. upload_layers/download_layer | **PARTIAL / ADAPT** | Layer transfer utilities and experimental NF4 prefetch exist; CPU LoRA grad/offload remains |
 | 17. ModelExecutePlan | **PARTIAL / ADAPT** | Stage memory splitting is ported; timing-fed placement remains |
 | 20. Batch API | **PARTIAL / ADAPT** | Fixed training tensors use token-weighted helpers; generic pytrees remain |
 | 21. Recompute context/RNG | **ADAPT** | Needed for Qwen checkpointing, MoE metadata, and mask/RoPE recompute avoidance |

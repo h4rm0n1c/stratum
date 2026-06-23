@@ -9,7 +9,7 @@ from stratum.assign import assign_layers_to_devices
 from stratum.stage import DeviceStage
 from stratum.host_staging import HostStagingPool
 from stratum.grad_hooks import make_boundary_hook
-from stratum.upload import ensure_weights, free_weights
+from stratum.upload import NF4Prefetch, ensure_prefetched_weights, ensure_weights, free_weights, prefetch_weights
 from stratum.timing import TimingRecorder
 from stratum.utils import log_event
 
@@ -28,11 +28,14 @@ class StratumPipeline(nn.Module):
         prefix: nn.Module,
         stages: list[DeviceStage],
         postfix: nn.Module,
+        *,
+        prefetch_nf4: bool = False,
     ):
         super().__init__()
         self.prefix = prefix
         self.stages = nn.ModuleList(stages)
         self.postfix = postfix
+        self.prefetch_nf4 = prefetch_nf4
         self.timing_recorder: Optional[TimingRecorder] = None
 
         # Build boundary transfer infrastructure
@@ -70,6 +73,31 @@ class StratumPipeline(nn.Module):
             return nullcontext()
         return self.timing_recorder.span(name, device_id=device_id, **fields)
 
+    def _prefetch_module(
+        self,
+        module: nn.Module,
+        device_id: int,
+        name: str,
+        **fields: Any,
+    ) -> Optional[NF4Prefetch]:
+        if not self.prefetch_nf4:
+            return None
+        with self._time(f"{name}_prefetch", device_id=device_id, **fields):
+            return prefetch_weights(module, device_id)
+
+    def _ensure_module(
+        self,
+        module: nn.Module,
+        device_id: int,
+        name: str,
+        prefetch: Optional[NF4Prefetch] = None,
+        **fields: Any,
+    ) -> int:
+        with self._time(f"{name}_upload", device_id=device_id, **fields):
+            if self.prefetch_nf4:
+                return ensure_prefetched_weights(module, device_id, prefetch)
+            return ensure_weights(module, device_id)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -79,8 +107,18 @@ class StratumPipeline(nn.Module):
     ) -> torch.Tensor:
         """Run forward through all stages. Returns loss if labels provided."""
         # Stream prefix weights to device 0 before embedding lookup.
-        with self._time("prefix_upload", device_id=0):
-            ensure_weights(self.prefix, 0)
+        self._ensure_module(self.prefix, 0, "prefix")
+
+        pending_stage: Optional[NF4Prefetch] = None
+        if self.stages:
+            pending_stage = self._prefetch_module(
+                self.stages[0],
+                self.stages[0].device_id,
+                "stage",
+                stage_device=self.stages[0].device_id,
+                layers=len(self.stages[0].layers),
+                stage_index=0,
+            )
 
         # Prefix on device 0 — returns the full 7-tuple
         with self._time("prefix_forward", device_id=0):
@@ -98,7 +136,7 @@ class StratumPipeline(nn.Module):
         pool_idx = 0
         prev_device = 0
 
-        for stage in self.stages:
+        for stage_index, stage in enumerate(self.stages):
             next_device = stage.device_id
 
             if next_device != prev_device:
@@ -157,13 +195,31 @@ class StratumPipeline(nn.Module):
             # Stream this stage's weights from NF4 to FP16 on its device,
             # run forward, then keep FP16 alive for backward's checkpoint recompute.
             # free_weights() is called by the training script after loss.backward().
-            with self._time(
-                "stage_upload",
-                device_id=stage.device_id,
+            self._ensure_module(
+                stage,
+                stage.device_id,
+                "stage",
+                pending_stage,
                 stage_device=stage.device_id,
                 layers=len(stage.layers),
-            ):
-                ensure_weights(stage, stage.device_id)
+                stage_index=stage_index,
+            )
+
+            next_pending: Optional[NF4Prefetch] = None
+            if stage_index + 1 < len(self.stages):
+                next_stage = self.stages[stage_index + 1]
+                next_pending = self._prefetch_module(
+                    next_stage,
+                    next_stage.device_id,
+                    "stage",
+                    stage_device=next_stage.device_id,
+                    layers=len(next_stage.layers),
+                    stage_index=stage_index + 1,
+                )
+            elif self.prefetch_nf4:
+                last_device = self.stages[-1].device_id if self.stages else 0
+                next_pending = self._prefetch_module(self.postfix, last_device, "postfix")
+
             with self._time(
                 "stage_forward",
                 device_id=stage.device_id,
@@ -171,12 +227,13 @@ class StratumPipeline(nn.Module):
                 layers=len(stage.layers),
             ):
                 tuple_data = stage(tuple_data)
+            pending_stage = next_pending
             prev_device = next_device
 
         # Stream postfix weights (lm_head), then compute loss
         last_device = self.stages[-1].device_id if self.stages else 0
-        with self._time("postfix_upload", device_id=last_device):
-            ensure_weights(self.postfix, last_device)
+        postfix_prefetch = pending_stage if self.prefetch_nf4 else None
+        self._ensure_module(self.postfix, last_device, "postfix", postfix_prefetch)
 
         # Ensure hidden state is on the correct device for postfix
         if tuple_data[0].is_cuda and tuple_data[0].device.index != last_device:

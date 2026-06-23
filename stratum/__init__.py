@@ -33,6 +33,7 @@ from stratum.transfer import (
 )
 from stratum.model.registry import build_pipeline
 from stratum.upload import prepare_nf4, upload_stream, NF4Stats, estimate_module_upload_gib
+from stratum.upload import NF4Prefetch, ensure_prefetched_weights, prefetch_weights
 from stratum.nf4_linear import NF4Linear
 
 
@@ -79,6 +80,9 @@ __all__ = [
     "prepare_nf4",
     "upload_stream",
     "NF4Stats",
+    "NF4Prefetch",
+    "prefetch_weights",
+    "ensure_prefetched_weights",
     "estimate_module_upload_gib",
     "NF4Linear",
 ]
