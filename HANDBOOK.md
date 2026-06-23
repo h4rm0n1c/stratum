@@ -7,13 +7,30 @@ design decisions, and known tricky areas for handoff to other agents.
 ## Quick Reference
 
 | Item | Path |
-|---|---|
+|---|---|---|
+| **Stratum repo** | `/home/harri/stratum/` |
 | Entry point | `scripts/train.py` |
 | Training config | CLI args (see `train.py --help`) |
 | Dockerfile | `Dockerfile` |
 | Port tracking | `STRATUM-PORT-TODO.md` |
-| Data | `/home/harri/qz-roundpipe/data/lfm25_fable_merged_48k_train.labels.jsonl` |
-| RoundPipe source | extracted at `/tmp/roundpipe-dl/roundpipe_src/roundpipe/` |
+| Handbook | `HANDBOOK.md` (this file) |
+| **RoundPipe source** (PyPI 0.1.1) | extracted at `/tmp/roundpipe-dl/roundpipe_src/roundpipe/` |
+| RoundPipe NF4 module | `/tmp/roundpipe-dl/roundpipe_src/roundpipe/transfer.py` |
+| RoundPipe chunked loss | `/tmp/roundpipe-dl/roundpipe_src/roundpipe/models/function.py` |
+| **qz-roundpipe repo** | `/home/harri/qz-roundpipe/` |
+| LFM25 training script | `/home/harri/qz-roundpipe/scripts/train_lfm25_roundpipe_lora.py` |
+| Qwen35 training script | `/home/harri/qz-roundpipe/scripts/train_qwen35_roundpipe_lora.py` |
+| RoundPipe NF4 monkeypatch | `/home/harri/qz-roundpipe/scripts/roundpipe_nf4.py` |
+| RoundPipe LFM25 volta patch | `/home/harri/qz-roundpipe/scripts/patch_lfm25_volta_attention.py` |
+| RoundPipe Qwen35 volta patch | `/home/harri/qz-roundpipe/scripts/patch_volta_attention.py` |
+| Design doc | `/home/harri/qz-roundpipe/docs/stratum-design.md` |
+| RAMP launch script | `/home/harri/qz-roundpipe/scripts/ramp_long_context.sh` |
+| **Training data** | `/home/harri/qz-roundpipe/data/lfm25_fable_merged_48k_train.labels.jsonl` |
+| Data format | Pre-tokenized JSONL, 25K windows, ~43M supervised tokens |
+| Data source | Merged fable_5_distillation_merged_cleaned_25k + WithinUsAI pool |
+| **Tested model** | `LiquidAI/LFM2.5-8B-A1B` (registered as `lfm25-8b-a1b`) |
+| **Hardware** | RTX 3080 (12 GiB, GPU 0) + V100 (32 GiB, GPU 1) |
+| **Docker image** | `stratum:latest` (sha `8226fc73`), rebuild from `Dockerfile` |
 
 ## RoundPipe Comparison — What's Ported and What's Different
 
@@ -505,11 +522,58 @@ aligned to page boundaries.
    - `build_postfix(model, **kwargs)` → postfix module
    - Optionally override `build()` to patch attention modules
 
-## Testing
+## Testing and Invocation
 
-Build and run:
+### Training data
+
+Dataset: `/home/harri/qz-roundpipe/data/lfm25_fable_merged_48k_train.labels.jsonl`
+
+- Pre-tokenized JSONL format: `{"input_ids": [...], "attention_mask": [...], "labels": [...]}`
+- 25,000 windows from the fable_5_distillation_merged_cleaned_25k + WithinUsAI merged pool
+- ~43 million supervised tokens
+- Sequence lengths up to 48K (truncated by `--max-seq-len`)
+- Labels use -100 for ignored positions (padding / non-supervised tokens)
+
+### Build Docker image
+
 ```bash
+cd /home/harri/stratum
 docker build -t stratum:latest .
+```
+
+The build compiles:
+- `flash-attn-v100` (for V100, sm_70) — from source
+- `flash-attn` (for RTX 3080, sm_86) — from source, `FLASH_ATTN_CUDA_ARCHS="86"`
+- `causal_conv1d` — both sm_70 + sm_86 in one wheel
+
+If CUDA compilation fails, check:
+- Docker daemon running: `sudo systemctl start docker`
+- Disk space: `df -h /` (need ~20 GiB free for build cache)
+- Source changes don't invalidate CUDA cache because `COPY stratum` is after all compilations
+
+### Starting Docker with Stratum
+
+For ad-hoc runs (no volume mounts):
+```bash
+docker run --gpus all --rm -it \
+    -v /home/harri/qz-roundpipe/data:/data \
+    stratum:latest \
+    python scripts/train.py --data /data/lfm25_fable_merged_48k_train.labels.jsonl ...
+```
+
+For development (live code changes visible inside container):
+```bash
+docker run --gpus all --rm -it \
+    -v /home/harri/stratum:/workspace/stratum \
+    -v /home/harri/qz-roundpipe/data:/data \
+    stratum:latest \
+    bash
+# Inside container: python scripts/train.py --data /data/... --out /runs/test ...
+```
+
+### Smoke test (quick validation)
+
+```bash
 docker run --gpus all --rm stratum:latest python scripts/train.py \
     --model lfm25-8b-a1b \
     --data /data/lfm25_fable_merged_48k_train.labels.jsonl \
@@ -520,6 +584,83 @@ docker run --gpus all --rm stratum:latest python scripts/train.py \
     --save-every 0 \
     --no-save
 ```
+
+Expected: 5 steps, prints JSON step logs, no OOM, no NaN, loss should start
+around 11-13 (random init for 124K vocab) and decrease.
+
+### Longer test (convergence check)
+
+```bash
+docker run --gpus all --rm stratum:latest python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /data/lfm25_fable_merged_48k_train.labels.jsonl \
+    --tensor-split 9 32 \
+    --steps 500 \
+    --batch-size 1 \
+    --num-microbatch 1 \
+    --lr 1e-4 \
+    --warmup-steps 50 \
+    --lr-scheduler cosine_with_warmup \
+    --save-every 100 \
+    --out /runs/long-test
+```
+
+### Single-GPU test (for debugging on one card)
+
+```bash
+docker run --gpus all --rm stratum:latest python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /data/lfm25_fable_merged_48k_train.labels.jsonl \
+    --steps 5 --batch-size 1 --save-every 0 --no-save
+```
+
+### Test with MLP optimizations
+
+```bash
+docker run --gpus all --rm stratum:latest python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /data/lfm25_fable_merged_48k_train.labels.jsonl \
+    --tensor-split 9 32 \
+    --steps 5 --batch-size 1 \
+    --checkpoint-mlp
+```
+
+### Test with torch-compiled loss
+
+```bash
+docker run --gpus all --rm stratum:latest python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /data/lfm25_fable_merged_48k_train.labels.jsonl \
+    --tensor-split 9 32 \
+    --steps 5 --batch-size 1 \
+    --torch-compile-loss
+```
+
+### Test with blocked postfix loss (batch=1 only)
+
+```bash
+docker run --gpus all --rm stratum:latest python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /data/lfm25_fable_merged_48k_train.labels.jsonl \
+    --tensor-split 9 32 \
+    --steps 5 --batch-size 1 \
+    --postfix-loss-token-chunk-size 2048
+```
+
+### Restarting Docker daemon
+
+```bash
+sudo systemctl start docker   # if stopped
+sudo systemctl status docker  # check status
+```
+
+### Monitoring during training
+
+- Check GPU memory: `nvidia-smi -l 1`
+- Step logs printed as JSON every 10 steps: `{"step": N, "loss": ..., "sec": ..., "tok_s": ..., "gpu0_used": ..., "gpu1_used": ...}`
+- Logged to `training.jsonl` in output dir every step
+- If loss is NaN: check for ignored-token chunks with `reduction="mean"` (should be `"sum"`)
+- If OOM: reduce batch size, increase `--num-microbatch`, enable `--checkpoint-mlp`, or reduce `--loss-token-chunk-size`
 
 ## Key Files for Agents
 
