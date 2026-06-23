@@ -1,0 +1,74 @@
+cff-version: 1.2.0
+title: Stratum
+message: >-
+  If you use Stratum in your research, please cite this software
+  and the projects it builds upon (see README.md for the full list).
+type: software
+authors:
+  - given-names: h4rm0n1c
+    email: h4rm0n1c@github
+preferred-citation:
+  title: Stratum
+  type: software
+  authors:
+    - given-names: h4rm0n1c
+  version: 0.1.0
+  date-released: 2026-06
+  url: https://github.com/h4rm0n1c/stratum
+
+references:
+  - title: "RoundPipe: Large DNNs Training Framework for Consumer GPUs"
+    type: software
+    authors:
+      - given-names: ITcarrot
+    url: https://github.com/thustorage/RoundPipe
+
+  - title: "llama.cpp"
+    type: software
+    authors:
+      - given-names: Georgi
+        family-names: Gerganov
+    url: https://github.com/ggml-org/llama.cpp
+
+  - title: "flash-attention-v100"
+    type: software
+    authors:
+      - given-names: ai-bond
+    url: https://github.com/ai-bond/flash-attention-v100
+
+  - title: "bitsandbytes"
+    type: software
+    authors:
+      - given-names: Tim
+        family-names: Dettmers
+    url: https://github.com/TimDettmers/bitsandbytes
+
+  - title: "QLoRA: Efficient Finetuning of Quantized Language Models"
+    type: article
+    authors:
+      - given-names: Tim
+        family-names: Dettmers
+      - given-names: Artidoro
+        family-names: Pagnoni
+      - given-names: Ari
+        family-names: Holtzman
+      - given-names: Luke
+        family-names: Zettlemoyer
+    year: 2023
+    url: https://arxiv.org/abs/2305.14314
+
+  - title: "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+    type: article
+    authors:
+      - given-names: Tri
+        family-names: Dao
+      - given-names: Daniel Y.
+        family-names: Fu
+      - given-names: Stefano
+        family-names: Ermon
+      - given-names: Atri
+        family-names: Rudra
+      - given-names: Christopher
+        family-names: Ré
+    year: 2022
+    url: https://arxiv.org/abs/2205.14135

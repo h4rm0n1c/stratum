@@ -1,0 +1,36 @@
+[project]
+name = "stratum"
+version = "0.1.0"
+description = "Multi-GPU layer-parallel training for transformer models"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+
+authors = [
+    { name = "h4rm0n1c" },
+    { name = "Stratum contributors" },
+]
+
+# Stratum builds on the work of many open-source projects.
+# See README.md (Acknowledgments) and CITATION.cff for the full list.
+
+dependencies = [
+    "torch>=2.11",
+    "bitsandbytes",
+    "transformers",
+    "peft",
+    "tqdm",
+    "py-cpuinfo",
+    "ninja",
+]
+
+[project.urls]
+homepage = "https://github.com/harri/stratum"
+documentation = "https://github.com/harri/stratum/docs"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["stratum*"]
