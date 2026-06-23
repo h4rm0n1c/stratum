@@ -153,6 +153,7 @@ class StratumPipeline(nn.Module):
 
     def free_all_weights(self) -> None:
         """Free FP16 weight data for all stages. Call after backward()."""
+        free_weights(self.prefix)
         for stage in self.stages:
             free_weights(stage)
         free_weights(self.postfix)

@@ -7,7 +7,7 @@ from stratum.host_staging import HostStagingPool
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
 from stratum.model.registry import build_pipeline
-from stratum.upload import prepare_nf4, upload_stream
+from stratum.upload import prepare_nf4, upload_stream, NF4Stats, estimate_module_upload_gib
 from stratum.nf4_linear import NF4Linear
 
 # Import model architectures so their @register decorators fire

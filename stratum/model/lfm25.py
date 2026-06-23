@@ -19,6 +19,9 @@ from transformers.models.llama.modeling_llama import repeat_kv
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
+from stratum.model.mlp_opt import apply_mlp_optimizations
+from stratum.model.blocked_loss import BlockedPostfixCausalLMLoss
+from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
 
 
 # causal_conv1d is compiled for sm_70 + sm_86 — fast path works on both GPUs.
@@ -147,6 +150,9 @@ class LFM25ForCausalLMPrefix(nn.Module):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Any,
     ):
+        if self.memory_telemetry:
+            mark_model_gpu_phase("prefix_enter")
+
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
 
@@ -175,6 +181,9 @@ class LFM25ForCausalLMPrefix(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.pos_emb(hidden_states, position_ids=position_ids)
 
+        if self.memory_telemetry:
+            mark_model_gpu_phase("prefix_after_rope", seq_len=int(hidden_states.shape[1]))
+
         return (
             hidden_states,
             causal_mask,
@@ -196,12 +205,14 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
         idx: int,
         checkpoint_decoder_layer: bool = False,
         use_flash_attention: bool = False,
+        memory_telemetry: bool = False,
     ):
         super().__init__()
         self.layer = layer
         self.idx = idx
         self.checkpoint_decoder_layer = checkpoint_decoder_layer
         self.use_flash_attention = use_flash_attention
+        self.memory_telemetry = memory_telemetry
 
     def forward(self, input_data):
         (
@@ -213,6 +224,16 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
             labels,
             logits_to_keep,
         ) = input_data
+
+        if self.memory_telemetry:
+            mark_model_gpu_phase(
+                "layer_enter",
+                layer_idx=self.idx,
+                seq_len=int(hidden_states.shape[1]),
+                hidden_size=int(hidden_states.shape[2]),
+                attention_type=getattr(self.layer, "attention_type", "full_attention"),
+                checkpoint_decoder_layer=bool(self.checkpoint_decoder_layer),
+            )
 
         layer_kwargs = dict(kwargs)
         layer_kwargs.pop("return_logits", None)
@@ -245,6 +266,13 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
 
+        if self.memory_telemetry:
+            mark_model_gpu_phase(
+                "layer_after_run",
+                layer_idx=self.idx,
+                attention_type=attention_type,
+            )
+
         return (
             hidden_states,
             causal_mask_mapping,
@@ -257,11 +285,25 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
 
 
 class LFM25ForCausalLMPostfix(nn.Module):
-    """Postfix: final norm + lm_head."""
+    """Postfix: final norm + lm_head.
 
-    def __init__(self, model, *, debug_finite: bool = False):
+    Two loss modes (matching RoundPipe):
+      1. postfix_loss_token_chunk_size == 0 (default):
+         norm runs full-seq, lm_head chunked by loss_token_chunk_size.
+      2. postfix_loss_token_chunk_size > 0:
+         BlockedPostfixCausalLMLoss — splits norm + lm_head into blocks,
+         backprops per-block within forward, saves grads to CPU.
+    """
+
+    def __init__(self, model, *, debug_finite: bool = False,
+                 loss_token_chunk_size: int = 4096,
+                 postfix_loss_token_chunk_size: int = 0,
+                 memory_telemetry: bool = False):
         super().__init__()
         self.debug_finite = debug_finite
+        self.loss_token_chunk_size = loss_token_chunk_size
+        self.postfix_loss_token_chunk_size = postfix_loss_token_chunk_size
+        self.memory_telemetry = memory_telemetry
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
         import copy
         self.norm = copy.deepcopy(
@@ -285,11 +327,28 @@ class LFM25ForCausalLMPostfix(nn.Module):
             logits_to_keep,
         ) = input_data
 
-        if self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+        if self.memory_telemetry:
+            mark_model_gpu_phase("postfix_enter",
+                                 seq_len=int(hidden_states.shape[1]))
 
         loss = None
         if labels is not None and not kwargs.get("return_logits", False):
+            # Mode 2: BlockedPostfixCausalLMLoss (norm + lm_head in blocks)
+            if self.postfix_loss_token_chunk_size > 0:
+                loss = BlockedPostfixCausalLMLoss.apply(
+                    hidden_states, labels,
+                    self.norm, self.lm_head, self.vocab_size,
+                    self.postfix_loss_token_chunk_size,
+                    -100, self.memory_telemetry, self.debug_finite,
+                )
+                if self.debug_finite:
+                    assert_finite_tensor("blocked_postfix_loss", loss)
+                return CausalLMOutputWithPast(loss=loss, logits=None)
+
+            # Mode 1: norm full-seq, then chunked lm_head
+            if self.norm is not None:
+                hidden_states = self.norm(hidden_states)
+
             shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
@@ -302,11 +361,11 @@ class LFM25ForCausalLMPostfix(nn.Module):
                     loss=shift_hidden.new_zeros(()), logits=None
                 )
 
-            # Chunked loss: split into 4096-token chunks for lm_head
-            # to avoid OOM from full [seq_len, 124893] logits matrix.
+            # Chunked loss: split into self.loss_token_chunk_size-token chunks
+            # for lm_head to avoid OOM from full [seq_len, 124893] logits matrix.
             # Uses reduction="sum" per chunk, normalizes by num_items
-            # (same pattern as RoundPipe's BlockedPostfixCausalLMLoss).
-            chunk_size = 4096
+            # (same pattern as RoundPipe's ChunkedCompileLinearForCausalLMLoss).
+            chunk_size = self.loss_token_chunk_size
             seq_len = shift_hidden.shape[1]
             loss_sum = shift_hidden.new_zeros(())
             for start in range(0, seq_len, chunk_size):
@@ -340,39 +399,60 @@ class LFM25Arch(ModelArch):
     def get_num_layers(self, config):
         return config.num_hidden_layers
 
-    def build_prefix(self, model):
-        return LFM25ForCausalLMPrefix(model)
+    def build_prefix(self, model, **kwargs):
+        return LFM25ForCausalLMPrefix(
+            model,
+            memory_telemetry=kwargs.get("memory_telemetry", False),
+        )
 
     def build_wrapped_layer(self, layer, idx, **kwargs):
         return LFM25ForCausalLMWrappedLayer(
             layer, idx=idx,
             use_flash_attention=True,
             checkpoint_decoder_layer=kwargs.get("checkpoint_decoder_layer", False),
+            memory_telemetry=kwargs.get("memory_telemetry", False),
         )
 
-    def build_postfix(self, model):
-        return LFM25ForCausalLMPostfix(model)
+    def build_postfix(self, model, **kwargs):
+        return LFM25ForCausalLMPostfix(
+            model,
+            loss_token_chunk_size=kwargs.get("loss_token_chunk_size", 4096),
+            postfix_loss_token_chunk_size=kwargs.get("postfix_loss_token_chunk_size", 0),
+            memory_telemetry=kwargs.get("memory_telemetry", False),
+            debug_finite=kwargs.get("debug_finite", False),
+        )
 
     def build(self, hf_model, tensor_split=None, device_ids=None, **kwargs):
-        # Replace ALL Lfm2MoeAttention modules with Lfm25VoltaAttention.
-        # The VoltaAttention falls back to eager on non-Volta GPUs at
-        # forward time, so no SM-capability check needed here.
         core = hf_model.get_base_model() if hasattr(hf_model, "get_base_model") else hf_model
-        _patch_lfm25_attention(core)
+        # Selective Volta attention patching
+        from stratum.telemetry import parse_int_set
+        volta_layers_str = kwargs.get("volta_layers", "")
+        volta_layer_indices = parse_int_set(volta_layers_str) if volta_layers_str else None
+        _patch_lfm25_attention(core, layer_indices=volta_layer_indices)
+        # MLP optimizations (checkpoint_mlp, memory_flat_frozen_mlp, mlp_token_chunk_size)
+        apply_mlp_optimizations(core, **kwargs)
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
-def _patch_lfm25_attention(model):
-    """Replace all Lfm2MoeAttention with Lfm25VoltaAttention."""
+def _patch_lfm25_attention(model, layer_indices: Optional[set[int]] = None):
+    """Replace Lfm2MoeAttention with Lfm25VoltaAttention.
+
+    Args:
+        model: HF model to patch.
+        layer_indices: Set of layer indices to patch. None = patch all.
+    """
     core = model.get_base_model() if hasattr(model, "get_base_model") else model
     config = core.config
     patched = 0
     for idx, layer in enumerate(core.model.layers):
+        if layer_indices is not None and idx not in layer_indices:
+            continue
         if not hasattr(layer, "self_attn"):
             continue
         old_attn = layer.self_attn
         if isinstance(old_attn, Lfm25VoltaAttention):
-            patched += 1
+            if layer_indices is None or idx in layer_indices:
+                patched += 1
             continue
 
         new_attn = Lfm25VoltaAttention(old_attn.config, layer_idx=idx)

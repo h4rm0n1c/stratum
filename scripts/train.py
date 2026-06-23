@@ -42,7 +42,8 @@ from stratum.utils import get_device_info, gpu_memory_snapshot
 class PretokJsonlDataset(Dataset):
     """Pre-tokenized JSONL dataset with label masking."""
 
-    def __init__(self, path: str, max_seq_len: int = 0, shuffle: bool = False):
+    def __init__(self, path: str, max_seq_len: int = 0, shuffle: bool = False,
+                 longest_first: bool = False):
         self.rows = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -59,6 +60,8 @@ class PretokJsonlDataset(Dataset):
         if shuffle:
             import random
             random.shuffle(self.rows)
+        if longest_first:
+            self.rows.sort(key=lambda r: len(r["input_ids"]), reverse=True)
         print({
             "dataset_rows": len(self.rows),
             "min_len": min(len(r["input_ids"]) for r in self.rows) if self.rows else 0,
@@ -77,7 +80,7 @@ class PretokJsonlDataset(Dataset):
         }
 
 
-def collate_one(batch, *, pad_to_multiple: int = 0):
+def collate_one(batch, *, pad_to_multiple: int = 0, pad_to_length: int = 0):
     """Collate function: pad to longest in batch."""
     from torch.nn.utils.rnn import pad_sequence
     input_ids = pad_sequence([b["input_ids"] for b in batch], batch_first=True, padding_value=0)
@@ -89,6 +92,16 @@ def collate_one(batch, *, pad_to_multiple: int = 0):
         padded = ((seq_len + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
         if padded != seq_len:
             pad = padded - seq_len
+            input_ids = F.pad(input_ids, (0, pad), value=0)
+            attention_mask = F.pad(attention_mask, (0, pad), value=0)
+            labels = F.pad(labels, (0, pad), value=-100)
+
+    if pad_to_length:
+        seq_len = input_ids.shape[1]
+        if pad_to_length < seq_len:
+            raise ValueError(f"pad_to_length={pad_to_length} < batch seq_len={seq_len}")
+        if pad_to_length != seq_len:
+            pad = pad_to_length - seq_len
             input_ids = F.pad(input_ids, (0, pad), value=0)
             attention_mask = F.pad(attention_mask, (0, pad), value=0)
             labels = F.pad(labels, (0, pad), value=-100)
@@ -114,7 +127,10 @@ def main():
     ap.add_argument("--tensor-split", type=float, nargs="+", default=None)
     ap.add_argument("--device-ids", type=int, nargs="+", default=None)
     ap.add_argument("--max-seq-len", type=int, default=49152)
-    ap.add_argument("--loss-token-chunk-size", type=int, default=4096)
+    ap.add_argument("--loss-token-chunk-size", type=int, default=4096,
+                    help="Token chunk size for chunked lm_head loss")
+    ap.add_argument("--postfix-loss-token-chunk-size", type=int, default=0,
+                    help="Split norm + lm_head into token blocks with per-block backward (saves VRAM)")
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--checkpoint-decoder-layer", action="store_true", default=True,
                     help="Activation checkpointing per decoder layer (reduces VRAM, ~30% slower)")
@@ -126,7 +142,58 @@ def main():
                     help="Directory to cache quantised NF4 payloads")
     ap.add_argument("--resume", default="",
                     help="Checkpoint path to resume from")
+    # MLP optimizations (mutually exclusive with each other)
+    ap.add_argument("--checkpoint-mlp", action="store_true",
+                    help="Wrap each decoder MLP in activation checkpointing")
+    ap.add_argument("--mlp-token-chunk-size", type=int, default=0,
+                    help="Split decoder MLPs over sequence-token chunks")
+    ap.add_argument("--memory-flat-frozen-mlp", action="store_true",
+                    help="Replace frozen dense MLPs with token-chunked backward recompute")
+    # Telemetry and debugging
+    ap.add_argument("--memory-telemetry", action="store_true",
+                    help="Log GPU allocator state at prefix/layer/postfix boundaries")
+    ap.add_argument("--operator-telemetry-layers", default="",
+                    help="Comma-separated layer indices for per-operator allocator telemetry")
+    ap.add_argument("--operator-telemetry-modules",
+                    default="input_layernorm,self_attn,post_attention_layernorm,mlp",
+                    help="Comma-separated submodule names for operator telemetry")
+    ap.add_argument("--debug-finite", action="store_true",
+                    help="Assert tensor values are finite after norm/loss/layer output")
+    ap.add_argument("--cuda-memory-summary-on-exception", action="store_true",
+                    help="Print CUDA memory summary when forward/backward raises RuntimeError")
+    # Memory watchdog
+    ap.add_argument("--host-ram-limit-gib", type=float, default=0.0,
+                    help="Abort when host RSS exceeds this many GiB (0 = disabled)")
+    # Selective Volta attention patching
+    ap.add_argument("--volta-layers", default="",
+                    help="Comma-separated full-attention layer indices to patch")
+    ap.add_argument("--volta-window-left", type=int, default=-1,
+                    help="Sliding-window left tokens for flash-attn-v100")
+    ap.add_argument("--volta-window-right", type=int, default=0,
+                    help="Right tokens for sliding-window (0 = causal)")
+    # Data loading
+    ap.add_argument("--longest-first", action="store_true",
+                    help="Sort training data by sequence length descending")
+    ap.add_argument("--pad-to-multiple", type=int, default=0,
+                    help="Pad batch sequence length to this multiple")
+    ap.add_argument("--pad-to-length", type=int, default=0,
+                    help="Pad batch sequence length to this exact value")
+    ap.add_argument("--no-save", action="store_true",
+                    help="Skip final save_pretrained call")
+    ap.add_argument("--dense-attention-masks", action="store_true",
+                    help="Force HF dense causal mask construction")
     args = ap.parse_args()
+
+    # Arg validation (same guards as RoundPipe)
+    if args.memory_flat_frozen_mlp:
+        if args.mlp_token_chunk_size <= 0:
+            raise ValueError("--memory-flat-frozen-mlp requires --mlp-token-chunk-size > 0")
+        if args.checkpoint_mlp:
+            raise ValueError("--memory-flat-frozen-mlp is not compatible with --checkpoint-mlp")
+    if args.mlp_token_chunk_size < 0:
+        raise ValueError("--mlp-token-chunk-size must be >= 0")
+    if args.postfix_loss_token_chunk_size < 0:
+        raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
 
     # Detect devices
     devices = get_device_info()
@@ -152,6 +219,7 @@ def main():
         tensor_split = get_optimal_tensor_split(device_ids)[:n_devices]
 
     # Load base model
+    mark_phase("before_model_load")
     print(f"Loading model {args.hf_model}...", flush=True)
     hf_model = AutoModelForCausalLM.from_pretrained(
         args.hf_model,
@@ -179,6 +247,18 @@ def main():
     hf_model = get_peft_model(hf_model, lora_cfg)
     hf_model.print_trainable_parameters()
 
+    # Operator telemetry hooks (on base model before extraction)
+    if args.operator_telemetry_layers:
+        from stratum.telemetry import enable_operator_telemetry, parse_int_set, parse_name_list
+        op_layers = parse_int_set(args.operator_telemetry_layers)
+        op_modules = parse_name_list(args.operator_telemetry_modules)
+        registered = enable_operator_telemetry(
+            hf_model,
+            layer_indices=op_layers,
+            module_names=op_modules,
+        )
+        print(f"  operator telemetry: {registered} hooks on layers {sorted(op_layers)}", flush=True)
+
     # Build stratified pipeline
     print("Building Stratum pipeline...", flush=True)
     pipeline = build_pipeline(
@@ -188,6 +268,17 @@ def main():
         use_nf4=not args.no_nf4,
         nf4_cache_dir=args.nf4_cache_dir,
         checkpoint_decoder_layer=args.checkpoint_decoder_layer,
+        loss_token_chunk_size=args.loss_token_chunk_size,
+        postfix_loss_token_chunk_size=args.postfix_loss_token_chunk_size,
+        memory_telemetry=args.memory_telemetry,
+        debug_finite=args.debug_finite,
+        checkpoint_mlp=args.checkpoint_mlp,
+        memory_flat_frozen_mlp=args.memory_flat_frozen_mlp,
+        mlp_token_chunk_size=args.mlp_token_chunk_size,
+        volta_layers=args.volta_layers,
+        volta_window_left=args.volta_window_left,
+        volta_window_right=args.volta_window_right,
+        dense_attention_masks=args.dense_attention_masks,
     )
 
     # Determine input device (prefix location)
@@ -214,13 +305,28 @@ def main():
     print({"lr": args.lr, "scheduler": args.lr_scheduler,
            "warmup": args.warmup_steps, "batch_size": args.batch_size}, flush=True)
 
+    # Memory watchdog (OS-level RSS limit)
+    if args.host_ram_limit_gib > 0:
+        from stratum.watchdog import start_memory_watchdog
+        start_memory_watchdog(args.host_ram_limit_gib)
+        print(f"Memory watchdog: {args.host_ram_limit_gib} GiB limit", flush=True)
+
+    # Phase marker (same as RoundPipe)
+    from stratum.watchdog import mark_phase, mark_memory_phase
+    mark_phase("after_pipeline_build")
+
     # Load dataset
-    ds = PretokJsonlDataset(args.data, max_seq_len=args.max_seq_len, shuffle=True)
+    ds = PretokJsonlDataset(args.data, max_seq_len=args.max_seq_len, shuffle=True,
+                            longest_first=args.longest_first)
+    def collate(batch):
+        return collate_one(batch, pad_to_multiple=args.pad_to_multiple,
+                           pad_to_length=args.pad_to_length)
     dl = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_one, num_workers=0,
+        collate_fn=collate, num_workers=0,
     )
     data_cycle = itertools.cycle(dl)
+    mark_memory_phase("after_dataloader", args.host_ram_limit_gib)
 
     # Resume from checkpoint
     start_step = 0
@@ -262,23 +368,31 @@ def main():
         # Microbatching: split batch into microbatches, accumulate gradients
         nmb = max(1, args.num_microbatch)
         loss = None
-        if nmb > 1 and input_ids.shape[0] >= nmb:
-            mb_size = max(1, input_ids.shape[0] // nmb)
-            for i in range(0, input_ids.shape[0], mb_size):
-                mb_end = min(i + mb_size, input_ids.shape[0])
-                mb_in = input_ids[i:mb_end].contiguous()
-                mb_attn = attention_mask[i:mb_end].contiguous()
-                mb_labels = labels[i:mb_end].contiguous()
-                mb_out = pipeline(mb_in, attention_mask=mb_attn, labels=mb_labels)
-                (mb_out.loss / nmb).backward()
-                if loss is None:
-                    loss = mb_out.loss.detach()
-                else:
-                    loss = loss + mb_out.loss.detach()
-        else:
-            output = pipeline(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = output.loss.detach()
-            loss.backward()
+        try:
+            if nmb > 1 and input_ids.shape[0] >= nmb:
+                mb_size = max(1, input_ids.shape[0] // nmb)
+                for i in range(0, input_ids.shape[0], mb_size):
+                    mb_end = min(i + mb_size, input_ids.shape[0])
+                    mb_in = input_ids[i:mb_end].contiguous()
+                    mb_attn = attention_mask[i:mb_end].contiguous()
+                    mb_labels = labels[i:mb_end].contiguous()
+                    mb_out = pipeline(mb_in, attention_mask=mb_attn, labels=mb_labels)
+                    (mb_out.loss / nmb).backward()
+                    if loss is None:
+                        loss = mb_out.loss.detach()
+                    else:
+                        loss = loss + mb_out.loss.detach()
+            else:
+                output = pipeline(input_ids, attention_mask=attention_mask, labels=labels)
+                output.loss.backward()
+                loss = output.loss.detach()
+        except RuntimeError:
+            print({"forward_backward_exception_step": step}, flush=True)
+            if args.cuda_memory_summary_on_exception and torch.cuda.is_available():
+                print(torch.cuda.memory_summary(
+                    device=torch.cuda.current_device(), abbreviated=True
+                ), flush=True)
+            raise
 
         optimizer.step()
         optimizer.scheduler_step()
@@ -332,11 +446,15 @@ def main():
             tqdm.write(f"Saved checkpoint {save_dir}")
 
     # Final save
-    save_dir = Path(args.out) / "final"
-    save_checkpoint(modules_by_device, optimizer, step, save_dir)
+    if not args.no_save:
+        save_dir = Path(args.out) / "final"
+        save_checkpoint(modules_by_device, optimizer, step, save_dir)
+        tqdm.write(f"Saved final checkpoint to {save_dir}")
+    else:
+        tqdm.write("Skipping final save (--no-save)")
     if log_file:
         log_file.close()
-    print(f"Training complete. Final model saved to {save_dir}", flush=True)
+    tqdm.write("Training complete")
 
 
 if __name__ == "__main__":

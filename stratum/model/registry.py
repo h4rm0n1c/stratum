@@ -20,13 +20,13 @@ class ModelArch:
     StratumPipeline, then uploads all weights to their assigned devices.
     """
 
-    def build_prefix(self, model: nn.Module) -> nn.Module:
+    def build_prefix(self, model: nn.Module, **kwargs) -> nn.Module:
         raise NotImplementedError
 
     def build_wrapped_layer(self, layer: nn.Module, idx: int, **kwargs) -> nn.Module:
         raise NotImplementedError
 
-    def build_postfix(self, model: nn.Module) -> nn.Module:
+    def build_postfix(self, model: nn.Module, **kwargs) -> nn.Module:
         raise NotImplementedError
 
     def get_config(self, model: nn.Module) -> Any:
@@ -68,7 +68,7 @@ class ModelArch:
         )
 
         # Build prefix (stays on CPU for now)
-        prefix = self.build_prefix(core)
+        prefix = self.build_prefix(core, **kwargs)
 
         # Build wrapped layers
         raw_layers = list(core.model.layers)
@@ -91,7 +91,7 @@ class ModelArch:
 
         # Build postfix (stays on CPU)
         last_device = stages[-1].device_id if stages else device_ids[0]
-        postfix = self.build_postfix(core)
+        postfix = self.build_postfix(core, **kwargs)
 
         pipeline = StratumPipeline(prefix, stages, postfix)
 
@@ -146,6 +146,13 @@ def build_pipeline(
     use_nf4: bool = True,
     nf4_cache_dir: Optional[str] = None,
     checkpoint_decoder_layer: bool = False,
+    loss_token_chunk_size: int = 4096,
+    postfix_loss_token_chunk_size: int = 0,
+    memory_telemetry: bool = False,
+    debug_finite: bool = False,
+    checkpoint_mlp: bool = False,
+    memory_flat_frozen_mlp: bool = False,
+    mlp_token_chunk_size: int = 0,
 ) -> StratumPipeline:
     """Build a StratumPipeline for a registered model architecture."""
     if model_name not in _registry:
@@ -158,4 +165,11 @@ def build_pipeline(
         hf_model, tensor_split=tensor_split, device_ids=device_ids,
         use_nf4=use_nf4, nf4_cache_dir=nf4_cache_dir,
         checkpoint_decoder_layer=checkpoint_decoder_layer,
+        loss_token_chunk_size=loss_token_chunk_size,
+        postfix_loss_token_chunk_size=postfix_loss_token_chunk_size,
+        memory_telemetry=memory_telemetry,
+        debug_finite=debug_finite,
+        checkpoint_mlp=checkpoint_mlp,
+        memory_flat_frozen_mlp=memory_flat_frozen_mlp,
+        mlp_token_chunk_size=mlp_token_chunk_size,
     )

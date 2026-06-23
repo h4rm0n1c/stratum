@@ -17,12 +17,63 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 from stratum.utils import log_event
 
 NF4_ATTR = "roundpipe_nf4_payload"
+
+
+@dataclass
+class NF4Stats:
+    """Structured NF4 preparation statistics (ported from roundpipe_nf4.py)."""
+    tensors: int = 0
+    source_bytes: int = 0
+    payload_bytes: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_writes: int = 0
+
+    @property
+    def compression(self) -> float:
+        if self.payload_bytes == 0:
+            return 0.0
+        return self.source_bytes / self.payload_bytes
+
+
+def _pin_cpu(t: torch.Tensor) -> torch.Tensor:
+    """Copy *t* to a pinned CPU buffer (faster H2D)."""
+    t = t.detach().contiguous().cpu()
+    if t.is_pinned():
+        return t
+    pinned = torch.empty_like(t, device=torch.device("cpu"), pin_memory=True)
+    pinned.copy_(t)
+    return pinned
+
+
+def _payload_bytes(*tensors: torch.Tensor) -> int:
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
+@dataclass
+class NF4Payload:
+    """NF4-quantized weight payload kept on CPU between steps.
+
+    Fields:
+        quantized:   NF4-quantized 4-bit data (uint8, 1/2 the element count of shape).
+        absmax:      Per-block absolute max values for dequantization.
+        code:        Quantization codebook (256 FP16 values).
+        shape:       Original weight shape (tuple).
+        dtype:       Original weight dtype.
+        source_bytes: Original weight size in bytes (for reporting).
+    """
+    quantized: torch.Tensor
+    absmax: torch.Tensor
+    code: torch.Tensor
+    shape: tuple
+    dtype: torch.dtype
+    source_bytes: int
 
 
 def _cache_path(cache_dir: Path, name: str) -> Path:
@@ -38,15 +89,19 @@ def prepare_nf4(
     min_numel: int = 4096,
     cache_dir: Optional[Path | str] = None,
     verbose: bool = True,
-) -> int:
+    blocksize: int = 64,
+    quant_type: str = "nf4",
+) -> NF4Stats:
     """Phase 1: quantize frozen 2D weights, attach NF4 payload, drop originals.
 
     Ported from roundpipe_nf4.py::prepare_nf4_frozen_params(). Drops original
     FP16 weight data (param.data = empty(0)) after quantizing.
+
+    Returns NF4Stats with tensors/bytes/cache counts.
     """
     from bitsandbytes.functional import quantize_4bit
 
-    tensors = 0
+    stats = NF4Stats()
     for name, param in module.named_parameters():
         if param.requires_grad:
             continue
@@ -57,58 +112,96 @@ def prepare_nf4(
         if param.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             continue
         if hasattr(param, NF4_ATTR):
-            tensors += 1
+            payload = cast(NF4Payload, getattr(param, NF4_ATTR))
+            stats.tensors += 1
+            stats.source_bytes += payload.source_bytes
+            stats.payload_bytes += _payload_bytes(payload.quantized, payload.absmax, payload.code)
             continue
 
         weight = param.detach().contiguous().cpu()
 
         cache_path = _cache_path(Path(cache_dir), name) if cache_dir else None
-        cached = None
+        payload = None
         if cache_path and cache_path.exists():
             try:
                 obj = torch.load(cache_path, map_location="cpu", weights_only=False)
                 if obj.get("shape") == tuple(weight.shape):
-                    cached = (obj["quantized"], obj["absmax"], obj["code"])
+                    payload = NF4Payload(
+                        quantized=_pin_cpu(obj["quantized"]),
+                        absmax=_pin_cpu(obj["absmax"]),
+                        code=_pin_cpu(obj["code"]),
+                        shape=tuple(weight.shape),
+                        dtype=weight.dtype,
+                        source_bytes=weight.numel() * weight.element_size(),
+                    )
+                    stats.cache_hits += 1
             except Exception:
                 pass
 
-        if cached:
-            quantized, absmax, code = cached
-        else:
+        if payload is None:
+            if cache_path is not None:
+                stats.cache_misses += 1
             quantized, q_state = quantize_4bit(
-                weight, blocksize=64, compress_statistics=False, quant_type="nf4",
+                weight, blocksize=blocksize, compress_statistics=False, quant_type=quant_type,
             )
-            absmax = q_state.absmax
-            code = q_state.code
+            payload = NF4Payload(
+                quantized=_pin_cpu(quantized),
+                absmax=_pin_cpu(q_state.absmax),
+                code=_pin_cpu(q_state.code),
+                shape=tuple(weight.shape),
+                dtype=weight.dtype,
+                source_bytes=weight.numel() * weight.element_size(),
+            )
             if cache_path:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = cache_path.with_name(f"{cache_path.name}.tmp")
                 torch.save({
-                    "shape": tuple(weight.shape),
-                    "dtype": str(weight.dtype).removeprefix("torch."),
-                    "quantized": quantized.contiguous().cpu(),
-                    "absmax": absmax.contiguous().cpu(),
-                    "code": code.contiguous().cpu(),
+                    "shape": tuple(payload.shape),
+                    "dtype": str(payload.dtype).removeprefix("torch."),
+                    "quantized": payload.quantized.detach().contiguous().cpu(),
+                    "absmax": payload.absmax.detach().contiguous().cpu(),
+                    "code": payload.code.detach().contiguous().cpu(),
                 }, tmp)
                 tmp.replace(cache_path)
+                stats.cache_writes += 1
 
-        setattr(param, NF4_ATTR, (quantized, absmax, code, tuple(weight.shape),
-                                  weight.dtype, weight.numel() * weight.element_size()))
+        setattr(param, NF4_ATTR, payload)
         param.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
-        tensors += 1
+        stats.tensors += 1
+        stats.source_bytes += payload.source_bytes
+        stats.payload_bytes += _payload_bytes(payload.quantized, payload.absmax, payload.code)
 
     if verbose:
-        src = sum(
-            getattr(p, NF4_ATTR)[5] for p in module.parameters() if hasattr(p, NF4_ATTR)
-        ) / 1024**3
-        pay = sum(
-            getattr(p, NF4_ATTR)[0].numel() * getattr(p, NF4_ATTR)[0].element_size()
-            + getattr(p, NF4_ATTR)[1].numel() * getattr(p, NF4_ATTR)[1].element_size()
-            + getattr(p, NF4_ATTR)[2].numel() * getattr(p, NF4_ATTR)[2].element_size()
-            for p in module.parameters() if hasattr(p, NF4_ATTR)
-        ) / 1024**3
-        print(f"  nf4 total: {tensors} tensors, {src:.2f} GiB -> {pay:.2f} GiB payload", flush=True)
-    return tensors
+        print(f"  nf4 total: {stats.tensors} tensors, "
+              f"{stats.source_bytes/1024**3:.2f} GiB -> {stats.payload_bytes/1024**3:.2f} GiB payload "
+              f"(compression {stats.compression:.2f}x, "
+              f"cache hits={stats.cache_hits} misses={stats.cache_misses} writes={stats.cache_writes})",
+              flush=True)
+    return stats
+
+
+@torch.no_grad()
+def estimate_module_upload_gib(module: torch.nn.Module) -> float:
+    """Estimate GPU upload footprint for a module, counting NF4 params after dequant.
+
+    Ported from roundpipe_nf4.py::estimate_module_upload_gib().
+    """
+    total = 0
+    seen: set[int] = set()
+    for param in module.parameters():
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+        payload = getattr(param, NF4_ATTR, None)
+        if payload is not None:
+            total += payload.source_bytes
+        else:
+            total += param.numel() * param.element_size()
+        if param.grad is not None:
+            total += param.grad.numel() * param.grad.element_size()
+    for buf in module.buffers():
+        total += buf.numel() * buf.element_size()
+    return total / 10**9
 
 
 @torch.no_grad()
@@ -138,7 +231,8 @@ def upload_stream(
 
         payload = getattr(param, NF4_ATTR, None)
         if payload is not None:
-            quantized_cpu, absmax_cpu, code_cpu, shape, dtype, _ = payload
+            quantized_cpu, absmax_cpu, code_cpu = payload.quantized, payload.absmax, payload.code
+            shape, dtype = payload.shape, payload.dtype
 
             q_gpu = quantized_cpu.to(device, non_blocking=False)
             a_gpu = absmax_cpu.to(device, non_blocking=False)
@@ -200,7 +294,8 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
         payload = getattr(param, NF4_ATTR, None)
         if payload is None:
             continue
-        quantized_cpu, absmax_cpu, code_cpu, shape, dtype, _ = payload
+        quantized_cpu, absmax_cpu, code_cpu = payload.quantized, payload.absmax, payload.code
+        shape, dtype = payload.shape, payload.dtype
         q_gpu = quantized_cpu.to(device, non_blocking=False)
         a_gpu = absmax_cpu.to(device, non_blocking=False)
         c_gpu = code_cpu.to(device, non_blocking=False)
