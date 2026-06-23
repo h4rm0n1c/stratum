@@ -1,7 +1,11 @@
 """Reusable pinned-memory buffer pool for host-staged cross-device transfers.
 
-Pattern from ggml_cuda_copy_across_devices (ggml-cuda.cu:1945-1981) and
-ggml_cuda_copy2d_across_devices (ggml-cuda.cu:1983-2050).
+Pattern from Harri's TurboQuant llama.cpp host-staged fallback:
+/home/harri/turboquant-work/llama-cpp-turboquant/ggml/src/ggml-cuda/ggml-cuda.cu
+
+Primary source functions:
+- ggml_cuda_copy_across_devices
+- ggml_cuda_copy2d_across_devices
 
 Three paths, tried in order:
 1. Peer access  -> cudaMemcpyPeerAsync  (direct GPU→GPU, fastest)

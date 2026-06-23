@@ -25,6 +25,8 @@ design decisions, and known tricky areas for handoff to other agents.
 | RoundPipe Qwen35 volta patch | `/home/harri/qz-roundpipe/scripts/patch_volta_attention.py` |
 | Design doc | `/home/harri/qz-roundpipe/docs/stratum-design.md` |
 | RAMP launch script | `/home/harri/qz-roundpipe/scripts/ramp_long_context.sh` |
+| **TurboQuant llama.cpp fork** | `/home/harri/turboquant-work/llama-cpp-turboquant/` |
+| Host-staged GPU copy source | `/home/harri/turboquant-work/llama-cpp-turboquant/ggml/src/ggml-cuda/ggml-cuda.cu` |
 | **Training data** | `/home/harri/qz-roundpipe/data/lfm25_fable_merged_48k_train.labels.jsonl` |
 | Data format | Pre-tokenized JSONL, 25K windows, ~43M supervised tokens |
 | Data source | Merged fable_5_distillation_merged_cleaned_25k + WithinUsAI pool |
@@ -298,6 +300,13 @@ between them:
    GPU→GPU copy through NVLink/NVSwitch. Fastest.
 2. **Host-staged path** (no P2P): D2H on source → pinned buffer → H2D on
    destination. Each pool instance handles one boundary.
+
+The host-staged fallback is adapted from Harri's TurboQuant llama.cpp work:
+`/home/harri/turboquant-work/llama-cpp-turboquant/ggml/src/ggml-cuda/ggml-cuda.cu`,
+specifically `ggml_cuda_copy_across_devices()` and
+`ggml_cuda_copy2d_across_devices()`. The key algorithmic point is a reusable
+pinned host staging pool that avoids per-copy `cudaMallocHost` overhead and
+falls back cleanly when CUDA peer access is unavailable.
 
 During backward, `make_boundary_hook()` uses `.to(device)` to move gradients
 back to the previous device.

@@ -41,8 +41,10 @@ New models register via `@register("name")` in `stratum/model/`.
 Stratum uses llama.cpp's `LLAMA_SPLIT_MODE_LAYER` algorithm to assign layers
 to devices proportional to their VRAM. At startup, frozen weights are uploaded
 via NF4 4-bit quantization (4x compression). During training, PCIe is used only
-for the hidden-state tensor at device boundaries — host-staged when peer access
-is unavailable.
+for the hidden-state tensor at device boundaries. When peer access is
+unavailable, the fallback stages through a reusable pinned host buffer, adapted
+from the local TurboQuant llama.cpp work in
+`/home/harri/turboquant-work/llama-cpp-turboquant/ggml/src/ggml-cuda/ggml-cuda.cu`.
 
 ## Components
 
@@ -91,7 +93,7 @@ Without the prior work these teams invested, Stratum would not exist.
 | Project | Contribution | Authors / Maintainers |
 |---------|-------------|-----------------------|
 | [RoundPipe](https://github.com/thustorage/RoundPipe) | Staged pipeline training framework that Stratum evolved from. The Prefix/WrappedLayer/Postfix module pattern, NF4 integration, and staged uploading are all adapted from RoundPipe's design. | ITcarrot, Tsinghua University |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | Multi-GPU layer split algorithm (`LLAMA_SPLIT_MODE_LAYER`, `llama-model.cpp:1265-1277`) and PCIe host-staged cross-device copy pattern (`ggml-cuda.cu:1950-1981`). | Georgi Gerganov and contributors |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) / TurboQuant local fork | Multi-GPU layer split algorithm (`LLAMA_SPLIT_MODE_LAYER`, `llama-model.cpp:1265-1277`) and Harri's PCIe host-staged cross-device copy fallback from `/home/harri/turboquant-work/llama-cpp-turboquant/ggml/src/ggml-cuda/ggml-cuda.cu` (`ggml_cuda_copy_across_devices`, `ggml_cuda_copy2d_across_devices`). | Georgi Gerganov and contributors; local TurboQuant work by Harri |
 | [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100) | V100 (SM70) flash attention kernel used by `Lfm25VoltaAttention` and `Qwen35VoltaAttention`. | ai-bond |
 | [bitsandbytes](https://github.com/TimDettmers/bitsandbytes) | NF4 4-bit quantization and dequantization kernels used for compressed weight upload. | Tim Dettmers, Facebook Research |
 | [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) | Efficient causal convolution kernels used by LFM2.5 ShortConv layers. | Tri Dao, Dao-AILab |
