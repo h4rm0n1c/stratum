@@ -1,14 +1,19 @@
 # Stratum Port TODO — RoundPipe → Multi-GPU Stratum
 
 **Principle:** Stratum is a heavy derivative of RoundPipe oriented towards
-spanned-weights multi-GPU training. EVERY mechanism in RoundPipe must be
-ported. No filtering, no "this isn't needed."
+spanned-weights multi-GPU training. The target is feature parity with every
+RoundPipe capability that is compatible with, or usefully adaptable to,
+Stratum's multi-GPU staged architecture. Do not discard a RoundPipe mechanism
+just because the exact implementation is tied to RoundPipe's single-runtime
+async scheduler; first decide whether the user-visible capability should be
+ported directly, adapted, or explicitly rejected with evidence.
 
 ## Status Legend
 - [ ] not started
 - [~] in progress
 - [x] done
-- [/] assessed — designed for RoundPipe's async per-layer pipeline, not applicable to Stratum's synchronous per-device streaming
+- [A] adapt — RoundPipe implementation does not fit directly, but the capability is still valuable for Stratum
+- [/] rejected — incompatible or no practical value after adaptation analysis
 
 ---
 
@@ -25,6 +30,11 @@ Key internal modules discovered:
 - `roundpipe/scheduler.py` — ModelExecutePlan, chunk_layer_params
 - `roundpipe/device.py` — DeviceManager (per-device streams)
 - `roundpipe/context.py` — ForwardCtx, RecomputeCtx, save_for_recompute
+- `roundpipe/batch.py` — pytree-aware microbatch split/merge, packed data handoff, AvgReducer
+- `roundpipe/timer.py` — CUDA-event per-layer fwd/recompute/bwd timing and smoothed estimates
+- `roundpipe/optim_stream.py` — background optimizer stream
+- `roundpipe/grad_scaler.py` — GradScaler compatible with async optimizer stream
+- `roundpipe/models/{llama,qwen3,qwen3_moe,gpt_oss}.py` — additional model adapters and MoE/router-loss patterns
 
 ---
 
@@ -120,10 +130,14 @@ Our current implementation:
 - Uses plain `F.cross_entropy` without torch.compile
 - Relies on outer autograd for backward instead of per-chunk backward
 
-**Port plan:**
+**Port status:**
 - [x] Add `--torch-compile-loss` flag — compiles CE in postfix `__init__` when set
 - [x] Approach: compile a closure in `__init__`, use it in forward's chunked loop
 - [x] Keep our current approach as the default (correct, no torch.compile dep)
+- [A] Add a Stratum-native `ChunkedLinearCrossEntropyFunction` that flattens
+  batch*seq, calls backward per chunk, and returns saved grads in its outer
+  backward. This is the missing RoundPipe memory behavior; current Stratum
+  chunking reduces logits size but still relies on outer autograd.
 
 ## 11. `PinnedUpload` Autograd Function
 
@@ -136,10 +150,18 @@ Custom autograd that:
 Makes H2D non-blocking even when caller provides pageable memory.
 Backward moves gradients back to pinned CPU for async D2H overlap.
 
-**Decision:** SKIP — Stratum uses sync `.to(device)` for NF4 H2D which doesn't
-benefit from PinnedUpload's async guarantees. NF4 payloads are already pinned
-by `_pin_cpu()`. The gradient-side backward (CPU gradient copy) doesn't apply
-because Stratum keeps gradients on GPU (PerDeviceOptimizer runs on GPU).
+**Parity decision:** ADAPT, not skip.
+
+The exact autograd wrapper is not useful for synchronous NF4 parameter H2D,
+but the capability is still useful at two Stratum boundaries:
+
+- [A] Introduce a small transfer/autograd utility for host-staged activation
+  transfers where gradients must return to the previous device or CPU with
+  pinned-memory guarantees.
+- [A] Reuse the pinned fallback for pageable user inputs if Stratum gains a
+  CPU-input pipeline API instead of requiring `input_ids.cuda(input_device)`.
+- [/] Do not use `PinnedUpload` for NF4 payload upload unless parameter H2D
+  becomes async; NF4 payloads are already pinned by `_pin_cpu()`.
 
 ## 12. `pin_module_alloc` / `pin_module_register` — `--pin-model`
 
@@ -171,9 +193,18 @@ chunk_nelements = math.ceil(src.nelement() / n_chunks)
 
 Stratum currently does single-shot `param.data = dequantized.contiguous()`.
 
-**Decision:** SKIP — Stratum NF4 weights are 4-bit on H2D (~1/8 FP16 size).
-A 2560×2560 weight matrix is ~3.3 MB over PCIe — too small to benefit from
-chunking. The dequant happens on GPU after the small NF4 upload completes.
+**Parity decision:** ADAPT selectively.
+
+NF4 H2D payloads are usually too small to justify RoundPipe's 256 MiB chunking
+threshold, but Stratum still has large non-NF4 tensors and dequantized
+temporary weights.
+
+- [A] Add size-aware chunked copy for non-NF4 permanent uploads in
+  `ModelArch.build()` and any future FP16/`--no-nf4` path.
+- [A] Add a configurable chunk threshold for `ensure_weights()` only if
+  profiling shows large payloads or monolithic dequant/copy stalls.
+- [/] Do not blindly chunk every NF4 tensor; that adds overhead to the common
+  small-payload path.
 
 ## 14. `RegisterBackwardEvent` Autograd Function
 
@@ -182,14 +213,16 @@ Source: `roundpipe/transfer.py:376-409`
 Records a CUDA event that backward synchronizes on. Ensures async
 uploads finish before backward accesses the tensor.
 
-**Assessment:** Designed for RoundPipe's fully async pipeline where
-layers are uploaded asynchronously and backward might race. Stratum
-uses synchronous per-stage streaming (ensure_weights → forward →
-next stage). Backward happens after all forwards complete. No race
-condition exists in Stratum's architecture.
+**Parity decision:** ADAPT if we add async transfers.
 
-- [/] **Not applicable** — Stratum's synchronous per-stage streaming
-  has no race between H2D upload and backward compute.
+There is no current race in synchronous `ensure_weights() -> forward`, but
+the event-guarding capability becomes necessary once Stratum overlaps stage
+weight upload, activation movement, or optimizer copies.
+
+- [A] Keep a Stratum-local equivalent ready for any async stage prefetch or
+  async host-staged activation path.
+- [/] Do not add it to the current synchronous weight path; there is no event
+  to guard today.
 
 ## 15. `async_d2h` / `async_h2d` — Async Host-Device Transfer
 
@@ -198,15 +231,18 @@ Source: `roundpipe/transfer.py:26-113`
 Async H2D/D2H with pinned buffers, stream ordering, event-based sync.
 Core of RoundPipe's overlapping strategy.
 
-**Assessment:** Stratum's `HostStagingPool` already provides host-staged
-cross-device transfers. For per-parameter H2D (NF4 → GPU), Stratum uses
-synchronous transfers because the NF4 payload stays on CPU and is only
-used once per step — there's no benefit to overlapping when we need the
-weight immediately for forward.
+**Parity decision:** ADAPT.
 
-- [/] **Not applicable** — `HostStagingPool` already handles cross-device
-  transfers. Per-param NF4 H2D benefits less from async because weights
-  are needed immediately.
+`HostStagingPool` covers the data path but not all RoundPipe semantics:
+stream ordering, event return values, reusable async H2D/D2H helpers, and
+explicit pinned fallback for pageable tensors.
+
+- [A] Extend `HostStagingPool.transfer()` to synchronize destination stream
+  correctness explicitly or return an event that callers must wait on.
+- [A] Implement generic `async_h2d` / `async_d2h` helpers for Stratum internal
+  tensors, using pinned fallback and stream/event ordering.
+- [A] Use these helpers for boundary hidden-state transfers and future
+  activation offload.
 
 ## 16. `upload_layers` / `download_layer` — RoundPipe's Upload Cycle
 
@@ -219,13 +255,23 @@ to bring frozen+trainable params to GPU for each forward.
 `download_layer`: Async gradient download from GPU back to CPU.
 Used to free GPU memory after backward, grads saved on CPU for optimizer.
 
-**Assessment:** Stratum's `ensure_weights`/`free_weights` is a simplified
-equivalent that handles NF4 streaming. The full `upload_layers` machinery
-is specific to RoundPipe's layer-at-a-time upload model. Stratum's
-per-stage streaming is different architecturally.
+**Parity decision:** ADAPT.
 
-- [/] **Not applicable** — Stratum's NF4 streaming (`ensure_weights` /
-  `free_weights`) fills the same role with a simpler interface.
+`ensure_weights()` / `free_weights()` covers frozen NF4 streaming, but does
+not cover RoundPipe's full memory behavior: independent module copies,
+buffer snapshots for recompute, async gradient download, reusable grad CPU
+buffers, or CPU optimizer storage.
+
+- [A] Add optional CPU/offloaded trainable-gradient mode for LoRA params:
+  download grads after backward, keep optimizer state on CPU or a selected
+  device, and re-upload updated trainable params before the next forward.
+- [A] Add buffer snapshot/restore support for recompute paths that mutate or
+  depend on buffers.
+- [A] Add an async stage prefetch experiment: upload next stage's NF4 payloads
+  while the current stage computes, with event fencing before use.
+- [/] Keep permanent in-place `DeviceStage` modules as the default; full
+  RoundPipe module-copy semantics are expensive and not required for the
+  current staged model layout.
 
 ## 17. `ModelExecutePlan` — Execution Planning
 
@@ -235,14 +281,20 @@ Forward/backward execution plans with per-layer scheduling. Supports
 multi-stage pipelining, fused-mode, and memory-budgeted planning.
 `--roundpipe-model-memory-limit-gib` controls the memory budget.
 
-**Assessment:** Stratum's layer assignment (`assign_layers_to_devices`)
-is simpler — it groups consecutive layers by device ratio. RoundPipe's
-scheduler is designed for per-layer async streaming within a single GPU,
-not for multi-device topology.
+**Parity decision:** ADAPT.
 
-- [/] **Not applicable** — Stratum uses device-level layer assignment
-  (`tensor_split` / `assign_layers_to_devices`), not per-layer execution
-  plans.
+`assign_layers_to_devices()` is a placement algorithm, not an execution
+planner. RoundPipe's planner provides memory-budgeted stage grouping and
+time-informed balancing; Stratum still needs analogous capabilities.
+
+- [A] Add a Stratum stage planner that can split a physical device's assigned
+  layer range into sub-stages for upload/free granularity.
+- [A] Add `--stratum-stage-memory-limit-gib` as the Stratum replacement for
+  `--roundpipe-model-memory-limit-gib`.
+- [A] Add per-layer/stage timing and feed that into future automatic
+  placement beyond raw VRAM ratios.
+- [/] Do not port RoundPipe fused-mode verbatim; Stratum's prefix/stage/postfix
+  topology needs a separate design.
 
 ## 18. CLI Flags — still missing from train.py
 
@@ -257,6 +309,131 @@ From RoundPipe scripts that Stratum doesn't have yet:
 - [ ] Build Docker image: `docker build -t stratum:latest .`
 - [ ] Test: 5 steps, batch=2, num_microbatch=2, tensor_split=[9,32]
 
+## 20. Batch API Parity — `roundpipe/batch.py`
+
+RoundPipe supports arbitrary pytree inputs, automatic split spec inference,
+custom split/merge functions, `AvgReducer`, and `RoundPipePackedData` for
+chaining pipeline outputs across RoundPipe calls.
+
+Current Stratum only handles the fixed training batch shape:
+`input_ids`, `attention_mask`, `labels`, with manual slicing in `train.py`.
+
+- [A] Move microbatch splitting into a reusable Stratum helper instead of
+  open-coded slicing in `scripts/train.py`.
+- [A] Add split/merge hooks or specs for non-standard inputs so Stratum can
+  support eval/debug calls and future model wrappers without hardcoding.
+- [A] Add a reducer abstraction for losses/outputs; default training should
+  keep token-weighted loss semantics, not blindly average per-microbatch losses.
+- [/] Do not require CPU-only user inputs like RoundPipe; Stratum's current
+  explicit input-device placement is acceptable, but the splitter should not
+  make that harder to change later.
+
+## 21. Recompute Context + RNG Parity — `roundpipe/context.py`, `run.py`
+
+RoundPipe exposes `save_for_recompute()` / `get_recompute_data()` and preserves
+CPU/CUDA RNG state for recomputation. Its model wrappers avoid rebuilding
+causal masks/RoPE during recompute by saving those non-grad tensors.
+
+Current Stratum uses PyTorch checkpointing in some wrappers, but lacks a
+generic recompute context and Qwen35 does not implement decoder-layer
+checkpointing at all.
+
+- [ ] Add Qwen35 `checkpoint_decoder_layer` support matching LFM25.
+- [A] Add a lightweight Stratum recompute context for non-grad per-layer data
+  such as causal masks, RoPE tensors, router token counts, and MoE metadata.
+- [A] Preserve RNG state explicitly for any custom recompute path that is not
+  delegated to `torch.utils.checkpoint`.
+- [A] Audit LFM25/Qwen35 prefixes against RoundPipe's `doing_recompute()` fast
+  path; avoid recomputing expensive masks/position embeddings during backward
+  when equivalent saved data can be used safely.
+
+## 22. Optimizer Stream / CPU Optimizer Parity
+
+RoundPipe has a background optimizer stream, optimizer-owned parameter copies,
+async `step()`, `synchronize()`, and a GradScaler designed for that async
+optimizer path.
+
+Current Stratum's `PerDeviceOptimizer` is synchronous and keeps trainable
+params, grads, and optimizer state on GPU.
+
+- [A] Add an optional CPU/offloaded optimizer mode for LoRA params. This is
+  valuable on low-VRAM devices even if slower.
+- [A] Add optional async optimizer stepping only after CPU/offload semantics
+  are correct; otherwise it mainly adds race risk.
+- [A] Add AMP/GradScaler support if Stratum starts using scaled mixed-precision
+  training beyond FP16 model weights.
+- [/] Keep the current synchronous per-device AdamW path as the default until
+  async/offloaded optimizer behavior is validated.
+
+## 23. Timing / Profiling Parity — `roundpipe/timer.py`, `profile.py`
+
+RoundPipe records CUDA-event timings for forward, recompute, and backward,
+then smooths estimates for scheduler decisions.
+
+Current Stratum logs step-level throughput and optional allocator telemetry,
+but it does not produce per-layer or per-stage timing estimates.
+
+- [A] Add `StageTimer` / `LayerTimer` instrumentation with CUDA events around
+  prefix, each wrapped layer, each stage, postfix, NF4 upload, and boundary
+  transfers.
+- [A] Emit timing to JSONL so long runs can tune tensor split and stage
+  memory limits empirically.
+- [A] Feed timing into future automatic placement/stage planning.
+
+## 24. Model Adapter Parity
+
+RoundPipe includes adapters for Llama, Qwen3, Qwen3-MoE, and GPT-OSS, including
+MoE router logits/loss handling and optimized expert routing paths.
+
+Current Stratum registers only `lfm25-8b-a1b` and `qwen3.5`.
+
+- [ ] Add a generic Llama-family adapter from RoundPipe's `llama.py` as the
+  baseline for non-LFM/non-Qwen models.
+- [ ] Add Qwen3 adapter parity separate from Qwen3.5 if HF class names and
+  attention/mask behavior differ.
+- [A] Add MoE/router-loss tuple support before adding Qwen3-MoE or GPT-OSS
+  adapters. The current fixed 7-tuple cannot carry router logits cleanly.
+- [A] Port RoundPipe's optimized MoE expert token-count recompute pattern for
+  any Stratum MoE adapter.
+
+## 25. Correctness / Sharp-Edge Backlog
+
+These came from the audit and are not RoundPipe feature gaps, but they affect
+parity quality.
+
+- [ ] Fix `stratum/__init__.py` exporting `"upload_to_device"` even though no
+  such symbol is imported.
+- [ ] Validate `HostStagingPool.transfer()` destination-stream ordering. It
+  currently launches H2D on a side stream and returns without an explicit wait
+  by the default compute stream.
+- [ ] Verify Qwen35 prefix/mask behavior against RoundPipe Qwen3: RoundPipe
+  can build full/sliding causal masks, while Stratum mostly passes `None` or
+  raw `attention_mask`.
+- [ ] Re-check PEFT save/load after pipeline build: stage layers share base
+  parameter objects, but prefix/postfix are deep copies. This is intentional
+  for frozen weights, but any future trainable prefix/postfix params would need
+  explicit handling.
+- [ ] Add lightweight unit tests for `assign_layers_to_devices`, NF4 payload
+  lifecycle, checkpoint metadata, and microbatch loss normalization. Current
+  validation is mostly GPU smoke scripts.
+
+## 26. Implementation Order
+
+Recommended order for reaching practical parity:
+
+1. Fix small correctness issues: stale export, Qwen35 checkpointing, transfer
+   stream wait, unit tests.
+2. Port RoundPipe's custom chunked linear CE autograd behavior, because this
+   directly affects long-context VRAM.
+3. Add Stratum timing instrumentation so later scheduler work is evidence-based.
+4. Add stage-memory-limit planning and intra-device sub-stages.
+5. Add generic microbatch split/reduce helpers.
+6. Add async transfer helpers and event fencing; then experiment with NF4
+   prefetch.
+7. Add CPU/offloaded optimizer mode.
+8. Expand model adapters: Llama, Qwen3, then MoE/GPT-OSS after tuple/router
+   support exists.
+
 ---
 
 ## Summary of decisions
@@ -264,11 +441,16 @@ From RoundPipe scripts that Stratum doesn't have yet:
 | Section | Decision | Reason |
 |---|---|---|
 | 9. Checkpoint format | **PORTED** | PEFT-compatible safetensors via hf_model.save_pretrained |
-| 10. Torch-compiled loss | **PORTED** | --torch-compile-loss flag, compiles CE in postfix |
-| 11. PinnedUpload | **SKIP** | Stratum uses sync .to() not async H2D for params; _pin_cpu already handles NF4 pinning |
+| 10. Torch-compiled loss | **PARTIAL / ADAPT** | --torch-compile-loss exists, but RoundPipe's per-chunk backward custom autograd is not ported |
+| 11. PinnedUpload | **ADAPT** | Useful for activation/offload transfer paths, not current sync NF4 upload |
 | 12. pin_model | **PORTED** | --pin-model {alloc,register,off}, both strategies in stratum/memory.py |
-| 13. Chunked upload | **SKIP** | Stratum NF4 weights are 4-bit (1/8 FP16 size) on H2D; dequant happens on GPU, so H2D payload is already tiny (~3 MB per weight) |
-| 14. RegisterBackwardEvent | **SKIP** | Stratum has no race between H2D upload and backward compute |
-| 15. async_d2h/h2d | **SKIP** | HostStagingPool already covers cross-device transfers |
-| 16. upload_layers/download_layer | **SKIP** | ensure_weights/free_weights is Stratum's equivalent |
-| 17. ModelExecutePlan | **SKIP** | assign_layers_to_devices is Stratum's equivalent |
+| 13. Chunked upload | **ADAPT** | Needed for non-NF4 and no-NF4 large tensors, not every NF4 payload |
+| 14. RegisterBackwardEvent | **ADAPT** | Needed when Stratum adds async prefetch/offload; not current sync path |
+| 15. async_d2h/h2d | **ADAPT** | HostStagingPool covers part of it but lacks generic helpers and full event semantics |
+| 16. upload_layers/download_layer | **ADAPT** | ensure/free covers frozen NF4 only; grad/offload/buffer behavior still missing |
+| 17. ModelExecutePlan | **ADAPT** | Stratum needs its own stage-memory/timing planner, not RoundPipe's exact plan |
+| 20. Batch API | **ADAPT** | Current fixed train loop lacks RoundPipe's pytree split/merge/reduce flexibility |
+| 21. Recompute context/RNG | **ADAPT** | Needed for Qwen checkpointing, MoE metadata, and mask/RoPE recompute avoidance |
+| 22. Optimizer stream/scaler | **ADAPT** | Optional CPU/offloaded optimizer has value; async step should come later |
+| 23. Timing/profiling | **ADAPT** | Needed to make scheduler decisions evidence-based |
+| 24. Model adapters | **PENDING** | Llama/Qwen3/MoE/GPT-OSS parity not present in Stratum |

@@ -32,48 +32,55 @@ design decisions, and known tricky areas for handoff to other agents.
 | **Hardware** | RTX 3080 (12 GiB, GPU 0) + V100 (32 GiB, GPU 1) |
 | **Docker image** | `stratum:latest` (sha `8226fc73`), rebuild from `Dockerfile` |
 
-## RoundPipe Comparison — What's Ported and What's Different
+## RoundPipe Comparison — Ported, Adapted, Still Missing
 
 Stratum is built from the qz-roundpipe training scripts but replaces RoundPipe's
-internal runtime with a custom multi-GPU pipeline. Every mechanism that affects
-**training correctness** is ported. Some RoundPipe internals are intentionally
-not ported due to architectural differences.
+internal runtime with a custom multi-GPU pipeline. The goal is practical
+feature parity with RoundPipe where the capability is compatible with Stratum's
+multi-GPU staged architecture. Some mechanisms are direct ports; others need a
+Stratum-native adaptation rather than RoundPipe's exact async implementation.
 
-### Training mechanisms — ALL PORTED
+See `STRATUM-PORT-TODO.md` for the active parity backlog and implementation
+order.
+
+### Training mechanisms
 
 | Mechanism | RoundPipe | Stratum | Status |
 |---|---|---|---|
 | NF4 frozen weight streaming | `NF4Linear` JIT-dequant on GPU | CPU→GPU H2D + dequant per step | Different approach, same semantics |
-| Chunked lm_head loss | `ChunkedCompileLinearForCausalLMLoss` | Chunked `CE(reduction="sum")` in postfix | Equivalent |
+| Chunked lm_head loss | `ChunkedCompileLinearForCausalLMLoss` custom autograd | Chunked `CE(reduction="sum")` in postfix | Partial; missing per-chunk backward memory behavior |
 | Blocked postfix loss | `BlockedPostfixCausalLMLoss` (batch=1 only) | Same, ported to `blocked_loss.py` | Identical |
-| Microbatching | `num_microbatch` in `RoundPipeRunConfig` | Manual loop in `train.py` | Equivalent |
-| Activation checkpointing | `checkpoint(run_layer, ...)` per decoder layer | Same, in `LFM25ForCausalLMWrappedLayer` | Identical |
+| Microbatching | `num_microbatch` plus pytree split/merge hooks | Manual loop in `train.py` | Basic training path only |
+| Activation checkpointing | `checkpoint(run_layer, ...)` per decoder layer | LFM25 only | Qwen35 still missing |
 | MLP checkpointing | `CheckpointedModule` | Same, in `mlp_opt.py` | Identical |
 | MLP token chunking | `TokenChunkedModule` | Same, in `mlp_opt.py` | Identical |
 | Memory-flat frozen MLP | `MemoryFlatFrozenMLP` custom autograd | Same, in `mlp_opt.py` | Identical |
 | Selective volta patching | `--volta-layers`, `--volta-window-*` | Same | Identical |
 | LoRA adapter checkpoint | `base.save_pretrained()` (PEFT safetensors) | Same via `hf_model.save_pretrained()` | Identical |
 
-### CLI flags — ALL PORTED
+### CLI flags
 
-Every flag from `train_lfm25_roundpipe_lora.py` and `train_qwen35_roundpipe_lora.py`
-exists in `scripts/train.py`. See CLI reference below.
+Most training flags from `train_lfm25_roundpipe_lora.py` and
+`train_qwen35_roundpipe_lora.py` exist in `scripts/train.py`. RoundPipe runtime
+flags that depend on its scheduler need Stratum-native replacements rather than
+literal ports. See CLI reference below and `STRATUM-PORT-TODO.md`.
 
-### RoundPipe internals — intentionally NOT ported
+### RoundPipe internals — adaptation backlog
 
-These are RoundPipe's internal runtime components that Stratum replaces:
+These RoundPipe runtime components should not be copied verbatim, but their
+useful capability should be adapted where it helps Stratum:
 
-| RoundPipe internal | What it does | Why not ported | Stratum equivalent |
+| RoundPipe internal | What it does | Current Stratum state | Adaptation direction |
 |---|---|---|---|
-| `upload_layers()` | Copies layers to GPU with chunked async upload | Stratum uses per-stage sync streaming | `ensure_weights()` + `free_weights()` |
-| `download_layer()` | Async gradient D2H after backward | Stratum keeps grads on GPU for `PerDeviceOptimizer` | Grads stay on GPU |
-| `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | Stratum uses sync `.to(device)`, NF4 payloads already pinned | `_pin_cpu()` in `upload.py` |
-| `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | Stratum syncs per-stage, no race condition | Not needed |
-| `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | Stratum groups layers by device, no per-layer plan | `assign_layers_to_devices()` |
-| `DeviceManager` | Per-device stream management (upstream/downstream/compute) | Stratum uses `HostStagingPool` for boundaries, no per-param streams | `HostStagingPool` |
-| `ParamAttribute` / `LayerAttribute` | Per-param upload/grad state tracking | Stratum tracks via NF4 payload attr, no upload events needed | `roundpipe_nf4_payload` attr |
+| `upload_layers()` | Copies layers to GPU with chunked async upload | `ensure_weights()` + `free_weights()` handle frozen NF4 only | Add optional prefetch/chunked non-NF4 upload |
+| `download_layer()` | Async gradient D2H after backward | Grads stay on GPU for `PerDeviceOptimizer` | Add optional CPU/offloaded LoRA optimizer path |
+| `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | NF4 payloads already pinned; sync upload path | Reuse for host-staged activation/offload transfers |
+| `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | No current race in sync weight path | Add when async prefetch/offload exists |
+| `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` only places layers | Add Stratum stage-memory planner and timing feedback |
+| `DeviceManager` | Per-device stream management (upstream/downstream/compute) | `HostStagingPool` covers boundary transfers only | Add explicit stream/event semantics for async paths |
+| `ParamAttribute` / `LayerAttribute` | Per-param upload/grad state tracking | `roundpipe_nf4_payload` attr tracks frozen NF4 | Add richer state only for async/offloaded modes |
 | `pin_module_alloc` / `pin_module_register` | CPU memory pinning strategies | **PORTED** to `stratum/memory.py` | Same |
-| `async_d2h` / `async_h2d` | Async host-device with event sync | Stratum uses `HostStagingPool` for cross-device, sync for weight H2D | `HostStagingPool.transfer()` |
+| `async_d2h` / `async_h2d` | Async host-device with event sync | `HostStagingPool` covers part of the data path | Add generic helpers with event fencing |
 
 ### Why some things are different
 
@@ -94,14 +101,14 @@ on the simpler synchronous pattern for multi-GPU correctness. The tradeoff
 is less opportunity for overlap vs. simpler code that's easier to verify
 across device boundaries.
 
-### Unported features (exist only in qz-roundpipe, not needed for Stratum)
+### qz-roundpipe compatibility notes
 
 | Feature | Reason |
 |---|---|
 | Operator telemetry hooks | Debugging only, no correctness impact |
 | Memory watchdog `/proc/self/status` | Safety guard, **PORTED** to `watchdog.py` |
 | `--pin-model` strategies | **PORTED** to `memory.py` |
-| `--roundpipe-model-memory-limit-gib` | RoundPipe's scheduler hint, not applicable to Stratum's device groups |
+| `--roundpipe-model-memory-limit-gib` | Needs Stratum replacement: planned as `--stratum-stage-memory-limit-gib` |
 | `--dense-attention-masks` | **PORTED** (passed to build kwargs) |
 
 ## Architecture Overview
