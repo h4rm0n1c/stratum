@@ -287,9 +287,9 @@ multi-stage pipelining, fused-mode, and memory-budgeted planning.
 planner. RoundPipe's planner provides memory-budgeted stage grouping and
 time-informed balancing; Stratum still needs analogous capabilities.
 
-- [A] Add a Stratum stage planner that can split a physical device's assigned
+- [x] Add a Stratum stage planner that can split a physical device's assigned
   layer range into sub-stages for upload/free granularity.
-- [A] Add `--stratum-stage-memory-limit-gib` as the Stratum replacement for
+- [x] Add `--stratum-stage-memory-limit-gib` as the Stratum replacement for
   `--roundpipe-model-memory-limit-gib`.
 - [A] Add per-layer/stage timing and feed that into future automatic
   placement beyond raw VRAM ratios.
@@ -427,7 +427,7 @@ Recommended order for reaching practical parity:
 2. [x] Port RoundPipe's custom chunked linear CE autograd behavior, because this
    directly affects long-context VRAM.
 3. [x] Add Stratum timing instrumentation so later scheduler work is evidence-based.
-4. Add stage-memory-limit planning and intra-device sub-stages.
+4. [x] Add stage-memory-limit planning and intra-device sub-stages.
 5. Add generic microbatch split/reduce helpers.
 6. Add async transfer helpers and event fencing; then experiment with NF4
    prefetch.
@@ -449,7 +449,7 @@ Recommended order for reaching practical parity:
 | 14. RegisterBackwardEvent | **ADAPT** | Needed when Stratum adds async prefetch/offload; not current sync path |
 | 15. async_d2h/h2d | **ADAPT** | HostStagingPool covers part of it but lacks generic helpers and full event semantics |
 | 16. upload_layers/download_layer | **ADAPT** | ensure/free covers frozen NF4 only; grad/offload/buffer behavior still missing |
-| 17. ModelExecutePlan | **ADAPT** | Stratum needs its own stage-memory/timing planner, not RoundPipe's exact plan |
+| 17. ModelExecutePlan | **PARTIAL / ADAPT** | Stage memory splitting is ported; timing-fed placement remains |
 | 20. Batch API | **ADAPT** | Current fixed train loop lacks RoundPipe's pytree split/merge/reduce flexibility |
 | 21. Recompute context/RNG | **ADAPT** | Needed for Qwen checkpointing, MoE metadata, and mask/RoPE recompute avoidance |
 | 22. Optimizer stream/scaler | **ADAPT** | Optional CPU/offloaded optimizer has value; async step should come later |

@@ -8,6 +8,7 @@ from stratum.pipeline import StratumPipeline
 from stratum.host_staging import HostStagingPool
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
+from stratum.planner import estimate_module_bytes, split_layers_by_memory_limit
 from stratum.timing import TimingRecorder
 from stratum.model.registry import build_pipeline
 from stratum.upload import prepare_nf4, upload_stream, NF4Stats, estimate_module_upload_gib
@@ -35,6 +36,8 @@ __all__ = [
     "PerDeviceOptimizer",
     "save_checkpoint",
     "load_checkpoint",
+    "estimate_module_bytes",
+    "split_layers_by_memory_limit",
     "TimingRecorder",
     "build_pipeline",
     "prepare_nf4",

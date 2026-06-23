@@ -140,6 +140,8 @@ def main():
                     help="Split batch into N microbatches (gradient accumulation, saves VRAM)")
     ap.add_argument("--no-nf4", action="store_true",
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
+    ap.add_argument("--stratum-stage-memory-limit-gib", type=float, default=0.0,
+                    help="Split per-device layer groups into substages below this upload footprint (0 = disabled)")
     ap.add_argument("--nf4-cache-dir", default=None,
                     help="Directory to cache quantised NF4 payloads")
     ap.add_argument("--resume", default="",
@@ -209,6 +211,8 @@ def main():
         raise ValueError("--mlp-token-chunk-size must be >= 0")
     if args.postfix_loss_token_chunk_size < 0:
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
+    if args.stratum_stage_memory_limit_gib < 0:
+        raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
 
     # Detect devices
     devices = get_device_info()
@@ -310,6 +314,7 @@ def main():
         volta_window_right=args.volta_window_right,
         dense_attention_masks=args.dense_attention_masks,
         torch_compile_loss=args.torch_compile_loss,
+        stage_memory_limit_gib=args.stratum_stage_memory_limit_gib,
     )
     timing_recorder = TimingRecorder(args.timing_jsonl, enabled=bool(args.timing_jsonl))
     pipeline.set_timing_recorder(timing_recorder if args.timing_jsonl else None)

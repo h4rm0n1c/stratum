@@ -7,9 +7,11 @@ import torch.nn as nn
 
 from stratum.pipeline import StratumPipeline
 from stratum.assign import assign_layers_to_devices
+from stratum.planner import split_layers_by_memory_limit
 from stratum.stage import DeviceStage
 from stratum.upload import prepare_nf4, upload_stream, ensure_weights, free_weights, NF4_ATTR
 from stratum.nf4_linear import NF4Linear
+from stratum.utils import log_event
 
 
 class ModelArch:
@@ -44,6 +46,7 @@ class ModelArch:
         use_nf4: bool = True,
         nf4_cache_dir: Optional[str] = None,
         checkpoint_decoder_layer: bool = False,
+        stage_memory_limit_gib: float = 0.0,
         verbose: bool = True,
     ) -> StratumPipeline:
         """Build a StratumPipeline from a HuggingFace model.
@@ -87,7 +90,20 @@ class ModelArch:
         stages = []
         for dev in device_ids:
             if device_groups[dev]:
-                stages.append(DeviceStage(device_groups[dev], device_id=dev))
+                stage_groups = split_layers_by_memory_limit(
+                    device_groups[dev],
+                    stage_memory_limit_gib,
+                )
+                if stage_memory_limit_gib > 0 and len(stage_groups) > 1:
+                    log_event(
+                        "stage_memory_split",
+                        device=dev,
+                        layers=len(device_groups[dev]),
+                        substages=len(stage_groups),
+                        limit_gib=stage_memory_limit_gib,
+                    )
+                for group in stage_groups:
+                    stages.append(DeviceStage(group, device_id=dev))
 
         # Build postfix (stays on CPU)
         last_device = stages[-1].device_id if stages else device_ids[0]
@@ -154,6 +170,11 @@ def build_pipeline(
     memory_flat_frozen_mlp: bool = False,
     mlp_token_chunk_size: int = 0,
     torch_compile_loss: bool = False,
+    stage_memory_limit_gib: float = 0.0,
+    volta_layers: str = "",
+    volta_window_left: int = -1,
+    volta_window_right: int = 0,
+    dense_attention_masks: bool = False,
 ) -> StratumPipeline:
     """Build a StratumPipeline for a registered model architecture."""
     if model_name not in _registry:
@@ -174,4 +195,9 @@ def build_pipeline(
         memory_flat_frozen_mlp=memory_flat_frozen_mlp,
         mlp_token_chunk_size=mlp_token_chunk_size,
         torch_compile_loss=torch_compile_loss,
+        stage_memory_limit_gib=stage_memory_limit_gib,
+        volta_layers=volta_layers,
+        volta_window_left=volta_window_left,
+        volta_window_right=volta_window_right,
+        dense_attention_masks=dense_attention_masks,
     )

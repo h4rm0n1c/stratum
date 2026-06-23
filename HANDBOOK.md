@@ -78,7 +78,7 @@ useful capability should be adapted where it helps Stratum:
 | `download_layer()` | Async gradient D2H after backward | Grads stay on GPU for `PerDeviceOptimizer` | Add optional CPU/offloaded LoRA optimizer path |
 | `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | NF4 payloads already pinned; sync upload path | Reuse for host-staged activation/offload transfers |
 | `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | No current race in sync weight path | Add when async prefetch/offload exists |
-| `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` places layers; timing JSONL is available | Add Stratum stage-memory planner |
+| `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` plus optional stage memory splitting; timing JSONL is available | Feed timing into automatic placement |
 | `DeviceManager` | Per-device stream management (upstream/downstream/compute) | `HostStagingPool` covers boundary transfers only | Add explicit stream/event semantics for async paths |
 | `ParamAttribute` / `LayerAttribute` | Per-param upload/grad state tracking | `roundpipe_nf4_payload` attr tracks frozen NF4 | Add richer state only for async/offloaded modes |
 | `pin_module_alloc` / `pin_module_register` | CPU memory pinning strategies | **PORTED** to `stratum/memory.py` | Same |
@@ -396,6 +396,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--no-nf4` | False | Disable NF4 frozen weight compression (FP16 direct upload) |
 | `--nf4-cache-dir` | None | Directory to cache NF4 payloads |
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
+| `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
 | `--checkpoint-mlp` | False | Wrap MLP in activation checkpointing |
 | `--mlp-token-chunk-size` | 0 | Split MLP forward into token chunks (0 = disabled) |
 | `--memory-flat-frozen-mlp` | False | Frozen MLP with token-chunked backward recompute |
