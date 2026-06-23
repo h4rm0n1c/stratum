@@ -153,6 +153,7 @@ def build_pipeline(
     checkpoint_mlp: bool = False,
     memory_flat_frozen_mlp: bool = False,
     mlp_token_chunk_size: int = 0,
+    torch_compile_loss: bool = False,
 ) -> StratumPipeline:
     """Build a StratumPipeline for a registered model architecture."""
     if model_name not in _registry:
@@ -172,4 +173,5 @@ def build_pipeline(
         checkpoint_mlp=checkpoint_mlp,
         memory_flat_frozen_mlp=memory_flat_frozen_mlp,
         mlp_token_chunk_size=mlp_token_chunk_size,
+        torch_compile_loss=torch_compile_loss,
     )

@@ -177,12 +177,25 @@ class Qwen35ForCausalLMPostfix(nn.Module):
     def __init__(self, model, *, loss_token_chunk_size: int = 4096,
                  postfix_loss_token_chunk_size: int = 0,
                  memory_telemetry: bool = False,
-                 debug_finite: bool = False):
+                 debug_finite: bool = False,
+                 torch_compile_loss: bool = False):
         super().__init__()
         self.loss_token_chunk_size = loss_token_chunk_size
         self.postfix_loss_token_chunk_size = postfix_loss_token_chunk_size
         self.memory_telemetry = memory_telemetry
         self.debug_finite = debug_finite
+        self._ce_compiled = None
+        if torch_compile_loss:
+            try:
+                import torch
+                @torch.compile
+                def _ce_fn(logits, labels, ignore_index):
+                    return nn.functional.cross_entropy(
+                        logits.float(), labels, ignore_index=ignore_index, reduction="sum",
+                    )
+                self._ce_compiled = _ce_fn
+            except Exception as exc:
+                print(f"torch_compile_loss not available: {exc}", flush=True)
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
         import copy
         self.norm = copy.deepcopy(core.model.norm)
@@ -230,12 +243,18 @@ class Qwen35ForCausalLMPostfix(nn.Module):
                 chunk_h = shift_hidden[:, start:end, :].contiguous()
                 chunk_l = shift_labels[:, start:end].contiguous()
                 logits = self.lm_head(chunk_h)
-                cl = nn.functional.cross_entropy(
-                    logits.reshape(-1, self.vocab_size),
-                    chunk_l.reshape(-1),
-                    ignore_index=-100,
-                    reduction="sum",
-                )
+                if self._ce_compiled is not None:
+                    cl = self._ce_compiled(
+                        logits.reshape(-1, self.vocab_size),
+                        chunk_l.reshape(-1), -100,
+                    )
+                else:
+                    cl = nn.functional.cross_entropy(
+                        logits.reshape(-1, self.vocab_size),
+                        chunk_l.reshape(-1),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
                 loss_sum = loss_sum + cl
             loss = loss_sum / num_items
 
@@ -260,6 +279,7 @@ class Qwen35Arch(ModelArch):
             postfix_loss_token_chunk_size=kwargs.get("postfix_loss_token_chunk_size", 0),
             memory_telemetry=kwargs.get("memory_telemetry", False),
             debug_finite=kwargs.get("debug_finite", False),
+            torch_compile_loss=kwargs.get("torch_compile_loss", False),
         )
 
     def build(self, hf_model, tensor_split=None, device_ids=None, **kwargs):

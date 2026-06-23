@@ -182,6 +182,17 @@ def main():
                     help="Skip final save_pretrained call")
     ap.add_argument("--dense-attention-masks", action="store_true",
                     help="Force HF dense causal mask construction")
+    # Pinning strategy
+    ap.add_argument("--pin-model", default="alloc",
+                    choices=["alloc", "register", "off"],
+                    help="CPU memory pinning strategy for faster H2D transfers")
+    # Loss optimization
+    ap.add_argument("--torch-compile-loss", action="store_true",
+                    help="Enable torch.compile on cross-entropy loss computation")
+    # LoRA target selection
+    ap.add_argument("--lora-target-set", default="all",
+                    choices=["all", "attention", "attention_input", "mlp"],
+                    help="LoRA module set. Narrower sets reduce memory.")
     args = ap.parse_args()
 
     # Arg validation (same guards as RoundPipe)
@@ -233,16 +244,31 @@ def main():
     print("Model loaded on CPU", flush=True)
 
     # Apply LoRA
+    def _lora_target_modules(target_set: str) -> list[str]:
+        attention_input = [
+            "q_proj", "k_proj", "v_proj",
+            "in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z",
+            "qkv",
+        ]
+        attention_output = ["o_proj", "out_proj"]
+        mlp = ["gate_proj", "up_proj", "down_proj", "linear_fc1", "linear_fc2"]
+        broad = ["proj"]
+        if target_set == "attention_input":
+            return attention_input
+        if target_set == "attention":
+            return attention_input + attention_output
+        if target_set == "mlp":
+            return mlp
+        return attention_input + attention_output + mlp + broad
+
+    target_modules = _lora_target_modules(args.lora_target_set)
     lora_cfg = LoraConfig(
         r=args.lora_r,
         lora_alpha=16,
         lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        target_modules=target_modules,
     )
     hf_model = get_peft_model(hf_model, lora_cfg)
     hf_model.print_trainable_parameters()
@@ -279,7 +305,24 @@ def main():
         volta_window_left=args.volta_window_left,
         volta_window_right=args.volta_window_right,
         dense_attention_masks=args.dense_attention_masks,
+        torch_compile_loss=args.torch_compile_loss,
     )
+
+    # Pin model memory for faster H2D (if enabled)
+    if args.pin_model != "off":
+        from stratum.memory import pin_module_alloc, pin_module_register
+        if args.pin_model == "register":
+            pin_module_register(pipeline.prefix)
+            pin_module_register(pipeline.postfix)
+            for stage in pipeline.stages:
+                pin_module_register(stage)
+            print("  pin_model: register (cudaHostRegister)", flush=True)
+        else:
+            pin_module_alloc(pipeline.prefix)
+            pin_module_alloc(pipeline.postfix)
+            for stage in pipeline.stages:
+                pin_module_alloc(stage)
+            print("  pin_model: alloc (pin_memory)", flush=True)
 
     # Determine input device (prefix location)
     input_device = pipeline.stages[0].device_id if pipeline.stages else 0
@@ -335,6 +378,7 @@ def main():
         if (resume_dir / "meta.pt").exists():
             start_step = load_checkpoint(
                 modules_by_device, optimizer, resume_dir,
+                peft_model=hf_model,
             )
             print(f"Resumed from step {start_step}", flush=True)
         else:
@@ -442,13 +486,15 @@ def main():
         # Periodic save
         if args.save_every > 0 and step % args.save_every == 0:
             save_dir = Path(args.out) / f"checkpoint-{step}"
-            save_checkpoint(modules_by_device, optimizer, step, save_dir)
+            save_checkpoint(modules_by_device, optimizer, step, save_dir,
+                            peft_model=hf_model)
             tqdm.write(f"Saved checkpoint {save_dir}")
 
     # Final save
     if not args.no_save:
         save_dir = Path(args.out) / "final"
-        save_checkpoint(modules_by_device, optimizer, step, save_dir)
+        save_checkpoint(modules_by_device, optimizer, step, save_dir,
+                        peft_model=hf_model)
         tqdm.write(f"Saved final checkpoint to {save_dir}")
     else:
         tqdm.write("Skipping final save (--no-save)")
