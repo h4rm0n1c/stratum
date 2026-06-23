@@ -50,7 +50,7 @@ order.
 | Mechanism | RoundPipe | Stratum | Status |
 |---|---|---|---|
 | NF4 frozen weight streaming | `NF4Linear` JIT-dequant on GPU | CPU→GPU H2D + dequant per step | Different approach, same semantics |
-| Chunked lm_head loss | `ChunkedCompileLinearForCausalLMLoss` custom autograd | Chunked `CE(reduction="sum")` in postfix | Partial; missing per-chunk backward memory behavior |
+| Chunked lm_head loss | `ChunkedCompileLinearForCausalLMLoss` custom autograd | `ChunkedLinearCrossEntropyFunction` in postfix | Equivalent custom per-chunk backward |
 | Blocked postfix loss | `BlockedPostfixCausalLMLoss` (batch=1 only) | Same, ported to `blocked_loss.py` | Identical |
 | Microbatching | `num_microbatch` plus pytree split/merge hooks | Manual loop in `train.py` | Basic training path only |
 | Activation checkpointing | `checkpoint(run_layer, ...)` per decoder layer | LFM25 only | Qwen35 still missing |

@@ -134,10 +134,10 @@ Our current implementation:
 - [x] Add `--torch-compile-loss` flag — compiles CE in postfix `__init__` when set
 - [x] Approach: compile a closure in `__init__`, use it in forward's chunked loop
 - [x] Keep our current approach as the default (correct, no torch.compile dep)
-- [A] Add a Stratum-native `ChunkedLinearCrossEntropyFunction` that flattens
+- [x] Add a Stratum-native `ChunkedLinearCrossEntropyFunction` that flattens
   batch*seq, calls backward per chunk, and returns saved grads in its outer
-  backward. This is the missing RoundPipe memory behavior; current Stratum
-  chunking reduces logits size but still relies on outer autograd.
+  backward. This ports RoundPipe's missing memory behavior beyond the earlier
+  forward-only logits chunking.
 
 ## 11. `PinnedUpload` Autograd Function
 
@@ -423,7 +423,7 @@ Recommended order for reaching practical parity:
 
 1. Fix small correctness issues: stale export, Qwen35 checkpointing, transfer
    stream wait, unit tests.
-2. Port RoundPipe's custom chunked linear CE autograd behavior, because this
+2. [x] Port RoundPipe's custom chunked linear CE autograd behavior, because this
    directly affects long-context VRAM.
 3. Add Stratum timing instrumentation so later scheduler work is evidence-based.
 4. Add stage-memory-limit planning and intra-device sub-stages.
@@ -441,7 +441,7 @@ Recommended order for reaching practical parity:
 | Section | Decision | Reason |
 |---|---|---|
 | 9. Checkpoint format | **PORTED** | PEFT-compatible safetensors via hf_model.save_pretrained |
-| 10. Torch-compiled loss | **PARTIAL / ADAPT** | --torch-compile-loss exists, but RoundPipe's per-chunk backward custom autograd is not ported |
+| 10. Torch-compiled loss | **PORTED** | --torch-compile-loss exists and RoundPipe-style per-chunk backward custom autograd is ported |
 | 11. PinnedUpload | **ADAPT** | Useful for activation/offload transfer paths, not current sync NF4 upload |
 | 12. pin_model | **PORTED** | --pin-model {alloc,register,off}, both strategies in stratum/memory.py |
 | 13. Chunked upload | **ADAPT** | Needed for non-NF4 and no-NF4 large tensors, not every NF4 payload |
