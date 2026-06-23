@@ -16,6 +16,14 @@ from stratum.batch import (
 )
 from stratum.planner import estimate_module_bytes, split_layers_by_memory_limit
 from stratum.timing import TimingRecorder
+from stratum.layer_transfer import (
+    DEFAULT_CHUNK_UPLOAD_BYTES,
+    DownloadResult,
+    LayerTransferResult,
+    copy_tensor_chunked,
+    download_layer_state,
+    upload_layer_copies,
+)
 from stratum.transfer import (
     PinnedUpload,
     RegisterBackwardEvent,
@@ -56,6 +64,12 @@ __all__ = [
     "estimate_module_bytes",
     "split_layers_by_memory_limit",
     "TimingRecorder",
+    "DEFAULT_CHUNK_UPLOAD_BYTES",
+    "DownloadResult",
+    "LayerTransferResult",
+    "copy_tensor_chunked",
+    "download_layer_state",
+    "upload_layer_copies",
     "PinnedUpload",
     "RegisterBackwardEvent",
     "TransferResult",

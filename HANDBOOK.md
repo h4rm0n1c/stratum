@@ -74,8 +74,8 @@ useful capability should be adapted where it helps Stratum:
 
 | RoundPipe internal | What it does | Current Stratum state | Adaptation direction |
 |---|---|---|---|
-| `upload_layers()` | Copies layers to GPU with chunked async upload | `ensure_weights()` + `free_weights()` handle frozen NF4 only | Add optional prefetch/chunked non-NF4 upload |
-| `download_layer()` | Async gradient D2H after backward | Grads stay on GPU for `PerDeviceOptimizer` | Add optional CPU/offloaded LoRA optimizer path |
+| `upload_layers()` | Copies layers to GPU with chunked async upload | `ensure_weights()` + `free_weights()` handle frozen NF4; `stratum.layer_transfer.upload_layer_copies()` provides standalone module-copy utility | Add optional prefetch/chunked non-NF4 runtime path |
+| `download_layer()` | Async gradient D2H after backward | Grads stay on GPU for `PerDeviceOptimizer`; `stratum.layer_transfer.download_layer_state()` can copy grads/buffers back | Add optional CPU/offloaded LoRA optimizer path |
 | `PinnedUpload` autograd | Pins tensors for async H2D, copies grads back | `stratum.transfer.PinnedUpload` exists; sync NF4 path does not need it | Wire into host-staged activation/offload transfers only when those paths become async |
 | `RegisterBackwardEvent` | CUDA event sync for upload→backward ordering | `stratum.transfer.RegisterBackwardEvent` exists; no current race in sync weight path | Use when async prefetch/offload introduces upload→backward ordering hazards |
 | `ModelExecutePlan` | Per-layer fwd/bwd scheduling with memory budget | `assign_layers_to_devices()` plus optional stage memory splitting; timing JSONL is available | Feed timing into automatic placement |
@@ -154,6 +154,7 @@ scripts/train.py
 | `stage.py` | `DeviceStage` — holds a contiguous slice of decoder layers on one GPU |
 | `assign.py` | `assign_layers_to_devices()` — llama.cpp's upper_bound algorithm for layer-to-device mapping |
 | `host_staging.py` | `HostStagingPool` — pinned CPU buffer for cross-device tensor transfers (P2P or host-staged) |
+| `layer_transfer.py` | RoundPipe-style standalone layer upload/download helpers for chunked module copies and grad/buffer download |
 | `grad_hooks.py` | `make_boundary_hook()` — backward gradient hook that transfers grads across devices |
 
 ### Weight streaming (NF4) — the VRAM enabler

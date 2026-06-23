@@ -257,11 +257,14 @@ Used to free GPU memory after backward, grads saved on CPU for optimizer.
 
 **Parity decision:** ADAPT.
 
-`ensure_weights()` / `free_weights()` covers frozen NF4 streaming, but does
-not cover RoundPipe's full memory behavior: independent module copies,
-buffer snapshots for recompute, async gradient download, reusable grad CPU
-buffers, or CPU optimizer storage.
+`ensure_weights()` / `free_weights()` covers frozen NF4 streaming.
+`stratum.layer_transfer` now covers the standalone RoundPipe-style utility
+behavior: independent shallow module copies, shared parameter preservation,
+chunked tensor copy, optional grad upload, and grad/buffer download. It is not
+yet wired into the active runtime.
 
+- [x] Add a Stratum utility for chunked non-NF4 tensor upload.
+- [x] Add standalone layer-copy upload and grad/buffer download helpers.
 - [A] Add optional CPU/offloaded trainable-gradient mode for LoRA params:
   download grads after backward, keep optimizer state on CPU or a selected
   device, and re-upload updated trainable params before the next forward.
