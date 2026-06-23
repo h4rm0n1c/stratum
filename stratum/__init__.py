@@ -8,6 +8,12 @@ from stratum.pipeline import StratumPipeline
 from stratum.host_staging import HostStagingPool
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
+from stratum.batch import (
+    TrainingMicrobatch,
+    microbatch_loss_scale,
+    reduce_microbatch_losses,
+    split_training_batch,
+)
 from stratum.planner import estimate_module_bytes, split_layers_by_memory_limit
 from stratum.timing import TimingRecorder
 from stratum.model.registry import build_pipeline
@@ -36,6 +42,10 @@ __all__ = [
     "PerDeviceOptimizer",
     "save_checkpoint",
     "load_checkpoint",
+    "TrainingMicrobatch",
+    "microbatch_loss_scale",
+    "split_training_batch",
+    "reduce_microbatch_losses",
     "estimate_module_bytes",
     "split_layers_by_memory_limit",
     "TimingRecorder",

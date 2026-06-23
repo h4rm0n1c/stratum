@@ -34,6 +34,11 @@ from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 
 from stratum import build_pipeline
+from stratum.batch import (
+    microbatch_loss_scale,
+    reduce_microbatch_losses,
+    split_training_batch,
+)
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
 from stratum.timing import TimingRecorder
@@ -420,22 +425,36 @@ def main():
         optimizer.zero_grad()
 
         # Microbatching: split batch into microbatches, accumulate gradients
+        # with token-weighted scaling so uneven label masks stay equivalent to
+        # a single full-batch normalized CE.
         nmb = max(1, args.num_microbatch)
         loss = None
         try:
-            if nmb > 1 and input_ids.shape[0] >= nmb:
-                mb_size = max(1, input_ids.shape[0] // nmb)
-                for i in range(0, input_ids.shape[0], mb_size):
-                    mb_end = min(i + mb_size, input_ids.shape[0])
-                    mb_in = input_ids[i:mb_end].contiguous()
-                    mb_attn = attention_mask[i:mb_end].contiguous()
-                    mb_labels = labels[i:mb_end].contiguous()
-                    mb_out = pipeline(mb_in, attention_mask=mb_attn, labels=mb_labels)
-                    (mb_out.loss / nmb).backward()
-                    if loss is None:
-                        loss = mb_out.loss.detach()
-                    else:
-                        loss = loss + mb_out.loss.detach()
+            if nmb > 1:
+                microbatches = split_training_batch(
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    num_microbatch=nmb,
+                )
+                total_trainable = sum(mb.trainable_tokens for mb in microbatches)
+                detached_losses = []
+                trainable_counts = []
+                for mb in microbatches:
+                    mb_out = pipeline(
+                        mb.input_ids,
+                        attention_mask=mb.attention_mask,
+                        labels=mb.labels,
+                    )
+                    scale = microbatch_loss_scale(
+                        mb.trainable_tokens,
+                        total_trainable,
+                        len(microbatches),
+                    )
+                    (mb_out.loss * scale).backward()
+                    detached_losses.append(mb_out.loss.detach())
+                    trainable_counts.append(mb.trainable_tokens)
+                loss = reduce_microbatch_losses(detached_losses, trainable_counts)
             else:
                 output = pipeline(input_ids, attention_mask=attention_mask, labels=labels)
                 output.loss.backward()

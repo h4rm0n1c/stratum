@@ -52,7 +52,7 @@ order.
 | NF4 frozen weight streaming | `NF4Linear` JIT-dequant on GPU | CPU→GPU H2D + dequant per step | Different approach, same semantics |
 | Chunked lm_head loss | `ChunkedCompileLinearForCausalLMLoss` custom autograd | `ChunkedLinearCrossEntropyFunction` in postfix | Equivalent custom per-chunk backward |
 | Blocked postfix loss | `BlockedPostfixCausalLMLoss` (batch=1 only) | Same, ported to `blocked_loss.py` | Identical |
-| Microbatching | `num_microbatch` plus pytree split/merge hooks | Manual loop in `train.py` | Basic training path only |
+| Microbatching | `num_microbatch` plus pytree split/merge hooks | `stratum.batch` fixed-tensor split/reduce | Token-weighted training path; generic pytrees still missing |
 | Activation checkpointing | `checkpoint(run_layer, ...)` per decoder layer | LFM25 and Qwen35 | Identical for current adapters |
 | MLP checkpointing | `CheckpointedModule` | Same, in `mlp_opt.py` | Identical |
 | MLP token chunking | `TokenChunkedModule` | Same, in `mlp_opt.py` | Identical |
@@ -83,6 +83,7 @@ useful capability should be adapted where it helps Stratum:
 | `ParamAttribute` / `LayerAttribute` | Per-param upload/grad state tracking | `roundpipe_nf4_payload` attr tracks frozen NF4 | Add richer state only for async/offloaded modes |
 | `pin_module_alloc` / `pin_module_register` | CPU memory pinning strategies | **PORTED** to `stratum/memory.py` | Same |
 | `async_d2h` / `async_h2d` | Async host-device with event sync | `HostStagingPool` covers part of the data path | Add generic helpers with event fencing |
+| `batch.py` | Pytree microbatch split/merge/reduce | Fixed training tensors use token-weighted helpers | Add generic split specs if future wrappers need them |
 
 ### Why some things are different
 
@@ -379,7 +380,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | Flag | Default | Description |
 |---|---|---|
 | `--steps` | 25000 | Training steps |
-| `--batch-size` | 2 | Microbatch not split (actual per-step = batch * num_microbatch) |
+| `--batch-size` | 2 | Batch size before optional microbatch splitting |
 | `--lr` | 1e-4 | Learning rate |
 | `--lr-scheduler` | `cosine_with_warmup` | LR schedule |
 | `--warmup-steps` | 500 | Linear warmup steps |

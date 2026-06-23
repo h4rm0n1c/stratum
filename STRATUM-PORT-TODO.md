@@ -318,11 +318,11 @@ chaining pipeline outputs across RoundPipe calls.
 Current Stratum only handles the fixed training batch shape:
 `input_ids`, `attention_mask`, `labels`, with manual slicing in `train.py`.
 
-- [A] Move microbatch splitting into a reusable Stratum helper instead of
+- [x] Move microbatch splitting into a reusable Stratum helper instead of
   open-coded slicing in `scripts/train.py`.
 - [A] Add split/merge hooks or specs for non-standard inputs so Stratum can
   support eval/debug calls and future model wrappers without hardcoding.
-- [A] Add a reducer abstraction for losses/outputs; default training should
+- [x] Add a reducer abstraction for losses/outputs; default training should
   keep token-weighted loss semantics, not blindly average per-microbatch losses.
 - [/] Do not require CPU-only user inputs like RoundPipe; Stratum's current
   explicit input-device placement is acceptable, but the splitter should not
@@ -428,7 +428,7 @@ Recommended order for reaching practical parity:
    directly affects long-context VRAM.
 3. [x] Add Stratum timing instrumentation so later scheduler work is evidence-based.
 4. [x] Add stage-memory-limit planning and intra-device sub-stages.
-5. Add generic microbatch split/reduce helpers.
+5. [x] Add generic microbatch split/reduce helpers.
 6. Add async transfer helpers and event fencing; then experiment with NF4
    prefetch.
 7. Add CPU/offloaded optimizer mode.
@@ -450,7 +450,7 @@ Recommended order for reaching practical parity:
 | 15. async_d2h/h2d | **ADAPT** | HostStagingPool covers part of it but lacks generic helpers and full event semantics |
 | 16. upload_layers/download_layer | **ADAPT** | ensure/free covers frozen NF4 only; grad/offload/buffer behavior still missing |
 | 17. ModelExecutePlan | **PARTIAL / ADAPT** | Stage memory splitting is ported; timing-fed placement remains |
-| 20. Batch API | **ADAPT** | Current fixed train loop lacks RoundPipe's pytree split/merge/reduce flexibility |
+| 20. Batch API | **PARTIAL / ADAPT** | Fixed training tensors use token-weighted helpers; generic pytrees remain |
 | 21. Recompute context/RNG | **ADAPT** | Needed for Qwen checkpointing, MoE metadata, and mask/RoPE recompute avoidance |
 | 22. Optimizer stream/scaler | **ADAPT** | Optional CPU/offloaded optimizer has value; async step should come later |
 | 23. Timing/profiling | **PARTIAL / ADAPT** | TimingRecorder JSONL is ported; scheduler feedback remains |
