@@ -333,8 +333,14 @@ From RoundPipe scripts that Stratum doesn't have yet:
 
 ## 19. Docker Build + Test
 
-- [ ] Build Docker image: `docker build -t stratum:latest .`
-- [ ] Test: 5 steps, batch=2, num_microbatch=2, tensor_split=[9,32]
+- [x] Build refresh image from cached base:
+  `docker build -f Dockerfile.refresh --build-arg STRATUM_REFRESH_BASE=stratum:refresh-base -t stratum:latest .`
+- [x] Test LFM2.5: 5 steps, batch=2, num_microbatch=2,
+  tensor_split=[9,32], max_seq_len=8192, save_every=5. Passed on
+  2026-06-24 with finite losses, host-staged RTX 3080→V100 transfers,
+  PEFT safetensors checkpoint/final save, and no legacy `.pt` checkpoint blobs.
+- [ ] Test the same LFM2.5 run with `--prefetch-nf4`.
+- [ ] Test Qwen35 on the same no-P2P two-GPU setup.
 
 ## 20. Batch API Parity — `roundpipe/batch.py`
 

@@ -103,13 +103,18 @@ Use two Docker build paths:
 docker build -t stratum:latest .
 
 # Fast source refresh. Use for normal code and runtime script changes.
-docker build -f Dockerfile.refresh -t stratum:latest .
+docker build -f Dockerfile.refresh \
+  --build-arg STRATUM_REFRESH_BASE=stratum:refresh-base \
+  -t stratum:latest .
 ```
 
-`Dockerfile.refresh` starts from the current `stratum:latest`, deletes the old
-`/workspace/stratum` tree, installs Stratum from a minimal temporary source
-copy, and force-reinstalls Stratum without touching the heavy CUDA dependency
-stack. This is the normal path after source changes.
+`Dockerfile.refresh` starts from the stable heavy-layer tag
+`stratum:refresh-base`, deletes any inherited `/workspace/stratum` tree,
+installs Stratum from a minimal temporary source copy, and force-reinstalls
+Stratum without touching the heavy CUDA dependency stack. This is the normal
+path after source changes. Do not use `stratum:latest` as the refresh base
+while also tagging the output as `stratum:latest`; repeated self-layering can
+hit Docker's max-depth limit.
 
 The final image should contain runtime code only:
 
@@ -168,6 +173,47 @@ The launcher bind-mounts the working tree over `/workspace/stratum` so local
 changes are visible during normal development. A refresh image is still useful
 because it keeps the baked runtime self-consistent for no-mount usage, but it
 must not become a repository archive.
+
+### Current validation baseline
+
+As of 2026-06-24, the LFM2.5 reference validation has passed on the no-P2P
+heterogeneous host with:
+
+```bash
+scripts/run-unified.sh python scripts/train.py \
+  --model lfm25-8b-a1b \
+  --data /workspace/data/lfm25_fable_merged_48k_train.labels.jsonl \
+  --out /workspace/out/lfm25-stratum-validate-b2-mb2 \
+  --steps 5 \
+  --batch-size 2 \
+  --num-microbatch 2 \
+  --tensor-split 9 32 \
+  --max-seq-len 8192 \
+  --longest-first \
+  --pin-model alloc \
+  --save-every 5 \
+  --host-ram-limit-gib 80 \
+  --timing-jsonl /workspace/out/lfm25-stratum-validate-b2-mb2/timing.jsonl
+```
+
+Observed result:
+
+| Item | Result |
+|---|---|
+| GPUs | RTX 3080 `cuda:0` + V100 `cuda:1`, peer access unavailable |
+| Attention | 6 LFM2.5 full-attention layers patched with Volta flash attention |
+| Placement | 6 decoder layers on GPU0, 18 decoder layers on GPU1 |
+| Transfer | Host-staged boundary path used twice per training step |
+| Sequence padding | `--pad-to-multiple` auto-raised to 32 for Volta flash |
+| Step metrics | 5 finite-loss steps, final logged loss `10.5647` |
+| Throughput | Warm steps around 3000 tokens/s for batch 2 / 2 microbatches |
+| Peaks | GPU0 ~4.6 GiB, GPU1 ~19.3 GiB |
+| Checkpoints | `checkpoint-5/` and `final/` wrote PEFT `adapter_model.safetensors` |
+| Legacy blobs | No `device_*.pt`, `optim_*.pt`, or `meta.pt` written by default |
+
+This proves the current LFM2.5 NF4 + LoRA + host-staged multi-GPU path for the
+reference setup. It does not yet prove Qwen35, `--prefetch-nf4`, CPU/offloaded
+optimizer mode, or long-run stability.
 
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 
