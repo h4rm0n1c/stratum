@@ -545,7 +545,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--num-microbatch` | 1 | Split batch into N microbatches (gradient accumulation) |
 | `--checkpoint-decoder-layer` | True | Activation checkpointing per decoder layer |
 | `--no-nf4` | False | Disable NF4 frozen weight compression (FP16 direct upload) |
-| `--nf4-cache-dir` | None | Directory to cache NF4 payloads |
+| `--nf4-cache-dir` | `/workspace/cache/nf4-frozen` | Directory to cache NF4 payloads; a model-id subdirectory is added automatically |
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
 | `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
 | `--prefetch-nf4` | False | Experimental side-stream NF4 payload prefetch for the next stage/postfix |

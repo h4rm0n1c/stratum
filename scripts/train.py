@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import re
 import time
 from pathlib import Path
 
@@ -153,8 +154,8 @@ def main():
                     help="Split per-device layer groups into substages below this upload footprint (0 = disabled)")
     ap.add_argument("--prefetch-nf4", action="store_true",
                     help="Experimentally prefetch next stage NF4 payloads on a side stream before use")
-    ap.add_argument("--nf4-cache-dir", default=None,
-                    help="Directory to cache quantised NF4 payloads")
+    ap.add_argument("--nf4-cache-dir", default="/workspace/cache/nf4-frozen",
+                    help="Directory to cache quantised NF4 payloads. A model-id subdirectory is added automatically.")
     ap.add_argument("--resume", default="",
                     help="Checkpoint path to resume from")
     # MLP optimizations (mutually exclusive with each other)
@@ -292,6 +293,9 @@ def main():
     hf_model = get_peft_model(hf_model, lora_cfg)
     hf_model.print_trainable_parameters()
 
+    def _safe_cache_component(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "model"
+
     # Operator telemetry hooks (on base model before extraction)
     if args.operator_telemetry_layers:
         from stratum.telemetry import enable_operator_telemetry, parse_int_set, parse_name_list
@@ -306,12 +310,16 @@ def main():
 
     # Build stratified pipeline
     print("Building Stratum pipeline...", flush=True)
+    nf4_cache_dir = None
+    if not args.no_nf4 and args.nf4_cache_dir:
+        nf4_cache_dir = str(Path(args.nf4_cache_dir) / _safe_cache_component(args.hf_model))
+        print({"nf4_cache_dir": nf4_cache_dir}, flush=True)
     pipeline = build_pipeline(
         args.model, hf_model,
         tensor_split=tensor_split,
         device_ids=args.device_ids,
         use_nf4=not args.no_nf4,
-        nf4_cache_dir=args.nf4_cache_dir,
+        nf4_cache_dir=nf4_cache_dir,
         checkpoint_decoder_layer=args.checkpoint_decoder_layer,
         loss_token_chunk_size=args.loss_token_chunk_size,
         postfix_loss_token_chunk_size=args.postfix_loss_token_chunk_size,
@@ -420,6 +428,8 @@ def main():
     )
 
     # Open log file for structured JSON logging
+    if args.out:
+        Path(args.out).mkdir(parents=True, exist_ok=True)
     log_file = open(Path(args.out) / "training.jsonl", "w") if args.out else None
 
     for step in range(start_step + 1, args.steps + 1):

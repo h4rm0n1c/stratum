@@ -119,6 +119,8 @@ with `--save-legacy-device-state` or `--save-optimizer-state`.
 
 Inside the launcher, the cache root is `/workspace/cache`. It persists under
 `./cache` by default and can be moved with `STRATUM_CACHE_DIR`.
+NF4 frozen-weight payloads default to `/workspace/cache/nf4-frozen/<hf-model>`,
+so repeated runs do not re-quantize the same base weights.
 
 ```bash
 STRATUM_CACHE_DIR=/fast/cache scripts/run-unified.sh python scripts/doctor.py
