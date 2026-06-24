@@ -2,6 +2,7 @@ import unittest
 import inspect
 
 import stratum
+from stratum.model.registry import ModelArch
 
 
 class PackageExportsTest(unittest.TestCase):
@@ -19,6 +20,12 @@ class PackageExportsTest(unittest.TestCase):
             "stage_memory_limit_gib",
         ]:
             self.assertIn(name, params)
+
+    def test_base_model_arch_accepts_adapter_forwarded_kwargs(self):
+        params = inspect.signature(ModelArch.build).parameters
+        self.assertTrue(
+            any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        )
 
 
 if __name__ == "__main__":

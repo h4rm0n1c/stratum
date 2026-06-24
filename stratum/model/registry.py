@@ -49,6 +49,7 @@ class ModelArch:
         stage_memory_limit_gib: float = 0.0,
         prefetch_nf4: bool = False,
         verbose: bool = True,
+        **kwargs,
     ) -> StratumPipeline:
         """Build a StratumPipeline from a HuggingFace model.
 
