@@ -299,7 +299,12 @@ class Qwen35Arch(ModelArch):
             layer_indices=volta_layer_indices,
             window_size=window_size,
         )
-        apply_mlp_optimizations(core, **kwargs)
+        apply_mlp_optimizations(
+            core,
+            checkpoint_mlp=kwargs.get("checkpoint_mlp", False),
+            memory_flat_frozen_mlp=kwargs.get("memory_flat_frozen_mlp", False),
+            mlp_token_chunk_size=kwargs.get("mlp_token_chunk_size", 0),
+        )
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
