@@ -15,6 +15,14 @@ import weakref
 import torch
 
 
+def _can_pin(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.numel() > 0
+        and tensor.device.type == "cpu"
+        and not tensor.is_pinned()
+    )
+
+
 def pin_module_alloc(module: torch.nn.Module) -> None:
     """Pin module parameters and buffers via pin_memory().
 
@@ -22,10 +30,10 @@ def pin_module_alloc(module: torch.nn.Module) -> None:
     Each param/buffer gets its own pinned allocation.
     """
     for param in module.parameters():
-        if param.numel() > 0 and not param.data.is_pinned():
+        if _can_pin(param.data):
             param.data = param.data.pin_memory()
     for buffer in module.buffers():
-        if buffer.numel() > 0 and not buffer.data.is_pinned():
+        if _can_pin(buffer.data):
             buffer.data = buffer.data.pin_memory()
 
 
@@ -42,10 +50,10 @@ def pin_module_register(module: torch.nn.Module) -> None:
     """
     storages: list[torch.UntypedStorage] = []
     for param in module.parameters():
-        if not param.data.is_pinned() and param.numel() > 0:
+        if _can_pin(param.data):
             storages.append(param.data.untyped_storage())
     for buffer in module.buffers():
-        if not buffer.data.is_pinned() and buffer.numel() > 0:
+        if _can_pin(buffer.data):
             storages.append(buffer.data.untyped_storage())
     if not storages:
         return
