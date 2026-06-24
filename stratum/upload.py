@@ -114,7 +114,9 @@ class NF4Prefetch:
         with torch.cuda.device(self.device), torch.cuda.stream(current), torch.no_grad():
             for entry in self.entries:
                 if entry.param.data.numel() > 0:
-                    continue
+                    if entry.param.data.device == self.device:
+                        continue
+                    entry.param.data = torch.empty(0, dtype=entry.param.dtype, device=entry.param.device)
                 payload = entry.payload
                 q_state = QuantState(
                     absmax=entry.absmax,
@@ -345,11 +347,24 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
     dequantize_4bit = None
     QuantState = None
     for name, param in module.named_parameters():
-        if param.data.numel() > 0:
-            continue  # already has FP16 data
         payload = getattr(param, NF4_ATTR, None)
         if payload is None:
+            if param.data.numel() > 0 and param.data.device != device:
+                if param.requires_grad:
+                    raise RuntimeError(
+                        f"trainable shared parameter {name!r} is on {param.data.device}, "
+                        f"but module is running on {device}; Stratum cannot safely move "
+                        "trainable parameters between stages"
+                    )
+                param.data = param.data.to(device, non_blocking=False)
             continue
+        if param.data.numel() > 0:
+            if param.data.device == device:
+                continue  # already has FP16 data on the target device
+            # Shared frozen weights can be used by prefix and postfix on
+            # different GPUs. Re-materialize from the CPU NF4 payload instead
+            # of trying to keep one Parameter's data on two devices.
+            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
         if dequantize_4bit is None or QuantState is None:
             from bitsandbytes.functional import QuantState as _QuantState
             from bitsandbytes.functional import dequantize_4bit as _dequantize_4bit
@@ -380,10 +395,10 @@ def prefetch_weights(module: torch.nn.Module, device_id: int) -> NF4Prefetch:
     device = torch.device(f"cuda:{device_id}")
     entries: list[_PrefetchEntry] = []
     for name, param in module.named_parameters():
-        if param.data.numel() > 0:
-            continue
         payload = getattr(param, NF4_ATTR, None)
         if payload is None:
+            continue
+        if param.data.numel() > 0 and param.data.device == device:
             continue
         entries.append(
             _PrefetchEntry(

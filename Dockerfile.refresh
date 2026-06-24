@@ -3,16 +3,19 @@
 # Use this when dependency layers in stratum:latest are already correct and
 # only runtime source/scripts need to be baked into the image:
 #
-#   docker build -f Dockerfile.refresh -t stratum:latest .
+#   docker build -f Dockerfile.refresh \
+#     --build-arg STRATUM_REFRESH_BASE=stratum:refresh-base \
+#     -t stratum:latest .
 #
 # Do not replace the full Dockerfile with this. This file intentionally starts
-# from the existing image so source changes do not invalidate expensive CUDA,
+# from a stable dependency image so source changes do not invalidate expensive CUDA,
 # PyTorch, flash-attention, and kernel-build layers.
 #
 # The base image may contain an older broad /workspace/stratum copy. Delete it
 # first so docs/tests/git/cache/data cannot survive through refresh layering.
 
-FROM stratum:latest
+ARG STRATUM_REFRESH_BASE=stratum:refresh-base
+FROM ${STRATUM_REFRESH_BASE}
 
 SHELL ["/bin/bash", "-lc"]
 

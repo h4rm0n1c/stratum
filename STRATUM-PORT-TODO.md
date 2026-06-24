@@ -110,6 +110,7 @@ Source: `train_lfm25_roundpipe_lora.py:120-298`
 - [x] `_patch_qwen35_attention(model, layer_indices=None, window_size=None)` — selective + sliding window
 - [x] `Qwen35VoltaAttention.__init__` accepts `window_size`
 - [x] Sliding window passthrough to flash-attn-v100
+- [x] `--volta-layers none` — disable Volta patching for eager fallback/debug
 
 ## 7. Data Loading Flags
 
@@ -117,7 +118,7 @@ Source: `train_lfm25_roundpipe_lora.py:120-298`
 - [x] `--pad-to-length N` — exact length padding
 - [x] `--no-save` — skip final save
 - [x] `--dense-attention-masks` — passed to build kwargs
-- [x] `--pad-to-multiple` — already existed
+- [x] `--pad-to-multiple` — already existed; Volta flash defaults 0 to 32 like qz-roundpipe
 
 ## 8. NF4 Refinements
 
@@ -436,10 +437,11 @@ parity quality.
 - [ ] Verify Qwen35 prefix/mask behavior against RoundPipe Qwen3: RoundPipe
   can build full/sliding causal masks, while Stratum mostly passes `None` or
   raw `attention_mask`.
-- [ ] Re-check PEFT save/load after pipeline build: stage layers share base
-  parameter objects, but prefix/postfix are deep copies. This is intentional
-  for frozen weights, but any future trainable prefix/postfix params would need
-  explicit handling.
+- [/] Re-check PEFT save/load after pipeline build: stage layers, prefix, and
+  postfix now keep source module references so LoRA adapter save remains tied
+  to `hf_model`. Shared frozen NF4 weights can rematerialize per device; any
+  future trainable shared params spanning stages still need explicit
+  optimizer/autograd handling.
 - [~] Add lightweight unit tests for `assign_layers_to_devices`, NF4 payload
   lifecycle, checkpoint metadata, and microbatch loss normalization. Current
   validation is mostly GPU smoke scripts.

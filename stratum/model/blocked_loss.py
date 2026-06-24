@@ -149,14 +149,14 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
         saved = ctx.saved_tensors
         if saved:
             if getattr(ctx, "memory_telemetry", False):
-                log_block_phase("postfix_backward_before_grad_restore")
+                _log_phase("postfix_backward_before_grad_restore")
             grad_hidden_states = saved[0].to(
                 device=ctx.hidden_states_device,
                 dtype=ctx.hidden_states_dtype,
                 non_blocking=False,
             ).mul_(grad_loss)
             if getattr(ctx, "memory_telemetry", False):
-                log_block_phase("postfix_backward_after_grad_restore")
+                _log_phase("postfix_backward_after_grad_restore")
         else:
             grad_hidden_states = None
         return grad_hidden_states, None, None, None, None, None, None, None, None

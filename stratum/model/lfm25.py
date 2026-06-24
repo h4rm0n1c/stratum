@@ -5,6 +5,7 @@ Includes Lfm25VoltaAttention for V100 flash-attention support.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable, Optional, Union, cast
 
 import torch
@@ -16,6 +17,7 @@ from transformers.models.lfm2_moe.modeling_lfm2_moe import (
     apply_rotary_pos_emb,
 )
 from transformers.models.llama.modeling_llama import repeat_kv
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
@@ -29,6 +31,11 @@ from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
 # is_fast_path_available is checked at runtime by Lfm2MoeShortConv.
 import transformers.models.lfm2_moe.modeling_lfm2_moe as _lfm2_mod
 _lfm2_mod.is_fast_path_available = True
+
+
+def _compat_mask_call(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
+    sig = inspect.signature(fn)
+    return fn(**{k: v for k, v in kwargs.items() if k in sig.parameters})
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +132,21 @@ class Lfm25VoltaAttention(Lfm2MoeAttention):
 class LFM25ForCausalLMPrefix(nn.Module):
     """Prefix: embedding + token embedding norm + position embedding."""
 
-    def __init__(self, model, *, memory_telemetry: bool = False):
+    def __init__(
+        self,
+        model,
+        *,
+        dense_attention_masks: bool = False,
+        memory_telemetry: bool = False,
+    ):
         super().__init__()
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
-        import copy
-        self.embed_tokens = copy.deepcopy(core.model.embed_tokens)
-        self.token_embd_norm = copy.deepcopy(getattr(core.model, "token_embd_norm", None))
-        self.pos_emb = copy.deepcopy(
-            getattr(core.model, "pos_emb", None) or getattr(core.model, "rotary_emb", None)
-        )
+        self.embed_tokens = core.model.embed_tokens
+        self.token_embd_norm = getattr(core.model, "token_embd_norm", None)
+        self.pos_emb = getattr(core.model, "pos_emb", None) or getattr(core.model, "rotary_emb", None)
         self.config = core.model.config
         self.has_sliding_layers = getattr(core.model, "has_sliding_layers", False)
+        self.dense_attention_masks = dense_attention_masks
         self.memory_telemetry = memory_telemetry
 
     def forward(
@@ -171,15 +182,37 @@ class LFM25ForCausalLMPrefix(nn.Module):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Causal mask not needed — transformers 5.x handles causality
-        # internally via is_causal. Volta flash attention also uses
-        # causal=True. Pass None to avoid format mismatches.
-        causal_mask = {
-            "full_attention": None,
-            "linear_attention": attention_mask,
-        }
+        if not isinstance(attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            if self.dense_attention_masks:
+                causal_mask = {
+                    "full_attention": _compat_mask_call(create_causal_mask, mask_kwargs),
+                    "linear_attention": attention_mask,
+                }
+                if self.has_sliding_layers:
+                    causal_mask["sliding_attention"] = _compat_mask_call(
+                        create_sliding_window_causal_mask,
+                        mask_kwargs,
+                    )
+            else:
+                # Long-context Volta mode relies on kernel-native causal handling.
+                causal_mask = {
+                    "full_attention": None,
+                    "linear_attention": attention_mask,
+                }
+        else:
+            causal_mask = attention_mask
 
         hidden_states = inputs_embeds
+        if self.pos_emb is None:
+            raise RuntimeError("LFM2.5 model has no pos_emb or rotary_emb")
         position_embeddings = self.pos_emb(hidden_states, position_ids=position_ids)
 
         if self.memory_telemetry:
@@ -207,6 +240,7 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
         checkpoint_decoder_layer: bool = False,
         use_flash_attention: bool = False,
         memory_telemetry: bool = False,
+        debug_finite: bool = False,
     ):
         super().__init__()
         self.layer = layer
@@ -214,6 +248,7 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
         self.checkpoint_decoder_layer = checkpoint_decoder_layer
         self.use_flash_attention = use_flash_attention
         self.memory_telemetry = memory_telemetry
+        self.debug_finite = debug_finite
 
     def forward(self, input_data):
         (
@@ -267,6 +302,9 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
 
+        if self.debug_finite:
+            assert_finite_tensor(f"layer_{self.idx}_output", hidden_states)
+
         if self.memory_telemetry:
             mark_model_gpu_phase(
                 "layer_after_run",
@@ -308,16 +346,11 @@ class LFM25ForCausalLMPostfix(nn.Module):
         self.memory_telemetry = memory_telemetry
         self.torch_compile_loss = torch_compile_loss
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
-        import copy
-        self.norm = copy.deepcopy(
-            getattr(core.model, "output_norm", None) or getattr(core.model, "norm", None)
-        )
+        self.norm = getattr(core.model, "output_norm", None) or getattr(core.model, "norm", None)
         self.vocab_size = getattr(core.config, "vocab_size", None)
         if self.vocab_size is None and hasattr(core.config, "text_config"):
             self.vocab_size = core.config.text_config.vocab_size
-        self.lm_head = copy.deepcopy(
-            getattr(core, "output", None) or getattr(core, "lm_head", None)
-        )
+        self.lm_head = getattr(core, "output", None) or getattr(core, "lm_head", None)
 
     def forward(self, input_data):
         (
@@ -351,6 +384,8 @@ class LFM25ForCausalLMPostfix(nn.Module):
             # Mode 1: norm full-seq, then chunked lm_head
             if self.norm is not None:
                 hidden_states = self.norm(hidden_states)
+                if self.debug_finite:
+                    assert_finite_tensor("post_norm_hidden_states", hidden_states)
 
             shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -373,6 +408,8 @@ class LFM25ForCausalLMPostfix(nn.Module):
                 token_chunk_size=self.loss_token_chunk_size,
                 use_torch_compile=self.torch_compile_loss,
             )
+            if self.debug_finite:
+                assert_finite_tensor("chunked_loss", loss)
 
         return CausalLMOutputWithPast(loss=loss, logits=None)
 
@@ -394,6 +431,7 @@ class LFM25Arch(ModelArch):
     def build_prefix(self, model, **kwargs):
         return LFM25ForCausalLMPrefix(
             model,
+            dense_attention_masks=kwargs.get("dense_attention_masks", False),
             memory_telemetry=kwargs.get("memory_telemetry", False),
         )
 
@@ -403,6 +441,7 @@ class LFM25Arch(ModelArch):
             use_flash_attention=True,
             checkpoint_decoder_layer=kwargs.get("checkpoint_decoder_layer", False),
             memory_telemetry=kwargs.get("memory_telemetry", False),
+            debug_finite=kwargs.get("debug_finite", False),
         )
 
     def build_postfix(self, model, **kwargs):
@@ -420,8 +459,11 @@ class LFM25Arch(ModelArch):
         # Selective Volta attention patching
         from stratum.telemetry import parse_int_set
         volta_layers_str = kwargs.get("volta_layers", "")
-        volta_layer_indices = parse_int_set(volta_layers_str) if volta_layers_str else None
-        _patch_lfm25_attention(core, layer_indices=volta_layer_indices)
+        if volta_layers_str.strip().lower() in {"none", "off", "false"}:
+            print("Patched 0 LFM2.5 attention layers with Volta flash attention", flush=True)
+        else:
+            volta_layer_indices = parse_int_set(volta_layers_str) if volta_layers_str else None
+            _patch_lfm25_attention(core, layer_indices=volta_layer_indices)
         # MLP optimizations (checkpoint_mlp, memory_flat_frozen_mlp, mlp_token_chunk_size)
         apply_mlp_optimizations(
             core,

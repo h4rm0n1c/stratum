@@ -225,6 +225,10 @@ def main():
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
     if args.stratum_stage_memory_limit_gib < 0:
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
+    volta_attention_enabled = args.volta_layers.strip().lower() not in {"none", "off", "false"}
+    if volta_attention_enabled and args.pad_to_multiple == 0:
+        args.pad_to_multiple = 32
+        print({"pad_to_multiple": 32, "reason": "volta_flash sequence length constraint"}, flush=True)
 
     # Detect devices
     devices = get_device_info()

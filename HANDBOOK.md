@@ -563,7 +563,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 ### Attention patching
 | Flag | Default | Description |
 |---|---|---|
-| `--volta-layers` | `""` | Comma-separated layer indices for V100 flash attn (empty = all) |
+| `--volta-layers` | `""` | Comma-separated layer indices for V100 flash attn; empty = all, `none` = disabled |
 | `--volta-window-left` | -1 | Sliding window left tokens (-1 = full attention) |
 | `--volta-window-right` | 0 | Sliding window right tokens (0 = causal) |
 
@@ -571,7 +571,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | Flag | Default | Description |
 |---|---|---|
 | `--longest-first` | False | Sort dataset by seq_len descending |
-| `--pad-to-multiple` | 0 | Pad batch length to multiple of N (volta_flash needs 32) |
+| `--pad-to-multiple` | 0 | Pad batch length to multiple of N; Volta flash automatically raises 0 to 32 |
 | `--pad-to-length` | 0 | Pad batch to exact length N |
 | `--dense-attention-masks` | False | Force HF dense attention mask construction |
 
@@ -615,13 +615,17 @@ But `hf_model.save_pretrained()` calls PEFT's `get_peft_model_state_dict()`
 which only returns LoRA parameters (those with `lora_` in the name). The
 empty frozen weights are invisible to the save.
 
-For this to work, the pipeline's stage layers MUST share Parameter objects
-with `hf_model.get_base_model().model.layers`. This is ensured by
-`ModelArch.build()` which uses the original layer objects (not deep copies).
+For this to work, the pipeline modules MUST share Parameter objects with
+`hf_model`. This is ensured by `ModelArch.build()` and the model adapters,
+which use the original prefix, layer, and postfix modules rather than deep
+copies.
 
-The prefix and postfix use `copy.deepcopy()`, so their NF4-dropped weights
-do NOT affect hf_model. Since prefix/postfix contain only frozen weights
-(no LoRA), this doesn't matter.
+Shared frozen NF4 weights can appear in different stages, for example tied
+embedding and LM-head weights split across prefix/postfix on different GPUs.
+`ensure_weights()` rematerializes those tensors from the CPU NF4 payload on
+the device that is about to run. Trainable shared parameters spanning multiple
+Stratum stages are not supported without explicit optimizer/autograd handling;
+the upload path raises instead of silently moving them between GPUs.
 
 ### 4. `BlockedPostfixCausalLMLoss` requires batch_size=1
 

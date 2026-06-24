@@ -3,6 +3,7 @@ import inspect
 
 import stratum
 from stratum.model.registry import ModelArch
+from stratum.telemetry import parse_int_set
 
 
 class PackageExportsTest(unittest.TestCase):
@@ -26,6 +27,10 @@ class PackageExportsTest(unittest.TestCase):
         self.assertTrue(
             any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
         )
+
+    def test_parse_int_set_accepts_disabled_sentinels(self):
+        for value in ["none", "off", "false", " NONE "]:
+            self.assertEqual(parse_int_set(value), set())
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ Includes Qwen35VoltaAttention for V100 flash-attention support.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union, cast
+import inspect
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 import torch.nn as nn
@@ -15,13 +16,19 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention,
     apply_rotary_pos_emb,
 )
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
 from stratum.model.mlp_opt import apply_mlp_optimizations
 from stratum.model.blocked_loss import BlockedPostfixCausalLMLoss
 from stratum.model.chunked_loss import chunked_linear_cross_entropy
-from stratum.telemetry import assert_finite_tensor
+from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
+
+
+def _compat_mask_call(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
+    sig = inspect.signature(fn)
+    return fn(**{k: v for k, v in kwargs.items() if k in sig.parameters})
 
 
 class Qwen35VoltaAttention(Qwen3_5Attention):
@@ -113,25 +120,59 @@ class Qwen35VoltaAttention(Qwen3_5Attention):
 class Qwen35ForCausalLMPrefix(nn.Module):
     """Prefix: embedding + rotary embedding."""
 
-    def __init__(self, model):
+    def __init__(
+        self,
+        model,
+        *,
+        dense_attention_masks: bool = False,
+        memory_telemetry: bool = False,
+    ):
         super().__init__()
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
-        import copy
-        self.embed_tokens = copy.deepcopy(core.model.embed_tokens)
-        self.rotary_emb = copy.deepcopy(core.model.rotary_emb)
-        self.config = core.config
+        self.embed_tokens = core.model.embed_tokens
+        self.rotary_emb = core.model.rotary_emb
+        self.config = core.model.config
+        self.has_sliding_layers = getattr(core.model, "has_sliding_layers", False)
+        self.dense_attention_masks = dense_attention_masks
+        self.memory_telemetry = memory_telemetry
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, labels=None, **kwargs):
+        if self.memory_telemetry:
+            mark_model_gpu_phase("prefix_enter")
+
         inputs_embeds = self.embed_tokens(input_ids)
         batch, seq_len = input_ids.shape
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
 
-        causal_mask = {
-            "full_attention": None,
-            "linear_attention": attention_mask,
-        }
+        if not isinstance(attention_mask, dict):
+            cache_position = torch.arange(seq_len, device=input_ids.device)
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            if self.dense_attention_masks:
+                causal_mask = {
+                    "full_attention": _compat_mask_call(create_causal_mask, mask_kwargs),
+                    "linear_attention": attention_mask,
+                }
+                if self.has_sliding_layers:
+                    causal_mask["sliding_attention"] = _compat_mask_call(
+                        create_sliding_window_causal_mask,
+                        mask_kwargs,
+                    )
+            else:
+                causal_mask = {
+                    "full_attention": None,
+                    "linear_attention": attention_mask,
+                }
+        else:
+            causal_mask = attention_mask
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -152,12 +193,16 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
         idx: int,
         checkpoint_decoder_layer: bool = False,
         use_flash_attention: bool = False,
+        memory_telemetry: bool = False,
+        debug_finite: bool = False,
     ):
         super().__init__()
         self.layer = layer
         self.idx = idx
         self.checkpoint_decoder_layer = checkpoint_decoder_layer
         self.use_flash_attention = use_flash_attention
+        self.memory_telemetry = memory_telemetry
+        self.debug_finite = debug_finite
 
     def forward(self, input_data):
         hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, _lk = input_data
@@ -185,6 +230,8 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
 
         if isinstance(hidden, tuple):
             hidden = hidden[0]
+        if self.debug_finite:
+            assert_finite_tensor(f"layer_{self.idx}_output", hidden)
         return (hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, 0)
 
 
@@ -211,9 +258,8 @@ class Qwen35ForCausalLMPostfix(nn.Module):
         self.debug_finite = debug_finite
         self.torch_compile_loss = torch_compile_loss
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
-        import copy
-        self.norm = copy.deepcopy(core.model.norm)
-        self.lm_head = copy.deepcopy(core.lm_head)
+        self.norm = core.model.norm
+        self.lm_head = core.lm_head
         self.vocab_size = core.config.vocab_size
 
     def forward(self, input_data):
@@ -235,6 +281,8 @@ class Qwen35ForCausalLMPostfix(nn.Module):
 
             # Mode 1: norm full-seq, then chunked lm_head
             hidden = self.norm(hidden)
+            if self.debug_finite:
+                assert_finite_tensor("post_norm_hidden_states", hidden)
             shift_hidden = hidden[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
@@ -256,6 +304,8 @@ class Qwen35ForCausalLMPostfix(nn.Module):
                 token_chunk_size=self.loss_token_chunk_size,
                 use_torch_compile=self.torch_compile_loss,
             )
+            if self.debug_finite:
+                assert_finite_tensor("chunked_loss", loss)
 
         return CausalLMOutputWithPast(loss=loss)
 
@@ -266,7 +316,11 @@ class Qwen35Arch(ModelArch):
         return config.num_hidden_layers
 
     def build_prefix(self, model, **kwargs):
-        return Qwen35ForCausalLMPrefix(model)
+        return Qwen35ForCausalLMPrefix(
+            model,
+            dense_attention_masks=kwargs.get("dense_attention_masks", False),
+            memory_telemetry=kwargs.get("memory_telemetry", False),
+        )
 
     def build_wrapped_layer(self, layer, idx, **kwargs):
         return Qwen35ForCausalLMWrappedLayer(
@@ -274,6 +328,8 @@ class Qwen35Arch(ModelArch):
             idx=idx,
             checkpoint_decoder_layer=kwargs.get("checkpoint_decoder_layer", False),
             use_flash_attention=True,
+            memory_telemetry=kwargs.get("memory_telemetry", False),
+            debug_finite=kwargs.get("debug_finite", False),
         )
 
     def build_postfix(self, model, **kwargs):
@@ -290,15 +346,19 @@ class Qwen35Arch(ModelArch):
         core = hf_model.get_base_model() if hasattr(hf_model, "get_base_model") else hf_model
         from stratum.telemetry import parse_int_set
         volta_layers_str = kwargs.get("volta_layers", "")
-        volta_layer_indices = parse_int_set(volta_layers_str) if volta_layers_str else None
+        disable_volta = volta_layers_str.strip().lower() in {"none", "off", "false"}
+        volta_layer_indices = parse_int_set(volta_layers_str) if volta_layers_str and not disable_volta else None
         vwl = kwargs.get("volta_window_left", -1)
         vwr = kwargs.get("volta_window_right", 0)
         window_size = (vwl, vwr) if vwl >= 0 else None
-        _patch_qwen35_attention(
-            core,
-            layer_indices=volta_layer_indices,
-            window_size=window_size,
-        )
+        if disable_volta:
+            print("Patched 0 Qwen3.5 attention layers with Volta flash attention", flush=True)
+        else:
+            _patch_qwen35_attention(
+                core,
+                layer_indices=volta_layer_indices,
+                window_size=window_size,
+            )
         apply_mlp_optimizations(
             core,
             checkpoint_mlp=kwargs.get("checkpoint_mlp", False),

@@ -78,7 +78,12 @@ class ModelArch:
         # Build wrapped layers
         raw_layers = list(core.model.layers)
         wrapped = [
-            self.build_wrapped_layer(layer, idx, checkpoint_decoder_layer=checkpoint_decoder_layer)
+            self.build_wrapped_layer(
+                layer,
+                idx,
+                checkpoint_decoder_layer=checkpoint_decoder_layer,
+                **kwargs,
+            )
             for idx, layer in enumerate(raw_layers)
         ]
 

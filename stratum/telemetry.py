@@ -255,6 +255,8 @@ def parse_int_set(value: str) -> set[int]:
     """Parse comma-separated integer string into a set, e.g. '0,2,4' -> {0,2,4}."""
     if not value.strip():
         return set()
+    if value.strip().lower() in {"none", "off", "false"}:
+        return set()
     return {int(part.strip()) for part in value.split(",") if part.strip()}
 
 
