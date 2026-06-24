@@ -223,6 +223,16 @@ with briefly overlapping prefetched NF4 payloads.
 These runs do not yet prove Qwen35, CPU/offloaded optimizer mode, or long-run
 stability.
 
+Qwen3.5 status as of 2026-06-24:
+
+| Item | Result |
+|---|---|
+| NF4 scope | `--nf4-scope layers` matches qz-roundpipe's `layers_only=True` behavior and avoids first-time NF4 cache creation over the huge embedding/head tensors |
+| NF4 cache | Reduced Qwen smoke created/restored cached layer NF4 payloads: 186 tensors, 9.67 GiB source -> 2.72 GiB payload |
+| Smoke run | 1 step at batch 1 / 4096 max sequence passed with finite loss `10.0315` |
+| 8K blocker found | 5-step batch 2 run failed on GPU0 because Qwen full-attention layer 3 fell back to eager attention on the RTX 3080 |
+| Fix direction | Qwen full-attention wrapper must dispatch to standard `flash_attn` on Ampere+ and `flash_attn_v100` on V100; silent fallback to quadratic eager is not acceptable for long-context training |
+
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 
 Stratum is built from the qz-roundpipe training scripts but replaces RoundPipe's
@@ -599,6 +609,7 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--num-microbatch` | 1 | Split batch into N microbatches (gradient accumulation) |
 | `--checkpoint-decoder-layer` | True | Activation checkpointing per decoder layer |
 | `--no-nf4` | False | Disable NF4 frozen weight compression (FP16 direct upload) |
+| `--nf4-scope` | `all` | NF4 prep scope: `all` includes prefix/stages/postfix; `layers` matches qz-roundpipe layers-only prep for large Qwen embedding/head tensors |
 | `--nf4-cache-dir` | `/workspace/cache/nf4-frozen` | Directory to cache NF4 payloads; a model-id subdirectory is added automatically |
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
 | `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
@@ -686,12 +697,11 @@ the upload path raises instead of silently moving them between GPUs.
 This is a RoundPipe limitation preserved in the port. The error is raised
 at runtime if batch > 1 with `--postfix-loss-token-chunk-size > 0`.
 
-### 5. Qwen3.5 wrapped layers don't support `checkpoint_decoder_layer`
+### 5. Qwen3.5 wrapped layers support `checkpoint_decoder_layer`
 
-Only LFM25's wrapped layer (`LFM25ForCausalLMWrappedLayer`) uses the
-`checkpoint_decoder_layer` flag. Qwen35's `Qwen35ForCausalLMWrappedLayer`
-runs the full layer without checkpointing. To add it, apply the same
-`torch.checkpoint` pattern as LFM25.
+Both LFM25 and Qwen35 wrapped layers use the `checkpoint_decoder_layer` flag.
+Keep this enabled for long-context runs unless a specific regression is being
+isolated.
 
 ### 6. `upload_stream()` is dead code
 

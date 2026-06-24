@@ -6,7 +6,7 @@ Includes Qwen35VoltaAttention for V100 flash-attention support.
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, Optional, Union, cast
+from typing import Any, Callable, NamedTuple, Optional, Union, cast
 
 import torch
 import torch.nn as nn
@@ -31,12 +31,17 @@ def _compat_mask_call(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
     return fn(**{k: v for k, v in kwargs.items() if k in sig.parameters})
 
 
+class _FlashBackend(NamedTuple):
+    name: str
+    fn: Callable[..., torch.Tensor]
+
+
 class Qwen35VoltaAttention(Qwen3_5Attention):
     """Qwen3.5 attention using flash-attention.
 
     Dispatches to the right backend based on GPU architecture:
     - sm_70 (V100): flash_attn_v100
-    - sm_75+ (Ampere): standard flash_attn
+    - sm_80+ (Ampere+): standard flash_attn
     - Fallback: eager (any GPU)
 
     Supports optional sliding-window attention via window_size kwarg
@@ -47,15 +52,29 @@ class Qwen35VoltaAttention(Qwen3_5Attention):
         super().__init__(*args, **kwargs)
         self.window_size = window_size
 
-    def _select_flash_fn(self, device: torch.device) -> callable:
-        """Return flash_attn_v100 for Volta GPUs, None (eager) otherwise."""
+    def _select_flash_backend(self, device: torch.device) -> _FlashBackend | None:
+        """Pick the non-quadratic attention backend for the current GPU."""
+        if device.type != "cuda":
+            return None
         try:
             sm = torch.cuda.get_device_capability(device)
-            if sm[0] == 7 and sm[1] == 0:
+        except RuntimeError:
+            return None
+
+        if sm[0] == 7 and sm[1] == 0:
+            try:
                 from flash_attn_v100 import flash_attn_func as fn
-                return fn
-        except (RuntimeError, ImportError):
-            pass
+                return _FlashBackend("flash_attn_v100", fn)
+            except ImportError:
+                return None
+
+        if sm[0] >= 8:
+            try:
+                from flash_attn import flash_attn_func as fn
+                return _FlashBackend("flash_attn", fn)
+            except ImportError:
+                return None
+
         return None
 
     def forward(
@@ -71,7 +90,7 @@ class Qwen35VoltaAttention(Qwen3_5Attention):
         if self.training and self.attention_dropout:
             raise ValueError("flash-attn requires dropout=0.0")
 
-        flash_fn = self._select_flash_fn(hidden_states.device)
+        flash_backend = self._select_flash_backend(hidden_states.device)
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -89,7 +108,7 @@ class Qwen35VoltaAttention(Qwen3_5Attention):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if flash_fn is not None:
+        if flash_backend is not None:
             q = query_states.transpose(1, 2).contiguous()
             k = key_states.transpose(1, 2).contiguous()
             v = value_states.transpose(1, 2).contiguous()
@@ -99,12 +118,16 @@ class Qwen35VoltaAttention(Qwen3_5Attention):
                 )
                 if self.window_size is not None:
                     flash_kwargs["window_size"] = self.window_size
-                attn_output = flash_fn(q, k, v, **flash_kwargs)
-                attn_output = attn_output.transpose(1, 2).contiguous()
-            except RuntimeError:
-                flash_fn = None
+                # flash-attn consumes and returns (batch, seq, heads, head_dim),
+                # matching qz-roundpipe's Qwen3.5 patch contract.
+                attn_output = flash_backend.fn(q, k, v, **flash_kwargs)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{flash_backend.name} failed for Qwen3.5 layer {self.layer_idx}; "
+                    "not falling back to quadratic eager attention"
+                ) from exc
 
-        if flash_fn is None:
+        if flash_backend is None:
             from transformers.models.llama.modeling_llama import eager_attention_forward
             attn_output, _ = eager_attention_forward(
                 self, query_states, key_states, value_states,

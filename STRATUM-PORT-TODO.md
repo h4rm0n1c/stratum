@@ -111,6 +111,10 @@ Source: `train_lfm25_roundpipe_lora.py:120-298`
 - [x] `Qwen35VoltaAttention.__init__` accepts `window_size`
 - [x] Sliding window passthrough to flash-attn-v100
 - [x] `--volta-layers none` — disable Volta patching for eager fallback/debug
+- [x] Qwen35 full-attention wrapper dispatches to standard `flash_attn` on
+  Ampere+ and `flash_attn_v100` on V100. This is required for heterogeneous
+  splits where a Qwen full-attention layer lands on the RTX 3080; silent eager
+  fallback caused an 8K OOM on layer 3.
 
 ## 7. Data Loading Flags
 
@@ -127,6 +131,10 @@ Source: `train_lfm25_roundpipe_lora.py:120-298`
 - [x] `_pin_cpu()` helper (dedicated pinned copy)
 - [x] `estimate_module_upload_gib()` — NF4-savvy size estimation
 - [x] `NF4Payload` dataclass (was already dataclass from prior fix)
+- [x] `--nf4-scope {all,layers}` — keeps the existing Stratum all-module
+  behavior for LFM while allowing qz-roundpipe-style decoder-layer-only NF4
+  prep for Qwen35, whose embedding/head tensors can kill first-time NF4 cache
+  creation on the reference host.
 
 ## 9. Checkpoint Format — `stratum/checkpoint.py`
 
@@ -342,7 +350,12 @@ From RoundPipe scripts that Stratum doesn't have yet:
 - [x] Test the same LFM2.5 run with `--prefetch-nf4`. Passed on 2026-06-24
   with finite losses, PEFT safetensors checkpoint/final save, and a small GPU1
   peak increase from ~19.32 GiB to ~19.46 GiB.
-- [ ] Test Qwen35 on the same no-P2P two-GPU setup.
+- [~] Test Qwen35 on the same no-P2P two-GPU setup. Initial attempts with
+  all-module NF4 prep were killed with exit 137 during first-time NF4
+  preparation, before training. A reduced Qwen smoke with `--nf4-scope layers`
+  passed one finite-loss step and confirmed cached layer NF4 payloads work.
+  The 8K batch 2 validation then exposed the missing Ampere flash-attention
+  backend on GPU0; rerun full validation after rebuilding the refresh image.
 
 ## 20. Batch API Parity — `roundpipe/batch.py`
 

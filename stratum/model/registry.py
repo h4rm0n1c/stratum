@@ -45,6 +45,7 @@ class ModelArch:
         *,
         use_nf4: bool = True,
         nf4_cache_dir: Optional[str] = None,
+        nf4_scope: str = "all",
         checkpoint_decoder_layer: bool = False,
         stage_memory_limit_gib: float = 0.0,
         prefetch_nf4: bool = False,
@@ -119,11 +120,16 @@ class ModelArch:
         pipeline = StratumPipeline(prefix, stages, postfix, prefetch_nf4=prefetch_nf4)
 
         # Phase 1: NF4 preparation (quantize frozen 2D weights, drop originals)
+        if nf4_scope not in {"all", "layers"}:
+            raise ValueError(f"nf4_scope must be 'all' or 'layers', got {nf4_scope!r}")
+
         if use_nf4:
-            prepare_nf4(pipeline.prefix, cache_dir=nf4_cache_dir, verbose=verbose)
+            if nf4_scope == "all":
+                prepare_nf4(pipeline.prefix, cache_dir=nf4_cache_dir, verbose=verbose)
             for stage in stages:
                 prepare_nf4(stage, cache_dir=nf4_cache_dir, verbose=verbose)
-            prepare_nf4(pipeline.postfix, cache_dir=nf4_cache_dir, verbose=verbose)
+            if nf4_scope == "all":
+                prepare_nf4(pipeline.postfix, cache_dir=nf4_cache_dir, verbose=verbose)
 
         # Phase 2: Upload non-NF4 params (trainable, norms, biases) permanently.
         # NF4-eligible frozen weights stay on CPU and are streamed per-step
@@ -168,6 +174,7 @@ def build_pipeline(
     *,
     use_nf4: bool = True,
     nf4_cache_dir: Optional[str] = None,
+    nf4_scope: str = "all",
     checkpoint_decoder_layer: bool = False,
     loss_token_chunk_size: int = 4096,
     postfix_loss_token_chunk_size: int = 0,
@@ -194,6 +201,7 @@ def build_pipeline(
     return arch.build(
         hf_model, tensor_split=tensor_split, device_ids=device_ids,
         use_nf4=use_nf4, nf4_cache_dir=nf4_cache_dir,
+        nf4_scope=nf4_scope,
         checkpoint_decoder_layer=checkpoint_decoder_layer,
         loss_token_chunk_size=loss_token_chunk_size,
         postfix_loss_token_chunk_size=postfix_loss_token_chunk_size,

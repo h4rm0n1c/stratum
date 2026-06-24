@@ -150,6 +150,8 @@ def main():
                     help="Split batch into N microbatches (gradient accumulation, saves VRAM)")
     ap.add_argument("--no-nf4", action="store_true",
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
+    ap.add_argument("--nf4-scope", default="all", choices=["all", "layers"],
+                    help="Frozen weight NF4 preparation scope. 'all' includes prefix/stages/postfix; 'layers' matches qz-roundpipe layers-only prep.")
     ap.add_argument("--stratum-stage-memory-limit-gib", type=float, default=0.0,
                     help="Split per-device layer groups into substages below this upload footprint (0 = disabled)")
     ap.add_argument("--prefetch-nf4", action="store_true",
@@ -324,6 +326,7 @@ def main():
         device_ids=args.device_ids,
         use_nf4=not args.no_nf4,
         nf4_cache_dir=nf4_cache_dir,
+        nf4_scope=args.nf4_scope,
         checkpoint_decoder_layer=args.checkpoint_decoder_layer,
         loss_token_chunk_size=args.loss_token_chunk_size,
         postfix_loss_token_chunk_size=args.postfix_loss_token_chunk_size,
