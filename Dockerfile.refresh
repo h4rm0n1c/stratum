@@ -1,0 +1,36 @@
+# Fast source refresh image.
+#
+# Use this when dependency layers in stratum:latest are already correct and
+# only runtime source/scripts need to be baked into the image:
+#
+#   docker build -f Dockerfile.refresh -t stratum:latest .
+#
+# Do not replace the full Dockerfile with this. This file intentionally starts
+# from the existing image so source changes do not invalidate expensive CUDA,
+# PyTorch, flash-attention, and kernel-build layers.
+#
+# The base image may contain an older broad /workspace/stratum copy. Delete it
+# first so docs/tests/git/cache/data cannot survive through refresh layering.
+
+FROM stratum:latest
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN rm -rf /workspace/stratum /tmp/stratum-src
+
+WORKDIR /tmp/stratum-src
+COPY pyproject.toml /tmp/stratum-src/
+RUN printf 'Stratum runtime image package build.\n' > README.md
+COPY stratum /tmp/stratum-src/stratum
+RUN pip install --no-cache-dir --force-reinstall --no-deps /tmp/stratum-src && \
+    rm -rf /tmp/stratum-src
+
+WORKDIR /workspace/stratum
+COPY scripts/train.py scripts/doctor.py /workspace/stratum/scripts/
+
+RUN python - <<'PY'
+import torch
+import stratum
+print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("Stratum import OK:", stratum.__file__)
+PY

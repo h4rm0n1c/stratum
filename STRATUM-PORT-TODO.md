@@ -8,6 +8,27 @@ just because the exact implementation is tied to RoundPipe's single-runtime
 async scheduler; first decide whether the user-visible capability should be
 ported directly, adapted, or explicitly rejected with evidence.
 
+**Reference validation contract:** Stratum's practical target is the same class
+of machine that motivated the qz-roundpipe work: a cheap heterogeneous local
+rig, not a clean homogeneous cluster. The current reference setup is
+container-local `cuda:0` as an RTX 3080-class card plus `cuda:1` as a V100 32
+GiB card, with CUDA peer access false in both directions. Host-staged
+cross-device transfer is therefore the primary path to keep correct and fast
+enough, not an afterthought.
+
+Multi-GPU parity work must stay aligned with that contract:
+- Validate boundary transfers on no-P2P devices, preferably with
+  `--tensor-split 10 32`.
+- Treat `/home/harri/turboquant-work/llama-cpp-turboquant/ggml/src/ggml-cuda/ggml-cuda.cu`
+  as the source-algorithm reference for host-staged fallback.
+- Treat `/home/harri/qz-roundpipe/` and the extracted RoundPipe package as the
+  source references for training/runtime features.
+- Use `Dockerfile.refresh` for normal source/docs/script rebuilds; use the full
+  `Dockerfile` only when the heavy CUDA/dependency stack changes.
+- Keep docs, tests, git metadata, caches, datasets, outputs, and checkpoint
+  blobs out of runtime images. Refresh builds must delete any inherited broad
+  `/workspace/stratum` copy before installing the minimal runtime payload.
+
 ## Status Legend
 - [ ] not started
 - [~] in progress

@@ -10,6 +10,8 @@ design decisions, and known tricky areas for handoff to other agents.
 |---|---|---|
 | **Stratum repo** | `/home/harri/stratum/` |
 | Entry point | `scripts/train.py` |
+| Container launcher | `scripts/run-unified.sh` |
+| Container doctor | `scripts/doctor.py` |
 | Training config | CLI args (see `train.py --help`) |
 | Dockerfile | `Dockerfile` |
 | Port tracking | `STRATUM-PORT-TODO.md` |
@@ -32,7 +34,140 @@ design decisions, and known tricky areas for handoff to other agents.
 | Data source | Merged fable_5_distillation_merged_cleaned_25k + WithinUsAI pool |
 | **Tested model** | `LiquidAI/LFM2.5-8B-A1B` (registered as `lfm25-8b-a1b`) |
 | **Hardware** | RTX 3080 (12 GiB, GPU 0) + V100 (32 GiB, GPU 1) |
-| **Docker image** | `stratum:latest` (sha `8226fc73`), rebuild from `Dockerfile` |
+| **Docker image** | `stratum:latest` refreshed from `Dockerfile.refresh`; full dependency base from `Dockerfile` |
+
+## Container Workflow
+
+Stratum training is container-first. Do not treat host Python, host CUDA, or
+host `nvidia-smi` as proof that the training runtime is healthy.
+
+Canonical probe:
+
+```bash
+scripts/run-unified.sh python scripts/doctor.py
+```
+
+Canonical training shape:
+
+```bash
+STRATUM_DATA_DIR=/home/harri/qz-roundpipe/data \
+scripts/run-unified.sh python scripts/train.py \
+  --model lfm25-8b-a1b \
+  --data /workspace/data/lfm25_fable_merged_48k_train.labels.jsonl \
+  --tensor-split 10 32 \
+  --steps 1 \
+  --batch-size 1 \
+  --no-save \
+  --out /workspace/out/smoke
+```
+
+GPU selection is two-level:
+
+- `STRATUM_GPU` controls Docker's physical NVIDIA device exposure, e.g.
+  `STRATUM_GPU=device=0,1`.
+- `STRATUM_CUDA_VISIBLE_DEVICES` optionally controls the logical CUDA IDs
+  seen by PyTorch inside the container.
+
+Stratum currently assumes the prefix lives on container-local `cuda:0`.
+Therefore physical GPU selection should usually be done by Docker mapping the
+desired physical devices into container-local `0..N`, then passing Stratum
+`--device-ids 0 1 ...` or relying on auto-detection.
+
+### Reference host contract
+
+The current reference validation host is intentionally heterogeneous and
+imperfect:
+
+| Container device | Observed GPU | SM | Observed VRAM | Role |
+|---|---|---|---|---|
+| `cuda:0` | NVIDIA GeForce RTX 3080 | 8.6 | ~9.6 GiB visible to PyTorch | prefix / smaller stage |
+| `cuda:1` | Tesla V100-SXM2-32GB | 7.0 | ~31.7 GiB visible to PyTorch | larger stage / postfix |
+
+`scripts/doctor.py` has reported `peer_access` false for both `0->1` and
+`1->0`. That no-peer behavior is not a blocker or a rare fallback case; it is
+the target runtime shape. Boundary activation and gradient transfers must be
+correct over the host-staged pinned-buffer path, adapted from the local
+TurboQuant llama.cpp work.
+
+This matters for design reviews: do not claim multi-GPU support based only on
+P2P-capable homogeneous cards. Validate on the no-peer host-staged path with
+`--tensor-split 10 32` unless the change is provably unrelated to device
+placement or transfer.
+
+### Build discipline
+
+Use two Docker build paths:
+
+```bash
+# Expensive dependency build. Use when CUDA/PyTorch/kernel/dependency layers change.
+docker build -t stratum:latest .
+
+# Fast source refresh. Use for normal code and runtime script changes.
+docker build -f Dockerfile.refresh -t stratum:latest .
+```
+
+`Dockerfile.refresh` starts from the current `stratum:latest`, deletes the old
+`/workspace/stratum` tree, installs Stratum from a minimal temporary source
+copy, and force-reinstalls Stratum without touching the heavy CUDA dependency
+stack. This is the normal path after source changes.
+
+The final image should contain runtime code only:
+
+| Path | Intended contents |
+|---|---|
+| site-packages | installed `stratum` package |
+| `/workspace/stratum/scripts/` | runtime entry scripts such as `train.py` and `doctor.py` |
+| `/workspace/cache` | mounted cache at runtime, not baked data |
+| `/workspace/out` | mounted output at runtime, not baked data |
+
+Documentation-only changes do not require an image rebuild. Docs, tests, git
+metadata, local caches, datasets, generated outputs, and model/checkpoint blobs
+do not belong in the runtime image. The Docker build generates a tiny temporary
+README only because `pyproject.toml` references a README for package metadata;
+the real project documentation is not copied into the image.
+
+Do not casually edit lines above the expensive dependency layers in
+`Dockerfile`. Docker's cache keys include prior instruction history; even a
+comment or early metadata change can invalidate later apt/CUDA build layers.
+There was one aborted full rebuild after such an edit; it missed cache early
+and was stopped before the CUDA compile work. Keep source-refresh changes in
+`Dockerfile.refresh` unless the dependency stack really changed.
+
+The `.dockerignore` is part of the build contract. Build context should be
+small and should exclude docs, tests, git state, caches, datasets, outputs, and
+model/checkpoint blobs. If context size jumps, fix ignored paths before
+trusting build timings.
+
+### Runtime validation rules
+
+After a refresh build, run:
+
+```bash
+scripts/run-unified.sh python scripts/doctor.py
+```
+
+The doctor currently verifies:
+
+| Component | Expected state |
+|---|---|
+| CUDA | visible in the container |
+| PyTorch | CUDA build importable |
+| bitsandbytes | importable, NF4 dequant works on every visible GPU |
+| causal-conv1d | importable |
+| flash-attn | importable |
+| flash-attn-v100 | importable for SM70 path |
+| transformers / peft | importable |
+| stratum | importable from `/workspace/stratum` |
+
+If Docker prints `Your kernel does not support memory limit capabilities...`,
+do not assume `STRATUM_DOCKER_MEMORY` or `STRATUM_DOCKER_MEMORY_SWAP` protects
+the host. Use `--host-ram-limit-gib` and the Stratum watchdog for practical RAM
+safety.
+
+The launcher bind-mounts the working tree over `/workspace/stratum` so local
+changes are visible during normal development. A refresh image is still useful
+because it keeps the baked runtime self-consistent for no-mount usage, but it
+must not become a repository archive.
 
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 

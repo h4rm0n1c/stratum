@@ -10,24 +10,59 @@ heterogeneous GPU setups a first-class target.
 ## Quick Start
 
 ```bash
-# Build
+# Full build. Use this only when CUDA/dependency layers change.
 docker build -t stratum:latest .
 
-# Run on 2 GPUs (10 GB + 32 GB)
-docker run --gpus all --ipc=host \
-    --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
-    -v stratum_cache:/var/cache/stratum \
-    -v /path/to/training_data:/data \
-    -v /path/to/runs:/runs \
-    stratum:latest \
-    python scripts/train.py \
-        --model lfm25-8b-a1b \
-        --data /data/training.labels.jsonl \
-        --tensor-split 10 32 \
-        --steps 25000 \
-        --batch-size 2 \
-        --out /runs/my-run
+# Fast source/runtime-script refresh. Use this for normal Stratum code edits.
+docker build -f Dockerfile.refresh -t stratum:latest .
+
+# Verify the container sees CUDA, compiled kernels, caches, and NF4.
+scripts/run-unified.sh python scripts/doctor.py
+
+# Run on the container-visible GPUs. Pick physical GPUs with STRATUM_GPU
+# and map them to logical cuda:0..N with STRATUM_CUDA_VISIBLE_DEVICES.
+STRATUM_DATA_DIR=/path/to/training_data \
+scripts/run-unified.sh python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /workspace/data/training.labels.jsonl \
+    --tensor-split 10 32 \
+    --steps 25000 \
+    --batch-size 2 \
+    --out /workspace/out/my-run
 ```
+
+`scripts/run-unified.sh` is the canonical Docker entry point. It mirrors the
+qz-roundpipe launcher pattern: persistent cache mounts, `--ipc=host`,
+`IPC_LOCK`, Docker memory caps, and explicit GPU visibility controls.
+
+## Reference Runtime
+
+Stratum is designed for heterogeneous, no-P2P multi-GPU machines, not just
+clean datacenter boxes. The current reference host is a scraped-together
+home/education-style setup: container-local `cuda:0` is an RTX 3080-class card
+and `cuda:1` is a V100 32 GiB card, with `peer_access` false in both
+directions. On that class of rig, cross-device boundaries must work through the
+host-staged pinned-buffer path.
+
+This is intentional. Treat host-staged boundary transfer as the reference path,
+not merely as a slow fallback. Multi-GPU changes should be validated with:
+
+```bash
+scripts/run-unified.sh python scripts/doctor.py
+
+STRATUM_DATA_DIR=/home/harri/qz-roundpipe/data \
+scripts/run-unified.sh python scripts/train.py \
+    --model lfm25-8b-a1b \
+    --data /workspace/data/lfm25_fable_merged_48k_train.labels.jsonl \
+    --tensor-split 10 32 \
+    --steps 1 \
+    --batch-size 1 \
+    --no-save \
+    --out /workspace/out/smoke
+```
+
+Do not use host Python, host CUDA, or host `nvidia-smi` as evidence that
+Stratum training works. The Docker runtime is the product surface.
 
 ## Supported Models
 
@@ -77,11 +112,49 @@ from the local TurboQuant llama.cpp work in
 
 ## Cache
 
-Single `$STRATUM_CACHE=/var/cache/stratum` root. Mount a volume or host dir:
+Inside the launcher, the cache root is `/workspace/cache`. It persists under
+`./cache` by default and can be moved with `STRATUM_CACHE_DIR`.
 
 ```bash
--v stratum_cache:/var/cache/stratum
+STRATUM_CACHE_DIR=/fast/cache scripts/run-unified.sh python scripts/doctor.py
 ```
+
+Useful launcher environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `STRATUM_IMAGE` | `stratum:latest` | Docker image |
+| `STRATUM_GPU` | `all` | Docker `--gpus` selector, e.g. `device=0,1` |
+| `STRATUM_CUDA_VISIBLE_DEVICES` | unset | Container logical device map |
+| `STRATUM_DOCKER_MEMORY` | `88g` | Container RAM limit |
+| `STRATUM_DOCKER_MEMORY_SWAP` | `88g` | Container swap limit |
+| `STRATUM_CACHE_DIR` | `./cache` | Persistent HF/Torch/Triton/CUDA/NF4 cache |
+| `STRATUM_OUT_DIR` | `./out` | Training outputs mounted at `/workspace/out` |
+| `STRATUM_DATA_DIR` | `./data` | Optional read-only data mount at `/workspace/data` |
+
+## Docker Build Discipline
+
+`Dockerfile` contains the expensive CUDA, PyTorch, flash-attention, and
+kernel-build layers. Avoid source-only edits near the top of that file: they
+invalidate the instruction chain and can force Docker to repeat expensive
+dependency work. For normal code and runtime script changes, use
+`Dockerfile.refresh`; it starts from the current `stratum:latest`, deletes any
+old `/workspace/stratum` tree, installs Stratum from a minimal temporary source
+copy, and leaves only runtime scripts under `/workspace/stratum/scripts`.
+
+Documentation-only changes do not require an image rebuild. Documentation,
+tests, git metadata, caches, datasets, outputs, and local checkpoint/model blobs
+are not runtime image contents. The Docker build generates a tiny temporary
+README solely to satisfy Python package metadata without baking real docs into
+the image.
+
+The repository has a `.dockerignore` so build context should stay small. If a
+build suddenly sends gigabytes of context, stop and check ignored paths before
+waiting on Docker.
+
+Some hosts print Docker warnings like `Your kernel does not support memory
+limit capabilities...`. On those machines Docker memory caps may be ignored;
+use Stratum's `--host-ram-limit-gib` watchdog as the practical safety guard.
 
 ## Acknowledgments
 

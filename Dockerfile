@@ -10,13 +10,9 @@
 #   docker build -t stratum:latest .
 #
 # Run:
-#   docker run --gpus all --ipc=host \
-#     --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
-#     -v stratum_cache:/var/cache/stratum \
-#     -v /path/to/training_data:/data \
-#     -v /path/to/runs:/runs \
-#     stratum:latest \
-#     python scripts/train.py ...
+#   scripts/run-unified.sh python scripts/doctor.py
+#   STRATUM_DATA_DIR=/path/to/training_data \
+#     scripts/run-unified.sh python scripts/train.py ...
 
 FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
 
@@ -192,9 +188,18 @@ RUN rm -rf /tmp/fa2
 
 # Stratum install — MUST come AFTER all CUDA builds so source file changes
 # don't invalidate the expensive CUDA kernel compilation layers.
-COPY . /tmp/stratum
-RUN pip install --no-cache-dir /tmp/stratum
-RUN rm -rf /tmp/stratum
+# Keep docs/tests/git/cache/data out of the final runtime image. The package
+# build gets a tiny generated README so real documentation is not baked into
+# wheel metadata.
+RUN rm -rf /workspace/stratum /tmp/stratum-src
+WORKDIR /tmp/stratum-src
+COPY pyproject.toml /tmp/stratum-src/
+RUN printf 'Stratum runtime image package build.\n' > README.md
+COPY stratum /tmp/stratum-src/stratum
+RUN pip install --no-cache-dir /tmp/stratum-src && rm -rf /tmp/stratum-src
+
+WORKDIR /workspace/stratum
+COPY scripts/train.py scripts/doctor.py /workspace/stratum/scripts/
 
 # Unified cache directory
 ENV STRATUM_CACHE=/var/cache/stratum
@@ -215,7 +220,9 @@ from flash_attn import flash_attn_func as fa2
 print("flash-attn (standard): OK")
 import bitsandbytes
 import transformers, peft
+import stratum
 print("All imports OK")
+print("Stratum import OK:", stratum.__file__)
 PY
 
 LABEL description="Stratum: multi-GPU layer-parallel training"
