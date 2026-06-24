@@ -212,8 +212,16 @@ Observed result:
 | Legacy blobs | No `device_*.pt`, `optim_*.pt`, or `meta.pt` written by default |
 
 This proves the current LFM2.5 NF4 + LoRA + host-staged multi-GPU path for the
-reference setup. It does not yet prove Qwen35, `--prefetch-nf4`, CPU/offloaded
-optimizer mode, or long-run stability.
+reference setup.
+
+An otherwise identical validation run with `--prefetch-nf4` also passed on
+2026-06-24. It produced 5 finite-loss steps, final logged loss `10.5622`, warm
+throughput around 3030 tokens/s, and PEFT safetensors checkpoint/final saves.
+The observed GPU1 peak rose slightly, from ~19.32 GiB to ~19.46 GiB, consistent
+with briefly overlapping prefetched NF4 payloads.
+
+These runs do not yet prove Qwen35, CPU/offloaded optimizer mode, or long-run
+stability.
 
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 

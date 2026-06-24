@@ -339,7 +339,9 @@ From RoundPipe scripts that Stratum doesn't have yet:
   tensor_split=[9,32], max_seq_len=8192, save_every=5. Passed on
   2026-06-24 with finite losses, host-staged RTX 3080→V100 transfers,
   PEFT safetensors checkpoint/final save, and no legacy `.pt` checkpoint blobs.
-- [ ] Test the same LFM2.5 run with `--prefetch-nf4`.
+- [x] Test the same LFM2.5 run with `--prefetch-nf4`. Passed on 2026-06-24
+  with finite losses, PEFT safetensors checkpoint/final save, and a small GPU1
+  peak increase from ~19.32 GiB to ~19.46 GiB.
 - [ ] Test Qwen35 on the same no-P2P two-GPU setup.
 
 ## 20. Batch API Parity — `roundpipe/batch.py`
