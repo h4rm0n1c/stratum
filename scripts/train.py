@@ -139,6 +139,10 @@ def main():
     ap.add_argument("--postfix-loss-token-chunk-size", type=int, default=0,
                     help="Split norm + lm_head into token blocks with per-block backward (saves VRAM)")
     ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--save-optimizer-state", action="store_true",
+                    help="Also save same-layout optimizer .pt state. Default checkpoints are adapter safetensors + JSON only.")
+    ap.add_argument("--save-legacy-device-state", action="store_true",
+                    help="Also save legacy per-device trainable .pt state for debugging/backward compatibility.")
     ap.add_argument("--checkpoint-decoder-layer", action="store_true", default=True,
                     help="Activation checkpointing per decoder layer (reduces VRAM, ~30% slower)")
     ap.add_argument("--num-microbatch", type=int, default=1,
@@ -393,7 +397,11 @@ def main():
     start_step = 0
     if args.resume:
         resume_dir = Path(args.resume)
-        if (resume_dir / "meta.pt").exists():
+        if (
+            (resume_dir / "trainer_state.json").exists()
+            or (resume_dir / "meta.pt").exists()
+            or (resume_dir / "adapter_model.safetensors").exists()
+        ):
             start_step = load_checkpoint(
                 modules_by_device, optimizer, resume_dir,
                 peft_model=hf_model,
@@ -519,14 +527,18 @@ def main():
         if args.save_every > 0 and step % args.save_every == 0:
             save_dir = Path(args.out) / f"checkpoint-{step}"
             save_checkpoint(modules_by_device, optimizer, step, save_dir,
-                            peft_model=hf_model)
+                            peft_model=hf_model,
+                            save_optimizer_state=args.save_optimizer_state,
+                            save_legacy_device_state=args.save_legacy_device_state)
             tqdm.write(f"Saved checkpoint {save_dir}")
 
     # Final save
     if not args.no_save:
         save_dir = Path(args.out) / "final"
         save_checkpoint(modules_by_device, optimizer, step, save_dir,
-                        peft_model=hf_model)
+                        peft_model=hf_model,
+                        save_optimizer_state=args.save_optimizer_state,
+                        save_legacy_device_state=args.save_legacy_device_state)
         tqdm.write(f"Saved final checkpoint to {save_dir}")
     else:
         tqdm.write("Skipping final save (--no-save)")

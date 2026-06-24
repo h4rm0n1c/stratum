@@ -1,12 +1,14 @@
-"""Save and load Stratum training state across devices.
+"""Save and load Stratum training state.
 
-Two output formats:
-  1. PEFT-compatible adapter (adapter_model.safetensors + adapter_config.json)
-     — portable, loadable by PeftModel.from_pretrained() on any GPU topology.
-  2. Per-device optimizer state (optim_{device_id}.pt) — for resume training
-     on the same device layout.
+Default checkpoint format is LoRA/QLoRA-style and topology-portable:
+  1. PEFT adapter files, normally adapter_model.safetensors + adapter_config.json.
+  2. trainer_state.json for lightweight metadata such as the current step.
+
+Large per-device ``.pt`` state is legacy/debug-only and must be explicitly
+requested by the caller. It is not appropriate for normal QLoRA checkpoints.
 """
 
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -21,44 +23,60 @@ def save_checkpoint(
     step: int,
     out_dir: Path,
     peft_model: Optional[torch.nn.Module] = None,
+    *,
+    save_optimizer_state: bool = False,
+    save_legacy_device_state: bool = False,
 ) -> None:
-    """Save LoRA adapter (PEFT safetensors) and per-device optimiser state.
+    """Save LoRA adapter and lightweight trainer metadata.
 
     Args:
-        modules_per_device: Pipeline modules grouped by device (for legacy .pt).
-        optimizer: Per-device optimizer (saves state per device).
+        modules_per_device: Pipeline modules grouped by device. Only used when
+            save_legacy_device_state=True.
+        optimizer: Per-device optimizer. Only saved when save_optimizer_state=True.
         step: Current training step.
         out_dir: Output directory.
         peft_model: The PeftModel (hf_model) for PEFT-compatible adapter save.
             If provided, saves adapter_model.safetensors + adapter_config.json.
+        save_optimizer_state: Save same-layout optimizer .pt files. Off by
+            default because portable LoRA/QLoRA checkpoints should stay small.
+        save_legacy_device_state: Save same-layout per-device trainable .pt
+            files for backward compatibility/debugging. Off by default.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    # 1. Portable PEFT LoRA adapter (safetensors)
+    # 1. Portable PEFT LoRA adapter (safetensors by default in PEFT).
+    peft_saved = False
     if peft_model is not None:
         try:
             peft_model.save_pretrained(str(out_dir))
+            peft_saved = True
         except Exception as exc:
             print({"checkpoint_peft_save_failed": str(exc)}, flush=True)
+            raise
 
-    # 2. Per-device trainable params (backward-compatible .pt)
-    for device_id, mods in modules_per_device.items():
-        state = {"step": step}
-        for idx, mod in enumerate(mods):
-            if hasattr(mod, "state_dict"):
-                sd = mod.state_dict()
+    # 2. Optional legacy per-device trainable params. This deliberately walks
+    # named_parameters() instead of state_dict(); state_dict() includes frozen
+    # base tensors and caused multi-GB checkpoint artifacts.
+    if save_legacy_device_state:
+        for device_id, mods in modules_per_device.items():
+            state = {"step": step}
+            for idx, mod in enumerate(mods):
+                if not hasattr(mod, "named_parameters"):
+                    continue
                 trainable = {
-                    k: v for k, v in sd.items()
-                    if v.numel() > 0
+                    name: param.detach().cpu()
+                    for name, param in mod.named_parameters()
+                    if param.requires_grad and param.numel() > 0
                 }
                 if trainable:
                     state[f"module_{idx}"] = trainable
-        torch.save(state, out_dir / f"device_{device_id}.pt")
+            torch.save(state, out_dir / f"device_{device_id}.pt")
 
-    # 3. Optimiser state per device
-    if optimizer is not None:
+    # 3. Optional optimizer state per device. This is same-layout resume state,
+    # not portable adapter state.
+    if save_optimizer_state and optimizer is not None:
         for device_id, opt in optimizer.optimizers.items():
             if opt is not None:
                 torch.save(
@@ -66,12 +84,28 @@ def save_checkpoint(
                     out_dir / f"optim_{device_id}.pt",
                 )
 
-    # 4. Metadata
-    torch.save({"step": step}, out_dir / "meta.pt")
+    # 4. Lightweight metadata. Keep this JSON so default checkpoints contain
+    # no .pt files at all.
+    trainer_state = {
+        "format_version": 2,
+        "step": int(step),
+        "peft_adapter_saved": peft_saved,
+        "optimizer_state_saved": bool(save_optimizer_state),
+        "legacy_device_state_saved": bool(save_legacy_device_state),
+    }
+    with (out_dir / "trainer_state.json").open("w", encoding="utf-8") as f:
+        json.dump(trainer_state, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    # meta.pt is legacy compatibility only, not part of the default format.
+    if save_legacy_device_state or save_optimizer_state:
+        torch.save({"step": step}, out_dir / "meta.pt")
 
     dt = time.time() - t0
     log_event("checkpoint_saved", step=step, out_dir=str(out_dir),
-              seconds=round(dt, 2))
+              seconds=round(dt, 2), peft_saved=peft_saved,
+              optimizer_state_saved=bool(save_optimizer_state),
+              legacy_device_state_saved=bool(save_legacy_device_state))
 
 
 def load_checkpoint(
@@ -97,23 +131,40 @@ def load_checkpoint(
         Training step to resume from.
     """
     checkpoint_dir = Path(checkpoint_dir)
-    meta = torch.load(checkpoint_dir / "meta.pt", map_location="cpu")
-    step = meta.get("step", 0)
+    trainer_state_path = checkpoint_dir / "trainer_state.json"
+    if trainer_state_path.exists():
+        with trainer_state_path.open("r", encoding="utf-8") as f:
+            trainer_state = json.load(f)
+        step = int(trainer_state.get("step", 0))
+    elif (checkpoint_dir / "meta.pt").exists():
+        meta = torch.load(checkpoint_dir / "meta.pt", map_location="cpu")
+        step = int(meta.get("step", 0))
+    else:
+        # qz-roundpipe PEFT checkpoints can be adapter-only; Stratum metadata is
+        # an additive trainer-state convenience, not a resume prerequisite.
+        step = 0
     log_event("checkpoint_loaded", step=step, checkpoint_dir=str(checkpoint_dir))
 
     # 1. Try PEFT adapter load (portable)
     adapter_path = checkpoint_dir / "adapter_model.safetensors"
+    peft_loaded = False
     if adapter_path.exists() and peft_model is not None:
         try:
             import safetensors.torch
             state_dict = safetensors.torch.load_file(str(adapter_path))
             peft_model.load_state_dict(state_dict, strict=False)
             log_event("checkpoint_load_peft", tensors=len(state_dict))
+            peft_loaded = True
         except Exception as exc:
             print({"checkpoint_peft_load_failed": str(exc)}, flush=True)
             # Fall through to legacy load
 
-    # 2. Legacy per-device .pt load (backward compatible)
+    # 2. Legacy per-device .pt load (backward compatible). Skip this if a PEFT
+    # adapter loaded successfully; the legacy files are same-layout fallback
+    # state, not something to layer over a portable adapter.
+    if peft_loaded:
+        return step
+
     for device_id, mods in modules_per_device.items():
         dev_path = checkpoint_dir / f"device_{device_id}.pt"
         if not dev_path.exists():

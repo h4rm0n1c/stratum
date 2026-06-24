@@ -261,27 +261,29 @@ class StratumPipeline(nn.Module):
             free_weights(self.postfix)
 
     def save_pretrained(self, out_dir):
-        """Save LoRA adapter weights only (trainable params per device).
+        """Save trainable adapter weights as safetensors.
 
         Frozen base weights are never saved — they're restored from the
         HuggingFace hub when loading.
         """
+        from safetensors.torch import save_file
+
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for stage in self.stages:
             dev = stage.device_id
             state = {
-                k: p.data.cpu() for k, p in stage.named_parameters()
+                k: p.detach().cpu().contiguous() for k, p in stage.named_parameters()
                 if p.requires_grad
             }
             if state:
-                torch.save(state, out_dir / f"adapter_device_{dev}.pt")
+                save_file(state, out_dir / f"adapter_device_{dev}.safetensors")
 
         # Also save prefix/postfix if they have trainable params
         for name, mod in [("prefix", self.prefix), ("postfix", self.postfix)]:
             state = {
-                k: p.data.cpu() for k, p in mod.named_parameters()
+                k: p.detach().cpu().contiguous() for k, p in mod.named_parameters()
                 if p.requires_grad
             }
             if state:
-                torch.save(state, out_dir / f"adapter_{name}.pt")
+                save_file(state, out_dir / f"adapter_{name}.safetensors")

@@ -193,7 +193,7 @@ order.
 | MLP token chunking | `TokenChunkedModule` | Same, in `mlp_opt.py` | Identical |
 | Memory-flat frozen MLP | `MemoryFlatFrozenMLP` custom autograd | Same, in `mlp_opt.py` | Identical |
 | Selective volta patching | `--volta-layers`, `--volta-window-*` | Same | Identical |
-| LoRA adapter checkpoint | `base.save_pretrained()` (PEFT safetensors) | Same via `hf_model.save_pretrained()` | Identical |
+| LoRA adapter checkpoint | `base.save_pretrained()` (PEFT safetensors) | Same via `hf_model.save_pretrained()` + JSON trainer state | Identical; legacy `.pt` is opt-in only |
 
 ### CLI flags
 
@@ -322,7 +322,7 @@ scripts/train.py
 | File | Purpose |
 |---|---|
 | `optim.py` | `PerDeviceOptimizer` — one AdamW per device, synchronised LR scheduling |
-| `checkpoint.py` | `save_checkpoint()` / `load_checkpoint()` — PEFT safetensors + per-device optim state |
+| `checkpoint.py` | `save_checkpoint()` / `load_checkpoint()` — PEFT safetensors + JSON metadata by default; legacy `.pt` opt-in |
 | `utils.py` | device detection, `gpu_memory_snapshot()`, `get_optimal_tensor_split()` |
 
 ## Training Mechanics — How a Single Step Works
@@ -470,17 +470,13 @@ Mutex rules (enforced by `apply_mlp_optimizations()`):
 
 ## Checkpoint Format
 
-Checkpoints are saved with **both** formats:
+Default checkpoints are LoRA/QLoRA-style and portable:
 
 ```
 checkpoint-5000/
 ├── adapter_model.safetensors     ← PEFT-compatible LoRA weights (portable)
 ├── adapter_config.json            ← PEFT adapter config
-├── meta.pt                        ← step number
-├── device_0.pt                    ← legacy per-device state (backward compat)
-├── device_1.pt
-├── optim_0.pt                     ← per-device optimizer state
-└── optim_1.pt
+└── trainer_state.json             ← step number and lightweight metadata
 ```
 
 **Saving:** `hf_model.save_pretrained(out_dir)` produces `adapter_model.safetensors`
@@ -488,8 +484,22 @@ checkpoint-5000/
 not base model frozen weights. Even though `prepare_nf4()` has set frozen
 weights to `empty(0)`, PEFT ignores them.
 
+Stratum no longer writes `device_{id}.pt`, `optim_{id}.pt`, or `meta.pt` by
+default. Those files are same-layout legacy/debug artifacts and are explicitly
+opt-in with:
+
+```bash
+--save-legacy-device-state
+--save-optimizer-state
+```
+
+Do not enable those flags for normal LoRA/QLoRA training unless same-layout
+optimizer resume is worth the extra disk use. Portable adapter checkpoints
+should stay small and safetensors-first.
+
 **Loading (resume):** `safetensors.torch.load_file()` → `hf_model.load_state_dict(strict=False)`.
-Prefers PEFT adapter, falls back to legacy `.pt` files.
+Prefers PEFT adapter, reads `trainer_state.json`, and falls back to legacy
+`.pt` files only for old checkpoints.
 
 **Inference on another machine:**
 ```python

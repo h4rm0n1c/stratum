@@ -129,10 +129,12 @@ Source: `train_lfm25_roundpipe_lora.py:120-298`
 
 ## 9. Checkpoint Format — `stratum/checkpoint.py`
 
-- [x] **Save portable PEFT LoRA adapter alongside per-device optim state**
+- [x] **Save portable PEFT LoRA adapter with JSON metadata by default**
   - [x] `hf_model.save_pretrained(out_dir)` → `adapter_model.safetensors` + `adapter_config.json`
-  - [x] Keep per-device `optim_{id}.pt` for optimizer state (resume)
-  - [x] Load via `safetensors.torch.load_file() + hf_model.load_state_dict(strict=False)`
+  - [x] Save `trainer_state.json` for step/format metadata
+  - [x] Do not write `device_{id}.pt`, `optim_{id}.pt`, or `meta.pt` by default
+  - [x] Keep legacy per-device `.pt` and optimizer `.pt` as explicit opt-in flags only
+  - [x] Load via `safetensors.torch.load_file() + hf_model.load_state_dict(strict=False)`, with legacy `.pt` fallback
 
 ## 10. `ChunkedCompileLinearCrossEntropy` — torch.compiled Chunked Loss
 

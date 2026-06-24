@@ -92,7 +92,7 @@ from the local TurboQuant llama.cpp work in
 | `stratum/grad_hooks.py` | Cross-device gradient hooks |
 | `stratum/upload.py` | Unified NF4 + FP16 weight upload per device |
 | `stratum/optim.py` | Per-device optimiser + LR scheduler |
-| `stratum/checkpoint.py` | Save/load across devices |
+| `stratum/checkpoint.py` | PEFT safetensors + JSON trainer state; legacy `.pt` opt-in |
 | `stratum/model/registry.py` | Model architecture registry |
 
 ## Configuration
@@ -109,6 +109,11 @@ from the local TurboQuant llama.cpp work in
 | `--save-every` | 500 | Checkpoint interval |
 | `--no-nf4` | false | Disable NF4 compression |
 | `--resume` | "" | Checkpoint to resume from |
+
+Default checkpoints are disk-efficient LoRA/QLoRA artifacts:
+`adapter_model.safetensors`, `adapter_config.json`, and `trainer_state.json`.
+Stratum does not write giant per-device `.pt` files unless explicitly asked
+with `--save-legacy-device-state` or `--save-optimizer-state`.
 
 ## Cache
 

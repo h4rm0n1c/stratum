@@ -19,6 +19,7 @@ dependencies = [
     "bitsandbytes",
     "transformers",
     "peft",
+    "safetensors",
     "tqdm",
     "py-cpuinfo",
     "ninja",
