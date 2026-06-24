@@ -233,6 +233,15 @@ Qwen3.5 status as of 2026-06-24:
 | 8K blocker found | 5-step batch 2 run failed on GPU0 because Qwen full-attention layer 3 fell back to eager attention on the RTX 3080 |
 | Fix direction | Qwen full-attention wrapper must dispatch to standard `flash_attn` on Ampere+ and `flash_attn_v100` on V100; silent fallback to quadratic eager is not acceptable for long-context training |
 
+Post-fix validation of the Ampere attention path:
+
+| Item | Result |
+|---|---|
+| Focused RTX 3080 probe | Qwen3.5 full-attention shape `(batch=1, seq=7104, q_heads=16, kv_heads=4, head_dim=256)` selected `flash_attn` and completed forward+backward |
+| Probe peak | ~0.49 GiB allocated on GPU0, confirming the full-attention OOM was removed |
+| Full original split | 5-step batch 2 / 2 microbatch Qwen run with `--tensor-split 9 32` advanced past full-attention forward and host-staged boundary transfer |
+| Remaining blocker | Backward checkpoint recompute OOMed inside Qwen `linear_attn` on GPU0 with the first 8 layers assigned to the 10 GiB RTX 3080 |
+
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 
 Stratum is built from the qz-roundpipe training scripts but replaces RoundPipe's

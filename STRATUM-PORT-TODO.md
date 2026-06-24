@@ -355,7 +355,13 @@ From RoundPipe scripts that Stratum doesn't have yet:
   preparation, before training. A reduced Qwen smoke with `--nf4-scope layers`
   passed one finite-loss step and confirmed cached layer NF4 payloads work.
   The 8K batch 2 validation then exposed the missing Ampere flash-attention
-  backend on GPU0; rerun full validation after rebuilding the refresh image.
+  backend on GPU0. After adding the Ampere backend, a focused RTX 3080
+  full-attention probe at Qwen shape `(1, 7104, 16, 256)` selected standard
+  `flash_attn` and completed forward+backward with ~0.49 GiB peak. The full
+  original split now gets past full attention and the host-staged boundary, but
+  still OOMs during backward checkpoint recompute inside Qwen `linear_attn` on
+  GPU0. Next work is reducing or relocating Qwen linear-attention memory on the
+  10 GiB card, not another full-attention fix.
 
 ## 20. Batch API Parity — `roundpipe/batch.py`
 
