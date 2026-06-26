@@ -11,6 +11,7 @@ preserving the same loss and gradients as regular linear cross-entropy.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,12 @@ import torch.nn as nn
 
 _COMPILED_LINEAR_CE = None
 _COMPILE_WARNING_PRINTED = False
+
+
+def _compute_stream_context(tensor: torch.Tensor):
+    if not torch.is_tensor(tensor) or not tensor.is_cuda:
+        return nullcontext()
+    return torch.cuda.stream(torch.cuda.default_stream(tensor.device))
 
 
 def _linear_cross_entropy(
@@ -89,7 +96,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         loss_fn = _compiled_linear_cross_entropy if use_torch_compile else _linear_cross_entropy
         grad_context = torch.enable_grad() if global_requires_grad else torch.no_grad()
 
-        with grad_context:
+        with grad_context, _compute_stream_context(hidden_states):
             for chunk_h, chunk_l in zip(
                 detached_hidden.split(token_chunk_size, dim=0),
                 labels_flat.split(token_chunk_size, dim=0),

@@ -5,9 +5,10 @@ Ported from roundpipe_nf4.py.
 Two-phase:
   Phase 1 — prepare_nf4(): quantize frozen 2D weights to NF4, attach payload,
              drop original FP16 data (frees CPU RAM).
-  Phase 2 — upload_stream(): upload NF4 payload compressed to GPU, wrap in
-             NF4Linear (never dequants permanently — JIT dequant in forward).
-             Non-NF4 params upload as FP16 permanent.
+  Phase 2 — upload_stream()/ensure_weights(): upload NF4 payload compressed to
+             GPU, dequantize into the staged parameter data for use, then let
+             free_weights() drop the materialized GPU copy after the stage.
+             Non-NF4 params upload as regular tensors.
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ from typing import Optional, cast
 
 import torch
 from stratum.utils import log_event
+from stratum.layer_transfer import copy_tensor_chunked, DEFAULT_CHUNK_UPLOAD_BYTES
 
 NF4_ATTR = "roundpipe_nf4_payload"
+FP16_ATTR = "stratum_fp16_staged"
 
 
 @dataclass
@@ -56,6 +59,14 @@ def _payload_bytes(*tensors: torch.Tensor) -> int:
     return sum(t.numel() * t.element_size() for t in tensors)
 
 
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    return cast(torch.dtype, getattr(torch, name.removeprefix("torch.")))
+
+
 @dataclass
 class NF4Payload:
     """NF4-quantized weight payload kept on CPU between steps.
@@ -66,14 +77,87 @@ class NF4Payload:
         code:        Quantization codebook (256 FP16 values).
         shape:       Original weight shape (tuple).
         dtype:       Original weight dtype.
+        blocksize:   NF4 quantization block size.
+        quant_type:  bitsandbytes quantization type.
+        source_numel: Original weight element count.
         source_bytes: Original weight size in bytes (for reporting).
+        payload_bytes: Compressed payload size in bytes.
     """
     quantized: torch.Tensor
     absmax: torch.Tensor
     code: torch.Tensor
     shape: tuple
     dtype: torch.dtype
+    blocksize: int
+    quant_type: str
+    source_numel: int
     source_bytes: int
+    payload_bytes: int
+
+
+@dataclass
+class FP16StagedPayload:
+    """FP16 frozen weight kept on CPU for per-step upload (analogous to NF4Payload).
+
+    Used by the --no-nf4 runtime path: frozen params are pinned on CPU and
+    uploaded to GPU each step via copy_tensor_chunked, then freed after backward.
+    """
+    data: torch.Tensor
+    shape: tuple
+    dtype: torch.dtype
+    source_bytes: int
+
+
+@torch.no_grad()
+def prepare_fp16_staged(
+    module: torch.nn.Module,
+    *,
+    min_numel: int = 4096,
+    verbose: bool = True,
+) -> int:
+    """Pin frozen params for per-step FP16 upload (non-NF4 analogue of prepare_nf4).
+
+    Marks each qualifying frozen parameter with FP16_ATTR and sets param.data to
+    empty(0), matching the NF4 lifecycle. ensure_weights() will upload the pinned
+    CPU tensor to GPU each step; free_weights() will release the GPU copy afterward.
+
+    Only 2D-or-larger params above min_numel are staged; small params (biases,
+    small norms) and trainable params are left as-is and uploaded permanently.
+    """
+    count = 0
+    for name, param in module.named_parameters():
+        if param.requires_grad:
+            continue
+        if param.numel() < min_numel:
+            continue
+        if param.ndim < 2:
+            continue
+        if hasattr(param, NF4_ATTR) or hasattr(param, FP16_ATTR):
+            continue
+        if param.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            continue
+        cpu_data = _pin_cpu(param.data)
+        payload = FP16StagedPayload(
+            data=cpu_data,
+            shape=tuple(param.shape),
+            dtype=param.dtype,
+            source_bytes=param.numel() * param.element_size(),
+        )
+        setattr(param, FP16_ATTR, payload)
+        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        count += 1
+    if verbose:
+        total_bytes = sum(
+            getattr(p, FP16_ATTR).source_bytes
+            for p in module.parameters()
+            if hasattr(p, FP16_ATTR)
+        )
+        print(
+            f"  fp16 staged: {count} tensors, "
+            f"{total_bytes / 1024**3:.2f} GiB to upload per step",
+            flush=True,
+        )
+    return count
 
 
 @dataclass
@@ -122,8 +206,8 @@ class NF4Prefetch:
                     absmax=entry.absmax,
                     shape=payload.shape,
                     code=entry.code,
-                    blocksize=64,
-                    quant_type="nf4",
+                    blocksize=payload.blocksize,
+                    quant_type=payload.quant_type,
                     dtype=payload.dtype,
                 )
                 entry.param.data = dequantize_4bit(entry.quantized, q_state).contiguous()
@@ -140,6 +224,68 @@ def _cache_path(cache_dir: Path, name: str) -> Path:
     return cache_dir / f"{digest}-{safe}.pt"
 
 
+def _load_payload_from_cache(
+    path: Path,
+    param: torch.nn.Parameter,
+    *,
+    blocksize: int,
+    quant_type: str,
+) -> Optional[NF4Payload]:
+    if not path.exists():
+        return None
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+
+    expected = {
+        "version": 1,
+        "shape": tuple(param.shape),
+        "dtype": _dtype_name(param.dtype),
+        "blocksize": int(blocksize),
+        "quant_type": str(quant_type),
+        "source_numel": int(param.numel()),
+        "source_bytes": int(param.numel() * param.element_size()),
+    }
+    for key, value in expected.items():
+        if obj.get(key) != value:
+            return None
+
+    quantized = cast(torch.Tensor, obj["quantized"])
+    absmax = cast(torch.Tensor, obj["absmax"])
+    code = cast(torch.Tensor, obj["code"])
+    return NF4Payload(
+        quantized=_pin_cpu(quantized),
+        absmax=_pin_cpu(absmax),
+        code=_pin_cpu(code),
+        shape=tuple(obj["shape"]),
+        dtype=_dtype_from_name(str(obj["dtype"])),
+        blocksize=int(obj["blocksize"]),
+        quant_type=str(obj["quant_type"]),
+        source_numel=int(obj["source_numel"]),
+        source_bytes=int(obj["source_bytes"]),
+        payload_bytes=_payload_bytes(quantized, absmax, code),
+    )
+
+
+def _save_payload_to_cache(path: Path, payload: NF4Payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    torch.save({
+        "version": 1,
+        "shape": tuple(payload.shape),
+        "dtype": _dtype_name(payload.dtype),
+        "blocksize": int(payload.blocksize),
+        "quant_type": str(payload.quant_type),
+        "source_numel": int(payload.source_numel),
+        "source_bytes": int(payload.source_bytes),
+        "quantized": payload.quantized.detach().contiguous().cpu(),
+        "absmax": payload.absmax.detach().contiguous().cpu(),
+        "code": payload.code.detach().contiguous().cpu(),
+    }, tmp)
+    tmp.replace(path)
+
+
 @torch.no_grad()
 def prepare_nf4(
     module: torch.nn.Module,
@@ -150,20 +296,22 @@ def prepare_nf4(
     blocksize: int = 64,
     quant_type: str = "nf4",
 ) -> NF4Stats:
-    """Phase 1: quantize frozen 2D weights, attach NF4 payload, drop originals.
+    """Phase 1: quantize frozen weights (2D and higher), attach NF4 payload, drop originals.
 
     Ported from roundpipe_nf4.py::prepare_nf4_frozen_params(). Drops original
     FP16 weight data (param.data = empty(0)) after quantizing.
 
+    Handles stacked MoE expert weight tensors (ndim > 2, e.g. [N, A, B]) by
+    reshaping to 2D for bitsandbytes quantization; payload.shape retains the
+    original tensor shape so all dequant paths reconstruct the correct rank.
+
     Returns NF4Stats with tensors/bytes/cache counts.
     """
-    from bitsandbytes.functional import quantize_4bit
-
     stats = NF4Stats()
     for name, param in module.named_parameters():
         if param.requires_grad:
             continue
-        if param.ndim != 2:
+        if param.ndim < 2:
             continue
         if param.numel() < min_numel:
             continue
@@ -173,32 +321,33 @@ def prepare_nf4(
             payload = cast(NF4Payload, getattr(param, NF4_ATTR))
             stats.tensors += 1
             stats.source_bytes += payload.source_bytes
-            stats.payload_bytes += _payload_bytes(payload.quantized, payload.absmax, payload.code)
+            stats.payload_bytes += payload.payload_bytes
             continue
 
-        weight = param.detach().contiguous().cpu()
-
         cache_path = _cache_path(Path(cache_dir), name) if cache_dir else None
-        payload = None
-        if cache_path and cache_path.exists():
-            try:
-                obj = torch.load(cache_path, map_location="cpu", weights_only=False)
-                if obj.get("shape") == tuple(weight.shape):
-                    payload = NF4Payload(
-                        quantized=_pin_cpu(obj["quantized"]),
-                        absmax=_pin_cpu(obj["absmax"]),
-                        code=_pin_cpu(obj["code"]),
-                        shape=tuple(weight.shape),
-                        dtype=weight.dtype,
-                        source_bytes=weight.numel() * weight.element_size(),
-                    )
-                    stats.cache_hits += 1
-            except Exception:
-                pass
+        payload = (
+            _load_payload_from_cache(
+                cache_path, param, blocksize=blocksize, quant_type=quant_type
+            )
+            if cache_path is not None
+            else None
+        )
+        if payload is not None:
+            stats.cache_hits += 1
 
         if payload is None:
+            from bitsandbytes.functional import quantize_4bit
+
             if cache_path is not None:
                 stats.cache_misses += 1
+            orig_shape = tuple(param.shape)
+            weight = param.detach().contiguous().cpu()
+            # bitsandbytes quantize_4bit requires a 2D contiguous input; higher-rank
+            # stacked weight tensors (e.g. MoE gate_up_proj [N, A, B]) are reshaped
+            # to [-1, last_dim] for quantization and restored via payload.shape at
+            # dequant time.
+            if weight.ndim > 2:
+                weight = weight.reshape(-1, weight.shape[-1])
             quantized, q_state = quantize_4bit(
                 weight, blocksize=blocksize, compress_statistics=False, quant_type=quant_type,
             )
@@ -206,28 +355,23 @@ def prepare_nf4(
                 quantized=_pin_cpu(quantized),
                 absmax=_pin_cpu(q_state.absmax),
                 code=_pin_cpu(q_state.code),
-                shape=tuple(weight.shape),
-                dtype=weight.dtype,
-                source_bytes=weight.numel() * weight.element_size(),
+                shape=orig_shape,
+                dtype=q_state.dtype,
+                blocksize=int(q_state.blocksize),
+                quant_type=str(q_state.quant_type),
+                source_numel=int(param.numel()),
+                source_bytes=int(param.numel() * param.element_size()),
+                payload_bytes=_payload_bytes(quantized, q_state.absmax, q_state.code),
             )
             if cache_path:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = cache_path.with_name(f"{cache_path.name}.tmp")
-                torch.save({
-                    "shape": tuple(payload.shape),
-                    "dtype": str(payload.dtype).removeprefix("torch."),
-                    "quantized": payload.quantized.detach().contiguous().cpu(),
-                    "absmax": payload.absmax.detach().contiguous().cpu(),
-                    "code": payload.code.detach().contiguous().cpu(),
-                }, tmp)
-                tmp.replace(cache_path)
+                _save_payload_to_cache(cache_path, payload)
                 stats.cache_writes += 1
 
         setattr(param, NF4_ATTR, payload)
-        param.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+        param.data = torch.empty(0, dtype=payload.dtype, device=param.device)
         stats.tensors += 1
         stats.source_bytes += payload.source_bytes
-        stats.payload_bytes += _payload_bytes(payload.quantized, payload.absmax, payload.code)
+        stats.payload_bytes += payload.payload_bytes
 
     if verbose:
         print(f"  nf4 total: {stats.tensors} tensors, "
@@ -271,13 +415,13 @@ def upload_stream(
 ) -> int:
     """Phase 2: upload all params/buffers of *module* to *device_id*.
 
-    NF4-eligible frozen Linear layers are replaced with NF4Linear (4-bit on
-    GPU, JIT dequant in forward). Everything else uploads as FP16 permanent.
+    NF4-eligible frozen parameters are uploaded compressed and dequantized into
+    the existing Parameter data on the target GPU. Everything else uploads as a
+    regular tensor.
 
     Ported from roundpipe_nf4.py::upload_layers_nf4().
     """
     from bitsandbytes.functional import QuantState, dequantize_4bit
-    from stratum.nf4_linear import NF4Linear
 
     device = torch.device(f"cuda:{device_id}")
     tensors = 0
@@ -297,21 +441,10 @@ def upload_stream(
             c_gpu = code_cpu.to(device, non_blocking=False)
             q_state = QuantState(
                 absmax=a_gpu, shape=shape, code=c_gpu,
-                blocksize=64, quant_type="nf4", dtype=dtype,
+                blocksize=payload.blocksize, quant_type=payload.quant_type, dtype=dtype,
             )
 
-            # Find the parent module
-            parts = name.split(".")
-            parent_path = parts[:-1]
-            parent_attr = parent_path[-1]
-            grandparent_path = parts[:-2]
-            grandparent = module
-            for p in grandparent_path:
-                grandparent = getattr(grandparent, p)
-            parent_mod = getattr(grandparent, parent_attr)
-
             # Dequant NF4 to FP16 on GPU (same as RoundPipe's upload_layers_nf4)
-            from bitsandbytes.functional import dequantize_4bit
             weight = dequantize_4bit(q_gpu, q_state).contiguous()
             param.data = weight
             tensors += 1
@@ -347,6 +480,19 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
     dequantize_4bit = None
     QuantState = None
     for name, param in module.named_parameters():
+        fp16_payload = getattr(param, FP16_ATTR, None)
+        if fp16_payload is not None:
+            if param.data.numel() > 0:
+                if param.data.device == device:
+                    continue
+                # Shared FP16-staged param reached from a different device context:
+                # drop the current materialization and re-upload for this device.
+                param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+            dst = torch.empty(fp16_payload.shape, dtype=fp16_payload.dtype, device=device)
+            copy_tensor_chunked(fp16_payload.data, dst, chunk_bytes=DEFAULT_CHUNK_UPLOAD_BYTES, non_blocking=True)
+            param.data = dst
+            tensors += 1
+            continue
         payload = getattr(param, NF4_ATTR, None)
         if payload is None:
             if param.data.numel() > 0 and param.data.device != device:
@@ -356,7 +502,8 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
                         f"but module is running on {device}; Stratum cannot safely move "
                         "trainable parameters between stages"
                     )
-                param.data = param.data.to(device, non_blocking=False)
+                param.data = param.data.to(device, non_blocking=True)
+                tensors += 1
             continue
         if param.data.numel() > 0:
             if param.data.device == device:
@@ -372,15 +519,19 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
             dequantize_4bit = _dequantize_4bit
         quantized_cpu, absmax_cpu, code_cpu = payload.quantized, payload.absmax, payload.code
         shape, dtype = payload.shape, payload.dtype
-        q_gpu = quantized_cpu.to(device, non_blocking=False)
-        a_gpu = absmax_cpu.to(device, non_blocking=False)
-        c_gpu = code_cpu.to(device, non_blocking=False)
+        q_gpu = quantized_cpu.to(device, non_blocking=True)
+        a_gpu = absmax_cpu.to(device, non_blocking=True)
+        c_gpu = code_cpu.to(device, non_blocking=True)
         q_state = QuantState(
             absmax=a_gpu, shape=shape, code=c_gpu,
-            blocksize=64, quant_type="nf4", dtype=dtype,
+            blocksize=payload.blocksize, quant_type=payload.quant_type, dtype=dtype,
         )
         param.data = dequantize_4bit(q_gpu, q_state).contiguous()
         tensors += 1
+    for buf in module.buffers():
+        if buf.data.device != device:
+            buf.data = buf.data.to(device, non_blocking=True)
+            tensors += 1
     return tensors
 
 
@@ -445,7 +596,9 @@ def ensure_prefetched_weights(
         return ensure_weights(module, device_id)
     if prefetch.device != torch.device(f"cuda:{device_id}"):
         raise ValueError(f"prefetch device {prefetch.device} does not match cuda:{device_id}")
-    return prefetch.finalize()
+    # Prefetch only stages NF4 payload tensors. The regular ensure path still
+    # has to move non-NF4 frozen params and buffers, matching upload_stream().
+    return prefetch.finalize() + ensure_weights(module, device_id)
 
 
 @torch.no_grad()
@@ -457,7 +610,7 @@ def free_weights(module: torch.nn.Module) -> int:
     """
     tensors = 0
     for name, param in module.named_parameters():
-        if not hasattr(param, NF4_ATTR):
+        if not hasattr(param, NF4_ATTR) and not hasattr(param, FP16_ATTR):
             continue
         if param.data.numel() == 0:
             continue

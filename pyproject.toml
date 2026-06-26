@@ -7,7 +7,7 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 
 authors = [
-    { name = "h4rm0n1c" },
+    { name = "Harri (h4rm0n1c)" },
     { name = "Stratum contributors" },
 ]
 
@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-homepage = "https://github.com/harri/stratum"
-documentation = "https://github.com/harri/stratum/docs"
+homepage = "https://github.com/h4rm0n1c/stratum"
+documentation = "https://github.com/h4rm0n1c/stratum/blob/main/HANDBOOK.md"
 
 [build-system]
 requires = ["setuptools>=68"]

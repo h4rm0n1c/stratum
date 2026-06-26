@@ -186,6 +186,12 @@ RUN FLASH_ATTN_CUDA_ARCHS="86" pip install --no-cache-dir --no-build-isolation -
 
 RUN rm -rf /tmp/fa2
 
+# Flash Linear Attention: Qwen3.5 linear-attention layers require FLA's
+# non-quadratic gated-delta kernels. Without this, Transformers falls back to
+# torch_chunk_gated_delta_rule and long-context backward recompute OOMs on the
+# 10 GiB RTX 3080 path.
+RUN pip install --no-cache-dir "flash-linear-attention[cuda]"
+
 # Stratum install — MUST come AFTER all CUDA builds so source file changes
 # don't invalidate the expensive CUDA kernel compilation layers.
 # Keep docs/tests/git/cache/data out of the final runtime image. The package
@@ -218,6 +224,8 @@ from flash_attn_v100 import flash_attn_func
 print("flash-attn-v100: OK")
 from flash_attn import flash_attn_func as fa2
 print("flash-attn (standard): OK")
+import fla
+print("flash-linear-attention: OK")
 import bitsandbytes
 import transformers, peft
 import stratum

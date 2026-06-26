@@ -53,6 +53,42 @@ class CheckpointMetadataTest(unittest.TestCase):
 
             self.assertEqual(load_checkpoint({}, checkpoint_dir=out_dir), 0)
 
+    def test_optimizer_state_loads_without_legacy_device_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            module = nn.Linear(2, 2)
+            saved_opt = torch.optim.AdamW(module.parameters(), lr=0.123)
+
+            class SavedOptimizer:
+                cpu_offload = True
+                optimizers = {0: saved_opt}
+
+            save_checkpoint(
+                {0: [module]},
+                optimizer=SavedOptimizer(),
+                step=4,
+                out_dir=out_dir,
+                save_optimizer_state=True,
+                save_legacy_device_state=False,
+            )
+            self.assertFalse((out_dir / "device_0.pt").exists())
+
+            loaded_module = nn.Linear(2, 2)
+            loaded_opt = torch.optim.AdamW(loaded_module.parameters(), lr=0.001)
+
+            class LoadedOptimizer:
+                cpu_offload = True
+                optimizers = {0: loaded_opt}
+
+            step = load_checkpoint(
+                {0: [loaded_module]},
+                optimizer=LoadedOptimizer(),
+                checkpoint_dir=out_dir,
+            )
+
+            self.assertEqual(step, 4)
+            self.assertEqual(loaded_opt.param_groups[0]["lr"], 0.123)
+
 
 if __name__ == "__main__":
     unittest.main()

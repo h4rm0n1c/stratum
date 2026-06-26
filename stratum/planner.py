@@ -12,8 +12,14 @@ import torch.nn as nn
 from stratum.upload import NF4_ATTR
 
 
-def estimate_module_bytes(module: nn.Module) -> int:
-    """Estimate uploaded parameter+buffer bytes for one module."""
+def estimate_module_bytes(module: nn.Module, *, floor_gib: float = 0.0) -> int:
+    """Estimate uploaded parameter+buffer bytes for one module.
+
+    ``floor_gib`` mirrors qz-roundpipe's NF4 scheduler-size floor: after the
+    layer's upload footprint is estimated, planning can force a minimum size so
+    memory-budgeted stage grouping does not over-pack layers whose frozen
+    weights were compressed or otherwise under-estimated.
+    """
     total = 0
     seen: set[int] = set()
     for param in module.parameters():
@@ -29,12 +35,16 @@ def estimate_module_bytes(module: nn.Module) -> int:
             total += param.grad.numel() * param.grad.element_size()
     for buf in module.buffers():
         total += buf.numel() * buf.element_size()
+    if floor_gib > 0:
+        total = max(total, int(floor_gib * 1024**3))
     return total
 
 
 def split_layers_by_memory_limit(
     layers: list[nn.Module],
     limit_gib: float,
+    *,
+    layer_size_floor_gib: float = 0.0,
 ) -> list[list[nn.Module]]:
     """Split ordered layers into stage groups below *limit_gib* when possible.
 
@@ -52,7 +62,7 @@ def split_layers_by_memory_limit(
     current_bytes = 0
 
     for layer in layers:
-        layer_bytes = estimate_module_bytes(layer)
+        layer_bytes = estimate_module_bytes(layer, floor_gib=layer_size_floor_gib)
         if current and current_bytes + layer_bytes > limit_bytes:
             groups.append(current)
             current = []

@@ -11,6 +11,8 @@ from stratum.model.registry import build_pipeline
 model = AutoModelForCausalLM.from_pretrained(
     "LiquidAI/LFM2.5-8B-A1B", trust_remote_code=True,
     dtype=torch.float16, device_map="cpu", low_cpu_mem_usage=True,
+    # HF eager load only; build_pipeline patches full-attention layers with
+    # Stratum's capability-dispatched flash wrappers.
     attn_implementation="eager",
 )
 model.config.use_cache = False

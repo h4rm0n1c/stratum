@@ -14,7 +14,7 @@ Source: train_lfm25_roundpipe_lora.py and train_qwen35_roundpipe_lora.py
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -77,21 +77,27 @@ class TokenChunkedModule(nn.Module):
 # 3. MemoryFlatFrozenMLP — custom autograd with chunked backward
 # ---------------------------------------------------------------------------
 
-def _assert_frozen_mlp(module: nn.Module) -> None:
-    """Validate that *module* is a frozen dense MLP (gate/up/down_proj).
+class _MlpProjectionNames(NamedTuple):
+    gate: str
+    up: str
+    down: str
 
-    Skips MoE experts (has gate_exps). Supports both LFM2.5 naming
-    (ffn_gate_proj / gate_proj) and standard Qwen naming.
-    """
-    # MoE experts use different structure — not applicable
+
+def _mlp_projection_names(module: nn.Module) -> _MlpProjectionNames:
+    """Return the dense MLP projection names used by *module*."""
     if hasattr(module, "gate_exps"):
-        return
-
-    # Determine naming convention
+        raise TypeError("memory-flat frozen MLP does not support MoE expert modules")
     if hasattr(module, "ffn_gate_proj"):
-        proj_names = ("ffn_gate_proj", "ffn_up_proj", "ffn_down_proj")
-    else:
-        proj_names = ("gate_proj", "up_proj", "down_proj")
+        return _MlpProjectionNames("ffn_gate_proj", "ffn_up_proj", "ffn_down_proj")
+    return _MlpProjectionNames("gate_proj", "up_proj", "down_proj")
+
+
+def _assert_frozen_mlp(module: nn.Module) -> _MlpProjectionNames:
+    """Validate that *module* is a frozen dense MLP.
+
+    Supports both LFM2.5 naming (ffn_*_proj) and standard Qwen naming.
+    """
+    proj_names = _mlp_projection_names(module)
 
     missing = [name for name in proj_names if not hasattr(module, name)]
     if missing:
@@ -118,6 +124,7 @@ def _assert_frozen_mlp(module: nn.Module) -> None:
             )
         if proj.bias is not None:
             raise TypeError(f"memory-flat frozen MLP currently expects bias=False for {name}")
+    return proj_names
 
 
 class MemoryFlatFrozenMLPFunction(torch.autograd.Function):
@@ -125,26 +132,30 @@ class MemoryFlatFrozenMLPFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, hidden_states: torch.Tensor, module: nn.Module, token_chunk_size: int) -> torch.Tensor:
-        _assert_frozen_mlp(module)
+        proj_names = _assert_frozen_mlp(module)
         if token_chunk_size <= 0:
             raise ValueError("token_chunk_size must be positive")
         if hidden_states.dim() < 3:
             raise ValueError("memory-flat frozen MLP expects [batch, seq, hidden] input")
 
         ctx.module = module
+        ctx.proj_names = proj_names
         ctx.token_chunk_size = token_chunk_size
         ctx.save_for_backward(hidden_states)
 
         seq_len = hidden_states.shape[1]
-        out_features = module.down_proj.out_features
+        gate_proj = getattr(module, proj_names.gate)
+        up_proj = getattr(module, proj_names.up)
+        down_proj = getattr(module, proj_names.down)
+        out_features = down_proj.out_features
         output = hidden_states.new_empty(*hidden_states.shape[:-1], out_features)
 
         with torch.no_grad():
             for start in range(0, seq_len, token_chunk_size):
                 end = min(start + token_chunk_size, seq_len)
                 chunk = hidden_states[:, start:end, :]
-                output[:, start:end, :] = module.down_proj(
-                    module.act_fn(module.gate_proj(chunk)) * module.up_proj(chunk)
+                output[:, start:end, :] = down_proj(
+                    module.act_fn(gate_proj(chunk)) * up_proj(chunk)
                 )
         return output
 
@@ -152,17 +163,21 @@ class MemoryFlatFrozenMLPFunction(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Optional[torch.Tensor], None, None]:
         (hidden_states,) = ctx.saved_tensors
         module = ctx.module
+        proj_names = ctx.proj_names
         token_chunk_size = ctx.token_chunk_size
         seq_len = hidden_states.shape[1]
         grad_hidden_states = torch.empty_like(hidden_states) if ctx.needs_input_grad[0] else None
 
         if grad_hidden_states is not None:
+            gate_proj = getattr(module, proj_names.gate)
+            up_proj = getattr(module, proj_names.up)
+            down_proj = getattr(module, proj_names.down)
             with torch.enable_grad():
                 for start in range(0, seq_len, token_chunk_size):
                     end = min(start + token_chunk_size, seq_len)
                     chunk = hidden_states[:, start:end, :].detach().requires_grad_(True)
-                    chunk_output = module.down_proj(
-                        module.act_fn(module.gate_proj(chunk)) * module.up_proj(chunk)
+                    chunk_output = down_proj(
+                        module.act_fn(gate_proj(chunk)) * up_proj(chunk)
                     )
                     (grad_chunk,) = torch.autograd.grad(
                         chunk_output,

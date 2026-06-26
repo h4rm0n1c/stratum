@@ -159,30 +159,28 @@ def load_checkpoint(
             print({"checkpoint_peft_load_failed": str(exc)}, flush=True)
             # Fall through to legacy load
 
-    # 2. Legacy per-device .pt load (backward compatible). Skip this if a PEFT
-    # adapter loaded successfully; the legacy files are same-layout fallback
-    # state, not something to layer over a portable adapter.
-    if peft_loaded:
-        return step
-
+    # 2. Legacy per-device .pt load (backward compatible). Skip legacy module
+    # weights if a PEFT adapter loaded successfully; the legacy files are
+    # same-layout fallback state, not something to layer over a portable adapter.
     for device_id, mods in modules_per_device.items():
         dev_path = checkpoint_dir / f"device_{device_id}.pt"
-        if not dev_path.exists():
-            continue
-        state = torch.load(dev_path, map_location=f"cuda:{device_id}")
-        for idx, mod in enumerate(mods):
-            key = f"module_{idx}"
-            if key in state and hasattr(mod, "load_state_dict"):
-                mod.load_state_dict(state[key])
+        if dev_path.exists() and not peft_loaded:
+            state = torch.load(dev_path, map_location=f"cuda:{device_id}")
+            for idx, mod in enumerate(mods):
+                key = f"module_{idx}"
+                if key in state and hasattr(mod, "load_state_dict"):
+                    mod.load_state_dict(state[key])
 
-        # Optimizer state
-        if optimizer is not None:
-            opt_path = checkpoint_dir / f"optim_{device_id}.pt"
-            if opt_path.exists() and device_id in optimizer.optimizers:
-                opt = optimizer.optimizers[device_id]
-                if opt is not None:
-                    opt.load_state_dict(
-                        torch.load(opt_path, map_location=f"cuda:{device_id}")
-                    )
+        # Optimizer state is independent of PEFT adapter loading. A normal
+        # checkpoint may contain adapter_model.safetensors plus optim_*.pt and
+        # no legacy device_*.pt files.
+        if optimizer is None:
+            continue
+        opt_path = checkpoint_dir / f"optim_{device_id}.pt"
+        if opt_path.exists() and device_id in optimizer.optimizers:
+            opt = optimizer.optimizers[device_id]
+            if opt is not None:
+                map_location = "cpu" if getattr(optimizer, "cpu_offload", False) else f"cuda:{device_id}"
+                opt.load_state_dict(torch.load(opt_path, map_location=map_location))
 
     return step

@@ -19,6 +19,11 @@ FROM ${STRATUM_REFRESH_BASE}
 
 SHELL ["/bin/bash", "-lc"]
 
+ARG STRATUM_REFRESH_INSTALL_FLA=0
+RUN if [[ "${STRATUM_REFRESH_INSTALL_FLA}" == "1" ]]; then \
+        pip install --no-cache-dir "flash-linear-attention[cuda]"; \
+    fi
+
 RUN rm -rf /workspace/stratum /tmp/stratum-src
 
 WORKDIR /tmp/stratum-src

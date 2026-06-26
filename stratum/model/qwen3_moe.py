@@ -1,19 +1,24 @@
-"""Qwen3.5 model architecture adapter for Stratum.
+"""Qwen3-MoE model architecture adapter for Stratum.
 
-Includes capability-dispatched flash attention for mixed RTX 3080/V100 runs.
+Includes capability-dispatched flash attention for mixed RTX 3080/V100 runs,
+and MoE router-logit side-channel capture for auxiliary load-balancing loss.
+
+Qwen3MoeAttention has per-head q_norm/k_norm like Qwen3Attention.
+Router logits are captured via patch_moe_block_for_router_logits (side-channel,
+no change to the MoE block return value) and accumulated in kwargs["_router_logits"].
 """
 
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, NamedTuple, Optional, Union, cast
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5Attention,
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeAttention,
     apply_rotary_pos_emb,
 )
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -30,7 +35,11 @@ from stratum.context import (
     get_recompute_data,
     save_for_recompute,
 )
-from stratum.moe import load_balancing_loss_func, patch_moe_block_for_router_logits, pop_router_logits
+from stratum.moe import (
+    load_balancing_loss_func,
+    patch_moe_block_for_router_logits,
+    pop_router_logits,
+)
 
 
 def _compat_mask_call(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
@@ -43,21 +52,17 @@ class _FlashBackend(NamedTuple):
     fn: Callable[..., torch.Tensor]
 
 
-class Qwen35FlashAttention(Qwen3_5Attention):
-    """Qwen3.5 attention using flash-attention.
+class Qwen3MoeFlashAttention(Qwen3MoeAttention):
+    """Qwen3-MoE attention using capability-dispatched flash-attention.
 
     Dispatches to the right backend based on GPU architecture:
     - sm_70 (V100): flash_attn_v100
     - sm_80+ (Ampere+): standard flash_attn
 
-    Supports optional sliding-window attention via window_size kwarg
-    (matching Stratum's --flash-window-left/--flash-window-right).
-    CUDA execution requires one of the flash backends; eager is CPU/test-only.
+    Qwen3MoeAttention has q_norm/k_norm (same pattern as Qwen3Attention) and
+    no gate projection. CUDA execution requires one of the flash backends;
+    eager is CPU/test-only.
     """
-
-    def __init__(self, *args, window_size: Optional[tuple[int, int]] = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.window_size = window_size
 
     def _select_flash_backend(self, device: torch.device) -> _FlashBackend | None:
         """Pick the non-quadratic attention backend for the current GPU."""
@@ -93,8 +98,8 @@ class Qwen35FlashAttention(Qwen3_5Attention):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         if kwargs.get("output_attentions", False):
-            raise ValueError("Qwen35FlashAttention does not return attention weights")
-        if self.training and self.attention_dropout:
+            raise ValueError("Qwen3MoeFlashAttention does not return attention weights")
+        if self.training and getattr(self, "attention_dropout", 0.0):
             raise ValueError("flash-attn requires dropout=0.0")
 
         flash_backend = self._select_flash_backend(hidden_states.device)
@@ -102,13 +107,8 @@ class Qwen35FlashAttention(Qwen3_5Attention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
-            2, dim=-1,
-        )
-        gate = gate.reshape(*input_shape, -1)
-
-        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        # Qwen3-MoE: q_norm/k_norm applied after projection, no gate.
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
@@ -119,7 +119,7 @@ class Qwen35FlashAttention(Qwen3_5Attention):
             if not getattr(self, "_stratum_flash_backend_logged", False):
                 print({
                     "event": "flash_attention_backend",
-                    "model": "qwen35",
+                    "model": "qwen3-moe",
                     "layer": int(self.layer_idx),
                     "backend": flash_backend.name,
                     "device": str(hidden_states.device),
@@ -129,24 +129,19 @@ class Qwen35FlashAttention(Qwen3_5Attention):
             k = key_states.transpose(1, 2).contiguous()
             v = value_states.transpose(1, 2).contiguous()
             try:
-                flash_kwargs = dict(
-                    dropout_p=0.0, softmax_scale=self.scaling, causal=True,
+                attn_output = flash_backend.fn(
+                    q, k, v, dropout_p=0.0, softmax_scale=self.scaling, causal=True,
                 )
-                if self.window_size is not None:
-                    flash_kwargs["window_size"] = self.window_size
-                # flash-attn consumes and returns (batch, seq, heads, head_dim),
-                # matching qz-roundpipe's Qwen3.5 patch contract.
-                attn_output = flash_backend.fn(q, k, v, **flash_kwargs)
             except RuntimeError as exc:
                 raise RuntimeError(
-                    f"{flash_backend.name} failed for Qwen3.5 layer {self.layer_idx}; "
+                    f"{flash_backend.name} failed for Qwen3-MoE layer {self.layer_idx}; "
                     "not falling back to quadratic eager attention"
                 ) from exc
 
         if flash_backend is None:
             if hidden_states.device.type == "cuda":
                 raise RuntimeError(
-                    f"no flash-attention backend available for Qwen3.5 layer {self.layer_idx} "
+                    f"no flash-attention backend available for Qwen3-MoE layer {self.layer_idx} "
                     f"on {hidden_states.device}; not falling back to quadratic eager attention"
                 )
             from transformers.models.llama.modeling_llama import eager_attention_forward
@@ -156,13 +151,18 @@ class Qwen35FlashAttention(Qwen3_5Attention):
             )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = attn_output * torch.sigmoid(gate)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
 
 
-class Qwen35ForCausalLMPrefix(nn.Module):
-    """Prefix: embedding + rotary embedding."""
+class Qwen3MoeForCausalLMPrefix(nn.Module):
+    """Prefix: embedding + rotary embedding.
+
+    Qwen3-MoE uses a single causal mask (not a dict), matching the reference
+    qwen3_moe.py. The mask function is selected based on config.sliding_window:
+    None → create_causal_mask; non-None → create_sliding_window_causal_mask.
+    In flash mode (default) the mask is None regardless.
+    """
 
     def __init__(
         self,
@@ -177,7 +177,7 @@ class Qwen35ForCausalLMPrefix(nn.Module):
         self.embed_tokens = core.model.embed_tokens
         self.rotary_emb = core.model.rotary_emb
         self.config = core.model.config
-        self.has_sliding_layers = getattr(core.model, "has_sliding_layers", False)
+        self.sliding_window = getattr(self.config, "sliding_window", None)
         self.dense_attention_masks = dense_attention_masks
         self.memory_telemetry = memory_telemetry
         self.output_router_logits = output_router_logits
@@ -191,16 +191,14 @@ class Qwen35ForCausalLMPrefix(nn.Module):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
 
-        # On checkpoint backward recompute, restore saved non-grad tensors
-        # and skip the expensive embedding lookup + mask construction.
-        # This matches qz-roundpipe's early-return-on-recompute pattern.
+        # On checkpoint backward recompute, restore saved non-grad tensors.
         if doing_recompute():
-            causal_mask_mapping, position_ids, position_embeddings = get_recompute_data()
+            causal_mask, position_ids, position_embeddings = get_recompute_data()
             if self.memory_telemetry:
                 mark_model_gpu_phase("prefix_recompute_loaded")
             return (
                 inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids),
-                causal_mask_mapping,
+                causal_mask,
                 position_ids,
                 position_embeddings,
                 kwargs,
@@ -211,38 +209,31 @@ class Qwen35ForCausalLMPrefix(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        batch, seq_len = input_ids.shape if inputs_embeds is None else inputs_embeds.shape[:2]
+        seq_len = inputs_embeds.shape[1]
+        ref_device = inputs_embeds.device
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=input_ids.device if input_ids is not None else inputs_embeds.device).unsqueeze(0)
+            position_ids = torch.arange(seq_len, device=ref_device).unsqueeze(0)
 
-        if not isinstance(attention_mask, dict):
-            cache_position = torch.arange(seq_len, device=inputs_embeds.device)
+        if self.dense_attention_masks:
+            cache_position = torch.arange(seq_len, device=ref_device)
             mask_kwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
+                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            if self.dense_attention_masks:
-                causal_mask_mapping = {
-                    "full_attention": _compat_mask_call(create_causal_mask, mask_kwargs),
-                    "linear_attention": attention_mask,
-                }
-                if self.has_sliding_layers:
-                    causal_mask_mapping["sliding_attention"] = _compat_mask_call(
-                        create_sliding_window_causal_mask,
-                        mask_kwargs,
-                    )
-            else:
-                # Long-context flash mode relies on kernel-native causal handling.
-                causal_mask_mapping = {
-                    "full_attention": None,
-                    "linear_attention": attention_mask,
-                }
+            mask_fn = (
+                create_sliding_window_causal_mask
+                if self.sliding_window is not None
+                else create_causal_mask
+            )
+            causal_mask = _compat_mask_call(mask_fn, mask_kwargs)
         else:
-            causal_mask_mapping = attention_mask
+            # Long-context flash mode: kernel handles causality natively.
+            causal_mask = None
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -250,22 +241,26 @@ class Qwen35ForCausalLMPrefix(nn.Module):
         if self.memory_telemetry:
             mark_model_gpu_phase("prefix_after_rope", seq_len=int(hidden_states.shape[1]))
 
-        # Save non-grad data for recompute (qz-roundpipe parity: saves
-        # causal_mask_mapping, position_ids, position_embeddings).
-        save_for_recompute(causal_mask_mapping, position_ids, position_embeddings)
+        save_for_recompute(causal_mask, position_ids, position_embeddings)
 
-        # Initialize the router_logits accumulator in kwargs for MoE adapters.
+        # Initialise the router_logits accumulator (shared mutable dict flowing
+        # through the pipeline). The wrapped layer appends to this list after
+        # pop_router_logits() collects from patched MoE blocks.
         if self.output_router_logits and "_router_logits" not in kwargs:
             kwargs["_router_logits"] = []
 
         return (
-            hidden_states, causal_mask_mapping, position_ids, position_embeddings,
+            hidden_states, causal_mask, position_ids, position_embeddings,
             kwargs, labels, 0,
         )
 
 
-class Qwen35ForCausalLMWrappedLayer(nn.Module):
-    """One decoder layer wrapper with optional checkpointing."""
+class Qwen3MoeForCausalLMWrappedLayer(nn.Module):
+    """One Qwen3-MoE decoder layer wrapper with optional activation checkpointing.
+
+    Collects router logits from patched Qwen3MoeSparseMoeBlock instances via
+    the pop_router_logits() side channel and appends them to kwargs["_router_logits"].
+    """
 
     def __init__(
         self,
@@ -287,13 +282,6 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
 
     def forward(self, input_data):
         hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, _lk = input_data
-        attention_type = getattr(self.layer, "attention_type", "full_attention")
-        if attention_type in causal_mask:
-            attn_mask = causal_mask[attention_type]
-        elif attention_type == "full_attention":
-            attn_mask = causal_mask.get("full_attention", causal_mask.get("linear_attention"))
-        else:
-            attn_mask = None
 
         layer_kwargs = dict(kwargs)
         layer_kwargs.pop("return_logits", None)
@@ -308,11 +296,11 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
                     recompute_layer_kwargs,
                 ) = get_recompute_data()
             else:
-                recompute_attn_mask = attn_mask
+                recompute_attn_mask = causal_mask
                 recompute_pos_ids = pos_ids
                 recompute_pos_embeds = pos_embeds
                 recompute_layer_kwargs = layer_kwargs
-                save_for_recompute(attn_mask, pos_ids, pos_embeds, layer_kwargs)
+                save_for_recompute(causal_mask, pos_ids, pos_embeds, layer_kwargs)
             return self.layer(
                 hs,
                 attention_mask=recompute_attn_mask,
@@ -332,7 +320,7 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
                     if hidden.is_cuda and hidden.device.index is not None
                     else None
                 ),
-                "attention_type": str(attention_type),
+                "attention_type": "full_attention",
                 "recompute_grain": "layer",
             }
             hidden = checkpoint(
@@ -344,37 +332,42 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
         else:
             hidden = run_layer(hidden)
 
+        # HF layer returns tensor or tuple. MoE blocks are patched to record
+        # router logits as side-channel state, so the return value is still
+        # just the hidden-states tensor (not a tuple with router_logits).
         if isinstance(hidden, tuple):
-            # Some adapters may propagate (hidden_states, router_logits).
-            # The standard HF path records router logits side-channel on
-            # patched MoE blocks and keeps the decoder return as a tensor.
-            if (len(hidden) >= 2
-                    and isinstance(hidden[1], torch.Tensor)
-                    and hidden[1].dim() == 2
-                    and kwargs.get("_router_logits") is not None):
-                router_logit = hidden[1]
+            if (
+                len(hidden) >= 2
+                and isinstance(hidden[1], torch.Tensor)
+                and hidden[1].dim() == 2
+                and kwargs.get("_router_logits") is not None
+            ):
+                kwargs["_router_logits"].append(hidden[1])
                 hidden = hidden[0]
-                kwargs["_router_logits"].append(router_logit)
             else:
                 hidden = hidden[0]
+
+        # Collect any router logits captured by patched MoE blocks.
         if kwargs.get("_router_logits") is not None:
             kwargs["_router_logits"].extend(pop_router_logits(self.layer))
+
         if self.debug_finite:
             assert_finite_tensor(f"layer_{self.idx}_output", hidden)
-        return (hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, 0)
+
+        return (hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, _lk)
 
 
-class Qwen35ForCausalLMPostfix(nn.Module):
+class Qwen3MoeForCausalLMPostfix(nn.Module):
     """Postfix: final norm + lm_head.
 
     Two loss modes (matching RoundPipe):
       1. postfix_loss_token_chunk_size == 0 (default):
          norm runs full-seq, lm_head chunked by loss_token_chunk_size.
       2. postfix_loss_token_chunk_size > 0:
-         BlockedPostfixCausalLMLoss — splits norm + lm_head into blocks,
-         backprops per-block within forward, saves grads to CPU.
+         BlockedPostfixCausalLMLoss — splits norm + lm_head into blocks.
 
-    Supports MoE auxiliary loss when ``router_aux_loss_coef > 0``.
+    When ``router_aux_loss_coef > 0``, adds MoE load-balancing loss from
+    accumulated router_logits to the main LM loss, mirroring LFM2.5.
     """
 
     def __init__(self, model, *, loss_token_chunk_size: int = 4096,
@@ -402,7 +395,6 @@ class Qwen35ForCausalLMPostfix(nn.Module):
 
         loss = None
         if labels is not None:
-            # Mode 2: BlockedPostfixCausalLMLoss (norm + lm_head in blocks)
             if self.postfix_loss_token_chunk_size > 0:
                 loss = BlockedPostfixCausalLMLoss.apply(
                     hidden, labels,
@@ -413,33 +405,26 @@ class Qwen35ForCausalLMPostfix(nn.Module):
                 if self.debug_finite:
                     assert_finite_tensor("blocked_postfix_loss", loss)
             else:
-                # Mode 1: norm full-seq, then chunked lm_head
                 hidden = self.norm(hidden)
                 if self.debug_finite:
                     assert_finite_tensor("post_norm_hidden_states", hidden)
                 shift_hidden = hidden[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-
-                # Count non-ignored tokens (same pattern as RoundPipe's
-                # ChunkedCompileLinearForCausalLMLoss).
                 flat_labels = shift_labels.reshape(-1)
                 num_items = (flat_labels != -100).sum()
                 if num_items == 0:
                     loss = shift_hidden.sum() * 0.0
                 else:
                     loss = chunked_linear_cross_entropy(
-                        shift_hidden,
-                        self.lm_head,
-                        shift_labels,
-                        num_items=num_items,
-                        ignore_index=-100,
+                        shift_hidden, self.lm_head, shift_labels,
+                        num_items=num_items, ignore_index=-100,
                         token_chunk_size=self.loss_token_chunk_size,
                         use_torch_compile=self.torch_compile_loss,
                     )
                     if self.debug_finite:
                         assert_finite_tensor("chunked_loss", loss)
 
-        # MoE auxiliary load-balancing loss from accumulated router_logits
+        # MoE auxiliary load-balancing loss from accumulated router_logits.
         if self.router_aux_loss_coef > 0:
             router_logits = kwargs.get("_router_logits")
             if router_logits:
@@ -456,13 +441,13 @@ class Qwen35ForCausalLMPostfix(nn.Module):
         return CausalLMOutputWithPast(loss=loss)
 
 
-@register("qwen3.5")
-class Qwen35Arch(ModelArch):
+@register("qwen3-moe")
+class Qwen3MoeArch(ModelArch):
     def get_num_layers(self, config):
         return config.num_hidden_layers
 
     def build_prefix(self, model, **kwargs):
-        return Qwen35ForCausalLMPrefix(
+        return Qwen3MoeForCausalLMPrefix(
             model,
             dense_attention_masks=kwargs.get("dense_attention_masks", False),
             memory_telemetry=kwargs.get("memory_telemetry", False),
@@ -470,7 +455,7 @@ class Qwen35Arch(ModelArch):
         )
 
     def build_wrapped_layer(self, layer, idx, **kwargs):
-        return Qwen35ForCausalLMWrappedLayer(
+        return Qwen3MoeForCausalLMWrappedLayer(
             layer,
             idx=idx,
             checkpoint_decoder_layer=kwargs.get("checkpoint_decoder_layer", False),
@@ -480,7 +465,7 @@ class Qwen35Arch(ModelArch):
         )
 
     def build_postfix(self, model, **kwargs):
-        return Qwen35ForCausalLMPostfix(
+        return Qwen3MoeForCausalLMPostfix(
             model,
             loss_token_chunk_size=kwargs.get("loss_token_chunk_size", 4096),
             postfix_loss_token_chunk_size=kwargs.get("postfix_loss_token_chunk_size", 0),
@@ -493,45 +478,38 @@ class Qwen35Arch(ModelArch):
     def build(self, hf_model, tensor_split=None, device_ids=None, **kwargs):
         core = hf_model.get_base_model() if hasattr(hf_model, "get_base_model") else hf_model
         from stratum.telemetry import parse_int_set
-        flash_layers_str = kwargs.get("flash_layers", "")
-        disable_flash = flash_layers_str.strip().lower() in {"none", "off", "false"}
-        if disable_flash:
+        flash_layers_str = kwargs.get("flash_layers", "") or kwargs.get("volta_layers", "")
+        if flash_layers_str.strip().lower() in {"none", "off", "false"}:
             raise ValueError("--flash-layers cannot disable flash attention")
         flash_layer_indices = parse_int_set(flash_layers_str) if flash_layers_str else None
-        fwl = kwargs.get("flash_window_left", -1)
-        fwr = kwargs.get("flash_window_right", 0)
-        window_size = (fwl, fwr) if fwl >= 0 else None
-        _patch_qwen35_attention(
-            core,
-            layer_indices=flash_layer_indices,
-            window_size=window_size,
-        )
+        _patch_qwen3moe_attention(core, layer_indices=flash_layer_indices)
         apply_mlp_optimizations(
             core,
             checkpoint_mlp=kwargs.get("checkpoint_mlp", False),
             memory_flat_frozen_mlp=kwargs.get("memory_flat_frozen_mlp", False),
             mlp_token_chunk_size=kwargs.get("mlp_token_chunk_size", 0),
         )
-        # MoE router logit capture (for future MoE adapter support)
+        # MoE router logit capture: patch blocks to expose router logits
+        # as side-channel state without changing block return values.
         output_router_logits = kwargs.get("output_router_logits", False)
         if output_router_logits:
             n_patched = patch_moe_block_for_router_logits(core)
             if n_patched > 0:
                 print(f"MoE router logit capture: patched {n_patched} MoE blocks", flush=True)
+            else:
+                print("MoE router logit capture: no MoE blocks found to patch", flush=True)
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
-def _patch_qwen35_attention(
+def _patch_qwen3moe_attention(
     model,
     layer_indices: Optional[set[int]] = None,
-    window_size: Optional[tuple[int, int]] = None,
 ):
-    """Replace Qwen3_5Attention with capability-dispatched flash attention.
+    """Replace Qwen3MoeAttention with capability-dispatched flash attention.
 
     Args:
         model: HF model to patch.
         layer_indices: Set of layer indices to patch. None = patch all.
-        window_size: Optional (left, right) window for flash-attn-v100 sliding window.
     """
     core = model.get_base_model() if hasattr(model, "get_base_model") else model
     patched = 0
@@ -541,16 +519,14 @@ def _patch_qwen35_attention(
         if not hasattr(layer, "self_attn"):
             continue
         old_attn = layer.self_attn
-        if not isinstance(old_attn, Qwen3_5Attention):
+        if not isinstance(old_attn, Qwen3MoeAttention):
             continue
-        if isinstance(old_attn, Qwen35FlashAttention):
+        if isinstance(old_attn, Qwen3MoeFlashAttention):
             if layer_indices is None or idx in layer_indices:
                 patched += 1
             continue
 
-        new_attn = Qwen35FlashAttention(
-            old_attn.config, layer_idx=idx, window_size=window_size,
-        )
+        new_attn = Qwen3MoeFlashAttention(old_attn.config, layer_idx=idx)
         for attr in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"]:
             if hasattr(old_attn, attr):
                 setattr(new_attn, attr, getattr(old_attn, attr))
@@ -558,5 +534,5 @@ def _patch_qwen35_attention(
         layer.self_attn = new_attn
         patched += 1
 
-    print(f"Patched {patched} Qwen3.5 attention layers with capability-dispatched flash attention",
+    print(f"Patched {patched} Qwen3-MoE attention layers with capability-dispatched flash attention",
           flush=True)

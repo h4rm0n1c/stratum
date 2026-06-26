@@ -1,6 +1,24 @@
+# Build artifacts
 *.pyc
 __pycache__/
 build/
 *.egg-info/
-runs/
+*.egg
 
+# Runtime outputs
+runs/
+out/
+cache/
+
+# Agent config (internal)
+.claude/
+CLAUDE.md
+
+# Documentation (separate from runtime)
+docs/
+
+# Environment / IDE
+.env
+.venv/
+.vscode/
+.idea/

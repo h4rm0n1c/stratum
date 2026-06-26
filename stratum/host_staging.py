@@ -14,6 +14,7 @@ Three paths, tried in order:
 """
 
 import torch
+from stratum.transfer import async_d2h, async_h2d
 from stratum.utils import log_event
 
 
@@ -80,8 +81,10 @@ class HostStagingPool:
         Returns the data on the destination device.
 
         The returned tensor is safe to use on the destination device's current
-        stream. Internally the H2D copy may run on a side stream, but that work
-        is fenced before returning.
+        stream. The source D2H leg uses a side stream and a reusable pinned
+        staging buffer; the destination H2D leg is enqueued on the destination
+        current stream so backward hooks return gradients produced on the same
+        stream that autograd will consume.
         """
         size_bytes = data.numel() * data.element_size()
 
@@ -105,29 +108,39 @@ class HostStagingPool:
         self.ensure(size_bytes)
 
         src_stream = torch.cuda.Stream(device=f"cuda:{src_device}")
-        dst_stream = torch.cuda.Stream(device=f"cuda:{dst_device}")
         src_current = torch.cuda.current_stream(device=src_device)
         dst_current = torch.cuda.current_stream(device=dst_device)
 
-        # D2H on source (non-blocking)
-        with torch.cuda.stream(src_stream):
-            src_stream.wait_stream(src_current)
-            data_flat = data.contiguous().flatten()
-            dst_cpu = _typed_buffer_view(self._buf, data_flat.dtype, data_flat.numel())
-            dst_cpu.copy_(data_flat, non_blocking=True)
+        data_flat = data.contiguous().flatten()
+        dst_cpu = _typed_buffer_view(self._buf, data_flat.dtype, data_flat.numel())
 
-        # Sync point — same as cudaStreamSynchronize in ggml_cuda_copy_across_devices
-        src_stream.synchronize()
+        # D2H on source (non-blocking), preserving the activation autograd edge.
+        src_stream.wait_stream(src_current)
+        d2h = async_d2h(
+            data_flat,
+            stream=src_stream,
+            preserve_autograd=True,
+            out=dst_cpu,
+        )
 
-        # H2D on destination side stream, then fence destination current stream.
-        dst_done = torch.cuda.Event()
-        with torch.cuda.stream(dst_stream):
-            result = torch.empty_like(data, device=f"cuda:{dst_device}")
-            result.view(-1).copy_(dst_cpu, non_blocking=True)
-            dst_stream.record_event(dst_done)
+        # Sync point — same as cudaStreamSynchronize in ggml_cuda_copy_across_devices.
+        d2h.wait()
 
-        dst_current.wait_event(dst_done)
-        self._pending_events.append(dst_done)
+        # H2D on the destination current stream. RoundPipe hands uploads back
+        # to compute after fencing; for a synchronous backward-hook transfer,
+        # producing the returned grad on the compute stream avoids autograd
+        # AccumulateGrad stream-mismatch warnings on no-P2P host-staged paths.
+        result = torch.empty_like(data, device=f"cuda:{dst_device}")
+        h2d = async_h2d(
+            dst_cpu,
+            f"cuda:{dst_device}",
+            stream=dst_current,
+            preserve_autograd=True,
+            out=result.view(-1),
+        )
+
+        if h2d.event is not None:
+            self._pending_events.append(h2d.event)
         return result
 
     def transfer_async(
@@ -161,21 +174,27 @@ class HostStagingPool:
         src_stream = torch.cuda.Stream(device=f"cuda:{src_device}")
         dst_stream = torch.cuda.Stream(device=f"cuda:{dst_device}")
 
-        with torch.cuda.stream(src_stream):
-            src_stream.wait_event(src_event)
-            data_flat = data.contiguous().flatten()
-            dst_cpu = _typed_buffer_view(self._buf, data_flat.dtype, data_flat.numel())
-            dst_cpu.copy_(data_flat, non_blocking=True)
+        src_stream.wait_event(src_event)
+        data_flat = data.contiguous().flatten()
+        dst_cpu = _typed_buffer_view(self._buf, data_flat.dtype, data_flat.numel())
+        d2h = async_d2h(
+            data_flat,
+            stream=src_stream,
+            preserve_autograd=True,
+            out=dst_cpu,
+        )
 
-        src_done = torch.cuda.Event()
-        src_stream.record_event(src_done)
+        result = torch.empty_like(data, device=f"cuda:{dst_device}")
+        h2d = async_h2d(
+            dst_cpu,
+            f"cuda:{dst_device}",
+            stream=dst_stream,
+            wait_events=[d2h.event] if d2h.event is not None else None,
+            preserve_autograd=True,
+            out=result.view(-1),
+        )
 
-        dst_event = torch.cuda.Event()
-        with torch.cuda.stream(dst_stream):
-            dst_stream.wait_event(src_done)
-            result = torch.empty_like(data, device=f"cuda:{dst_device}")
-            result.view(-1).copy_(dst_cpu, non_blocking=True)
-            dst_stream.record_event(dst_event)
-
-        self._pending_events.append(dst_event)
-        return result, dst_event
+        if h2d.event is None:
+            raise RuntimeError("host-staged async transfer did not produce a CUDA event")
+        self._pending_events.append(h2d.event)
+        return result, h2d.event

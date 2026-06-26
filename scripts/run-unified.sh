@@ -54,6 +54,7 @@ docker_args=(
   -e CUDA_CACHE_PATH=/workspace/cache/cuda
   -e CUDA_CACHE_MAXSIZE=2147483648
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID
+  -e PYTHONPATH=/workspace/stratum
   -w /workspace/stratum
 )
 

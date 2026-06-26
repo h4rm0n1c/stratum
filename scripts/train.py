@@ -20,11 +20,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import itertools
 import json
 import re
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -42,9 +44,26 @@ from stratum.batch import (
 )
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
-from stratum.timing import TimingRecorder
+from stratum.timing import ModelLayerTimer, TimingRecorder
 from stratum.utils import get_device_info, gpu_memory_snapshot
 from stratum.watchdog import mark_phase, mark_memory_phase
+from stratum.grad_scaler import GradScaler as CPUOffloadGradScaler
+
+
+def make_grad_scaler(*, enabled: bool, cpu_offload: bool):
+    """Return the scaler implementation that matches the optimizer backend."""
+    if cpu_offload:
+        return CPUOffloadGradScaler(enabled=enabled)
+    grad_scaler_cls = getattr(torch.amp, "GradScaler", None)
+    if grad_scaler_cls is not None:
+        return grad_scaler_cls("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def compute_stream_context_for(tensor: torch.Tensor):
+    if not torch.is_tensor(tensor) or not tensor.is_cuda:
+        return nullcontext()
+    return torch.cuda.stream(torch.cuda.default_stream(tensor.device))
 
 
 class PretokJsonlDataset(Dataset):
@@ -146,8 +165,14 @@ def main():
                     help="Also save legacy per-device trainable .pt state for debugging/backward compatibility.")
     ap.add_argument("--checkpoint-decoder-layer", action="store_true", default=True,
                     help="Activation checkpointing per decoder layer (reduces VRAM, ~30% slower)")
+    ap.add_argument("--recompute-grain", default="layer", choices=["layer", "none"],
+                    help="Recompute granularity: 'layer' (default, checkpoint each decoder layer) "
+                         "or 'none' (disable per-layer checkpointing). Overrides --checkpoint-decoder-layer.")
     ap.add_argument("--num-microbatch", type=int, default=1,
                     help="Split batch into N microbatches (gradient accumulation, saves VRAM)")
+    ap.add_argument("--pytree-batch", action="store_true",
+                    help="Use pytree-based batch splitting (supports arbitrary input shapes, "
+                         "mirrors RoundPipe's guess_split_spec). Default uses fixed-tensor path.")
     ap.add_argument("--no-nf4", action="store_true",
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
     ap.add_argument("--nf4-scope", default="all", choices=["all", "layers"],
@@ -181,16 +206,20 @@ def main():
                     help="Print CUDA memory summary when forward/backward raises RuntimeError")
     ap.add_argument("--timing-jsonl", default="",
                     help="Write pipeline timing spans to this JSONL file")
+    ap.add_argument("--adapt-plan-every", type=int, default=0, metavar="N",
+                    help="Re-derive the scheduler plan from per-layer timing every N steps "
+                         "(0 = disabled). Requires CUDA; no-op on CPU.")
     # Memory watchdog
     ap.add_argument("--host-ram-limit-gib", type=float, default=0.0,
                     help="Abort when host RSS exceeds this many GiB (0 = disabled)")
-    # Selective Volta attention patching
-    ap.add_argument("--volta-layers", default="",
-                    help="Comma-separated full-attention layer indices to patch")
-    ap.add_argument("--volta-window-left", type=int, default=-1,
-                    help="Sliding-window left tokens for flash-attn-v100")
-    ap.add_argument("--volta-window-right", type=int, default=0,
-                    help="Right tokens for sliding-window (0 = causal)")
+    # Selective flash-attention patching. The implementation dispatches by GPU
+    # capability: standard flash-attn on SM80+/SM86, flash-attn-v100 on SM70.
+    ap.add_argument("--flash-layers", default="",
+                    help="Comma-separated full-attention layer indices to patch; empty = all full-attention layers")
+    ap.add_argument("--flash-window-left", type=int, default=-1,
+                    help="Sliding-window left tokens for flash attention")
+    ap.add_argument("--flash-window-right", type=int, default=0,
+                    help="Right tokens for sliding-window flash attention (0 = causal)")
     # Data loading
     ap.add_argument("--longest-first", action="store_true",
                     help="Sort training data by sequence length descending")
@@ -213,9 +242,50 @@ def main():
     ap.add_argument("--lora-target-set", default="all",
                     choices=["all", "attention", "attention_input", "mlp"],
                     help="LoRA module set. Narrower sets reduce memory.")
+    # CPU offloaded optimizer (VRAM saving)
+    ap.add_argument("--cpu-offload-optim", action="store_true",
+                    help="Keep AdamW optimizer state in fp32 on CPU instead of GPU. "
+                         "Frees ~2x trainable-param GPU memory. Gradients are moved "
+                         "to CPU copies before each step.")
+    ap.add_argument("--async-optimizer-step", action="store_true",
+                    help="Run CPU-offloaded optimizer.step() through the background "
+                         "optimizer queue. Requires --cpu-offload-optim.")
+    ap.add_argument("--optim-dtype", default="fp32", choices=["fp32", "fp16"],
+                    help="Data type for CPU optimizer parameter copies (fp32 recommended).")
+    # MoE auxiliary loss (router load balancing)
+    ap.add_argument("--output-router-logits", action="store_true",
+                    help="Capture MoE router logits during forward for auxiliary load-balancing loss.")
+    ap.add_argument("--router-aux-loss-coef", type=float, default=0.0,
+                    help="Coefficient for MoE router auxiliary loss (e.g. 0.02). Requires --output-router-logits.")
+    # Gradient scaling (mixed precision)
+    ap.add_argument("--grad-scaler-enabled", action="store_true",
+                    help="Enable GradScaler for stable fp16 training. Scales loss before "
+                         "backward, unscales gradients before optimizer step.")
+    # Attention backend selection. "flash" means Stratum-owned dispatch:
+    # flash_attn on SM80+/SM86 and flash_attn_v100 on SM70.
+    ap.add_argument("--attn-implementation", default="flash",
+                    choices=["flash"],
+                    help="Attention backend. 'flash' loads HF with eager attention and patches "
+                         "full-attention layers with GPU-capability-dispatched flash attention.")
+    # NF4 quantization tuning (qz-roundpipe parity)
+    ap.add_argument("--nf4-min-numel", type=int, default=4096,
+                    help="Minimum frozen 2D parameter elements to NF4-quantize.")
+    ap.add_argument("--nf4-layer-size-floor-gib", type=float, default=0.0,
+                    help="Experimental scheduler hint: floor transformer layer size "
+                         "after NF4 prep to force smaller stages.")
     args = ap.parse_args()
 
     # Arg validation (same guards as RoundPipe)
+    if args.recompute_grain == "none":
+        args.checkpoint_decoder_layer = False
+        print({"checkpoint_decoder_layer": False, "reason": "recompute_grain=none"}, flush=True)
+    if args.async_optimizer_step and not args.cpu_offload_optim:
+        raise ValueError("--async-optimizer-step requires --cpu-offload-optim")
+    if args.pad_to_multiple == 0:
+        args.pad_to_multiple = 32
+        print({"pad_to_multiple": 32, "reason": "flash attention seq len constraint"}, flush=True)
+    if args.router_aux_loss_coef > 0 and not args.output_router_logits:
+        raise ValueError("--router-aux-loss-coef requires --output-router-logits")
     if args.memory_flat_frozen_mlp:
         if args.mlp_token_chunk_size <= 0:
             raise ValueError("--memory-flat-frozen-mlp requires --mlp-token-chunk-size > 0")
@@ -227,11 +297,6 @@ def main():
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
     if args.stratum_stage_memory_limit_gib < 0:
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
-    volta_attention_enabled = args.volta_layers.strip().lower() not in {"none", "off", "false"}
-    if volta_attention_enabled and args.pad_to_multiple == 0:
-        args.pad_to_multiple = 32
-        print({"pad_to_multiple": 32, "reason": "volta_flash sequence length constraint"}, flush=True)
-
     # Detect devices
     devices = get_device_info()
     if not devices:
@@ -258,15 +323,22 @@ def main():
     # Load base model
     mark_phase("before_model_load")
     print(f"Loading model {args.hf_model}...", flush=True)
+    # Map Stratum flash mode to eager HF loading, then patch full-attention
+    # layers with capability-dispatched flash kernels.
+    hf_attn_impl = "eager" if args.attn_implementation == "flash" else args.attn_implementation
     hf_model = AutoModelForCausalLM.from_pretrained(
         args.hf_model,
         trust_remote_code=True,
         dtype=torch.float16,
         device_map="cpu",
         low_cpu_mem_usage=True,
-        attn_implementation="eager",
+        attn_implementation=hf_attn_impl,
     )
     hf_model.config.use_cache = False
+    # Record effective attn implementation
+    hf_model.config._attn_implementation = hf_attn_impl
+    print({"attn_implementation": args.attn_implementation,
+           "hf_attn_implementation": hf_attn_impl}, flush=True)
     print("Model loaded on CPU", flush=True)
 
     # Apply LoRA
@@ -320,6 +392,8 @@ def main():
     if not args.no_nf4 and args.nf4_cache_dir:
         nf4_cache_dir = str(Path(args.nf4_cache_dir) / _safe_cache_component(args.hf_model))
         print({"nf4_cache_dir": nf4_cache_dir}, flush=True)
+    if args.nf4_layer_size_floor_gib > 0:
+        print({"nf4_layer_size_floor_gib": args.nf4_layer_size_floor_gib}, flush=True)
     pipeline = build_pipeline(
         args.model, hf_model,
         tensor_split=tensor_split,
@@ -327,6 +401,7 @@ def main():
         use_nf4=not args.no_nf4,
         nf4_cache_dir=nf4_cache_dir,
         nf4_scope=args.nf4_scope,
+        nf4_min_numel=args.nf4_min_numel,
         checkpoint_decoder_layer=args.checkpoint_decoder_layer,
         loss_token_chunk_size=args.loss_token_chunk_size,
         postfix_loss_token_chunk_size=args.postfix_loss_token_chunk_size,
@@ -335,16 +410,26 @@ def main():
         checkpoint_mlp=args.checkpoint_mlp,
         memory_flat_frozen_mlp=args.memory_flat_frozen_mlp,
         mlp_token_chunk_size=args.mlp_token_chunk_size,
-        volta_layers=args.volta_layers,
-        volta_window_left=args.volta_window_left,
-        volta_window_right=args.volta_window_right,
+        flash_layers=args.flash_layers,
+        flash_window_left=args.flash_window_left,
+        flash_window_right=args.flash_window_right,
         dense_attention_masks=args.dense_attention_masks,
         torch_compile_loss=args.torch_compile_loss,
         stage_memory_limit_gib=args.stratum_stage_memory_limit_gib,
+        nf4_layer_size_floor_gib=args.nf4_layer_size_floor_gib,
         prefetch_nf4=args.prefetch_nf4,
+        output_router_logits=args.output_router_logits,
+        router_aux_loss_coef=args.router_aux_loss_coef,
     )
     timing_recorder = TimingRecorder(args.timing_jsonl, enabled=bool(args.timing_jsonl))
     pipeline.set_timing_recorder(timing_recorder if args.timing_jsonl else None)
+
+    layer_timer: Optional[ModelLayerTimer] = None
+    if torch.cuda.is_available() and pipeline._total_layers > 0:
+        layer_timer = ModelLayerTimer(n_layers=pipeline._total_layers)
+        pipeline.set_layer_timer(layer_timer, adapt_every_n=args.adapt_plan_every)
+        if args.adapt_plan_every > 0:
+            print(f"  layer timer: adapt plan every {args.adapt_plan_every} steps", flush=True)
 
     # Pin model memory for faster H2D (if enabled)
     if args.pin_model != "off":
@@ -375,6 +460,7 @@ def main():
     last_dev = pipeline.stages[-1].device_id if pipeline.stages else 0
     modules_by_device.setdefault(last_dev, []).append(pipeline.postfix)
 
+    optim_dtype = torch.float32 if args.optim_dtype == "fp32" else torch.float16
     optimizer = PerDeviceOptimizer(
         modules_by_device,
         lr=args.lr,
@@ -382,9 +468,22 @@ def main():
         scheduler=args.lr_scheduler,
         warmup_steps=args.warmup_steps,
         total_steps=args.steps,
+        cpu_offload=args.cpu_offload_optim,
+        optim_dtype=optim_dtype,
     )
+    if args.cpu_offload_optim:
+        optimizer.ensure_optim_params()
+        print({"cpu_offload_optim": True, "optim_dtype": args.optim_dtype}, flush=True)
+    scaler = make_grad_scaler(
+        enabled=args.grad_scaler_enabled,
+        cpu_offload=args.cpu_offload_optim,
+    )
+    if args.grad_scaler_enabled:
+        print({"grad_scaler_enabled": True, "init_scale": 2.0**16}, flush=True)
     print({"lr": args.lr, "scheduler": args.lr_scheduler,
            "warmup": args.warmup_steps, "batch_size": args.batch_size}, flush=True)
+    if args.pytree_batch:
+        print({"pytree_batch": True, "reason": "arbitrary pytree input shapes"}, flush=True)
 
     # Memory watchdog (OS-level RSS limit)
     if args.host_ram_limit_gib > 0:
@@ -438,10 +537,22 @@ def main():
     if args.out:
         Path(args.out).mkdir(parents=True, exist_ok=True)
     log_file = open(Path(args.out) / "training.jsonl", "w") if args.out else None
+    pending_async_optimizer_step = False
+
+    def finish_optimizer_step() -> None:
+        if args.async_optimizer_step:
+            optimizer.synchronize()
+        if not optimizer.last_step_was_skipped():
+            optimizer.scheduler_step()
+        scaler.update()
 
     for step in range(start_step + 1, args.steps + 1):
         batch = next(data_cycle)
         iter_t0 = time.time()
+
+        if pending_async_optimizer_step:
+            finish_optimizer_step()
+            pending_async_optimizer_step = False
 
         input_ids = batch["input_ids"].cuda(input_device)
         attention_mask = batch["attention_mask"].cuda(input_device)
@@ -459,33 +570,65 @@ def main():
         loss = None
         try:
             if nmb > 1:
-                microbatches = split_training_batch(
-                    input_ids,
-                    attention_mask,
-                    labels,
-                    num_microbatch=nmb,
-                )
-                total_trainable = sum(mb.trainable_tokens for mb in microbatches)
-                detached_losses = []
-                trainable_counts = []
-                for mb in microbatches:
-                    mb_out = pipeline(
-                        mb.input_ids,
-                        attention_mask=mb.attention_mask,
-                        labels=mb.labels,
+                if args.pytree_batch:
+                    # Pytree path: split kwargs dict, supports arbitrary input shapes.
+                    from stratum.batch import split_kwargs_pytree, TokenWeightedReducer
+                    batch_kwargs = {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "labels": labels,
+                    }
+                    mb_kwargs_list = split_kwargs_pytree(
+                        batch_kwargs, num_microbatch=nmb,
+                        expected_batch_size=input_ids.size(0),
                     )
-                    scale = microbatch_loss_scale(
-                        mb.trainable_tokens,
-                        total_trainable,
-                        len(microbatches),
+                    reducer = TokenWeightedReducer()
+                    for mb_kw in mb_kwargs_list:
+                        mb_tokens = int((mb_kw["labels"] != -100).sum().item())
+                        mb_out = pipeline(**mb_kw)
+                        scale = microbatch_loss_scale(
+                            mb_tokens,
+                            sum((mk["labels"] != -100).sum().item() for mk in mb_kwargs_list),
+                            nmb,
+                        )
+                        scaled_loss = scaler.scale(mb_out.loss * scale)
+                        with compute_stream_context_for(scaled_loss):
+                            scaled_loss.backward()
+                        reducer.accumulate(mb_out.loss.detach(), mb_tokens)
+                    loss = reducer.reduce()
+                else:
+                    # Fixed-tensor path (default).
+                    microbatches = split_training_batch(
+                        input_ids,
+                        attention_mask,
+                        labels,
+                        num_microbatch=nmb,
                     )
-                    (mb_out.loss * scale).backward()
-                    detached_losses.append(mb_out.loss.detach())
-                    trainable_counts.append(mb.trainable_tokens)
-                loss = reduce_microbatch_losses(detached_losses, trainable_counts)
+                    total_trainable = sum(mb.trainable_tokens for mb in microbatches)
+                    detached_losses = []
+                    trainable_counts = []
+                    for mb in microbatches:
+                        mb_out = pipeline(
+                            mb.input_ids,
+                            attention_mask=mb.attention_mask,
+                            labels=mb.labels,
+                        )
+                        scale = microbatch_loss_scale(
+                            mb.trainable_tokens,
+                            total_trainable,
+                            len(microbatches),
+                        )
+                        scaled_loss = scaler.scale(mb_out.loss * scale)
+                        with compute_stream_context_for(scaled_loss):
+                            scaled_loss.backward()
+                        detached_losses.append(mb_out.loss.detach())
+                        trainable_counts.append(mb.trainable_tokens)
+                    loss = reduce_microbatch_losses(detached_losses, trainable_counts)
             else:
                 output = pipeline(input_ids, attention_mask=attention_mask, labels=labels)
-                output.loss.backward()
+                scaled_loss = scaler.scale(output.loss)
+                with compute_stream_context_for(scaled_loss):
+                    scaled_loss.backward()
                 loss = output.loss.detach()
         except RuntimeError:
             print({"forward_backward_exception_step": step}, flush=True)
@@ -495,8 +638,12 @@ def main():
                 ), flush=True)
             raise
 
-        optimizer.step()
-        optimizer.scheduler_step()
+        if args.async_optimizer_step:
+            optimizer.step(async_step=True, scaler=scaler)
+            pending_async_optimizer_step = True
+        else:
+            optimizer.step(scaler=scaler)
+            finish_optimizer_step()
 
         # Free streamed weights after backward
         pipeline.free_all_weights()
@@ -542,12 +689,19 @@ def main():
 
         # Periodic save
         if args.save_every > 0 and step % args.save_every == 0:
+            if pending_async_optimizer_step:
+                finish_optimizer_step()
+                pending_async_optimizer_step = False
             save_dir = Path(args.out) / f"checkpoint-{step}"
             save_checkpoint(modules_by_device, optimizer, step, save_dir,
                             peft_model=hf_model,
                             save_optimizer_state=args.save_optimizer_state,
                             save_legacy_device_state=args.save_legacy_device_state)
             tqdm.write(f"Saved checkpoint {save_dir}")
+
+    if pending_async_optimizer_step:
+        finish_optimizer_step()
+        pending_async_optimizer_step = False
 
     # Final save
     if not args.no_save:

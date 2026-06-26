@@ -1,9 +1,9 @@
-"""BlockedPostfixCausalLMLoss — norm + lm_head with per-block backward.
+"""BlockedPostfixCausalLMLoss — optional norm + lm_head with per-block backward.
 
 Ported from train_lfm25_roundpipe_lora.py::BlockedPostfixCausalLMLoss.
 
 Saves VRAM at long context by:
-  1. Splitting the sequence into token blocks for the norm + lm_head forward
+  1. Splitting the sequence into token blocks for the optional norm + lm_head forward
   2. Backward-propagating through each block's lm_head output via
      per-block .backward() calls (accumulates lm_head gradients)
   3. Saving the hidden-states gradient to CPU and restoring it in the
@@ -15,6 +15,7 @@ Enable with --postfix-loss-token-chunk-size N.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
@@ -45,13 +46,19 @@ def _make_block_loss(
     return loss / num_items
 
 
+def _compute_stream_context(tensor: torch.Tensor):
+    if not torch.is_tensor(tensor) or not tensor.is_cuda:
+        return nullcontext()
+    return torch.cuda.stream(torch.cuda.default_stream(tensor.device))
+
+
 class BlockedPostfixCausalLMLoss(torch.autograd.Function):
     """Custom autograd: split norm + lm_head over token blocks.
 
     Forward:
       - Shifts labels for causal LM
       - Counts non-ignored tokens
-      - Iterates token blocks: norm → lm_head → CE(reduction=sum) / total_items
+      - Iterates token blocks: optional norm → lm_head → CE(reduction=sum) / total_items
       - Calls .backward() on each block's loss to accumulate lm_head gradients
       - Saves hidden_states gradient to CPU
 
@@ -65,7 +72,7 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
         ctx: Any,
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
-        norm: nn.Module,
+        norm: Optional[nn.Module],
         lm_head: nn.Linear,
         vocab_size: int,
         token_chunk_size: int,
@@ -73,7 +80,7 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
         memory_telemetry: bool = False,
         debug_finite: bool = False,
     ) -> torch.Tensor:
-        if any(param.requires_grad for param in norm.parameters()):
+        if norm is not None and any(param.requires_grad for param in norm.parameters()):
             raise ValueError("--postfix-loss-token-chunk-size does not yet support trainable final norm")
         if any(param.requires_grad for param in lm_head.parameters()):
             raise ValueError("--postfix-loss-token-chunk-size does not yet support trainable lm_head")
@@ -88,6 +95,9 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
 
         if int(num_items.detach().cpu().item()) == 0:
             grad_saved = torch.zeros_like(hidden_states) if ctx.needs_input_grad[0] else None
+            ctx.hidden_states_device = hidden_states.device
+            ctx.hidden_states_dtype = hidden_states.dtype
+            ctx.memory_telemetry = memory_telemetry
             ctx.save_for_backward(grad_saved) if grad_saved is not None else ctx.save_for_backward()
             return hidden_states.new_zeros(())
 
@@ -96,10 +106,11 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
             raise ValueError("--postfix-loss-token-chunk-size currently expects batch-size 1")
 
         loss_sum = hidden_states.new_zeros(())
-        with torch.enable_grad():
+        with torch.enable_grad(), _compute_stream_context(hidden_states):
             for start in range(0, seq_len, token_chunk_size):
                 end = min(start + token_chunk_size, seq_len)
-                block_norm = norm(detached_hidden[:, start:end, :])
+                block_hidden = detached_hidden[:, start:end, :]
+                block_norm = norm(block_hidden) if norm is not None else block_hidden
                 if debug_finite:
                     assert_finite_tensor(f"post_norm_hidden_{start}_{end}", block_norm)
 

@@ -1,8 +1,9 @@
 """Async transfer primitives adapted from RoundPipe.
 
-These helpers are intentionally standalone for now. They provide the stream /
-event semantics needed for future NF4 prefetch and activation offload without
-changing the current synchronous training path.
+The default mode is offload-style and detaches the transfer from autograd.
+Callers that are moving boundary activations can opt into graph-preserving
+copies with ``preserve_autograd=True`` and, when needed, provide preallocated
+``out`` buffers.
 """
 
 from __future__ import annotations
@@ -37,17 +38,26 @@ def _as_device(device: torch.device | str | int) -> torch.device:
     return torch.device(device)
 
 
-def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+def _pin_cpu_tensor(tensor: torch.Tensor, *, preserve_autograd: bool = False) -> torch.Tensor:
     if tensor.device.type != "cpu":
         raise ValueError(f"expected CPU tensor, got {tensor.device}")
     if not torch.cuda.is_available() or tensor.is_pinned():
         return tensor
     pinned = torch.empty_like(tensor, device=torch.device("cpu"), pin_memory=True)
-    pinned.copy_(tensor.detach())
+    source = tensor if preserve_autograd else tensor.detach()
+    pinned.copy_(source)
     return pinned
 
 
-def _copy_sync(tensor: torch.Tensor, device: torch.device, keep_requires_grad: bool) -> torch.Tensor:
+def _copy_sync(
+    tensor: torch.Tensor,
+    device: torch.device,
+    keep_requires_grad: bool,
+    *,
+    preserve_autograd: bool = False,
+) -> torch.Tensor:
+    if preserve_autograd:
+        return tensor.to(device).clone()
     requires_grad = tensor.requires_grad
     with torch.no_grad():
         out = tensor.detach().to(device).clone()
@@ -69,27 +79,49 @@ def async_h2d(
     stream: Optional[torch.cuda.Stream] = None,
     wait_events: Optional[Sequence[torch.cuda.Event]] = None,
     keep_requires_grad: bool = False,
+    preserve_autograd: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> TransferResult:
     """Copy a host tensor to *device* with pinned fallback and event output."""
     device = _as_device(device)
     requires_grad = tensor.requires_grad
     if device.type != "cuda":
-        return TransferResult(_copy_sync(tensor, device, keep_requires_grad))
+        return TransferResult(
+            _copy_sync(
+                tensor,
+                device,
+                keep_requires_grad,
+                preserve_autograd=preserve_autograd,
+            )
+        )
 
     if not torch.cuda.is_available():
         raise RuntimeError(f"CUDA is not available for async_h2d to {device}")
 
     if tensor.device.type != "cpu":
         raise ValueError(f"async_h2d expected a CPU tensor, got {tensor.device}")
+    if out is not None and out.device != device:
+        raise ValueError(f"async_h2d out tensor is on {out.device}, expected {device}")
 
-    host = _pin_cpu_tensor(tensor)
+    host = _pin_cpu_tensor(tensor, preserve_autograd=preserve_autograd)
     if stream is None:
         stream = torch.cuda.Stream(device=device)
     with torch.cuda.device(device), torch.cuda.stream(stream):
         _wait_events(stream, wait_events)
-        with torch.no_grad():
-            out = host.detach().to(device, non_blocking=True)
-        out.requires_grad_(keep_requires_grad and requires_grad)
+        source = host if preserve_autograd else host.detach()
+        if out is None:
+            if preserve_autograd:
+                out = source.to(device, non_blocking=True)
+            else:
+                with torch.no_grad():
+                    out = source.to(device, non_blocking=True)
+                out.requires_grad_(keep_requires_grad and requires_grad)
+        elif preserve_autograd:
+            out.copy_(source, non_blocking=True)
+        else:
+            with torch.no_grad():
+                out.copy_(source, non_blocking=True)
+            out.requires_grad_(keep_requires_grad and requires_grad)
         event = torch.cuda.Event()
         stream.record_event(event)
     return TransferResult(out, event=event, stream=stream, pinned_buffer=host)
@@ -100,21 +132,46 @@ def async_d2h(
     *,
     stream: Optional[torch.cuda.Stream] = None,
     keep_requires_grad: bool = False,
+    preserve_autograd: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> TransferResult:
     """Copy a CUDA tensor to pinned host memory with event output."""
     requires_grad = tensor.requires_grad
     if tensor.device.type != "cuda":
-        return TransferResult(_copy_sync(tensor, torch.device("cpu"), keep_requires_grad))
+        return TransferResult(
+            _copy_sync(
+                tensor,
+                torch.device("cpu"),
+                keep_requires_grad,
+                preserve_autograd=preserve_autograd,
+            )
+        )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA tensor transfer requested but CUDA is not available")
 
     if stream is None:
         stream = torch.cuda.Stream(device=tensor.device)
-    host = torch.empty_like(tensor, device=torch.device("cpu"), pin_memory=True)
+    if out is None:
+        host = torch.empty_like(tensor, device=torch.device("cpu"), pin_memory=True)
+    else:
+        if out.device.type != "cpu":
+            raise ValueError(f"async_d2h out tensor must be on CPU, got {out.device}")
+        if out.shape != tensor.shape or out.dtype != tensor.dtype:
+            raise ValueError(
+                "async_d2h out tensor must match source shape and dtype: "
+                f"got shape={tuple(out.shape)} dtype={out.dtype}, "
+                f"expected shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+            )
+        host = out
     with torch.cuda.device(tensor.device), torch.cuda.stream(stream):
-        host.copy_(tensor.detach(), non_blocking=True)
-        host.requires_grad_(keep_requires_grad and requires_grad)
+        source = tensor if preserve_autograd else tensor.detach()
+        if preserve_autograd:
+            host.copy_(source, non_blocking=True)
+        else:
+            with torch.no_grad():
+                host.copy_(source, non_blocking=True)
+            host.requires_grad_(keep_requires_grad and requires_grad)
         event = torch.cuda.Event()
         stream.record_event(event)
     return TransferResult(host, event=event, stream=stream, pinned_buffer=host)

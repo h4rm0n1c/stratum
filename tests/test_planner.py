@@ -16,6 +16,12 @@ class StagePlannerTest(unittest.TestCase):
 
         self.assertEqual(estimate_module_bytes(module), expected)
 
+    def test_estimate_applies_layer_size_floor(self):
+        module = nn.Linear(2, 2, bias=False)
+        floor_gib = 32 / 1024**3
+
+        self.assertEqual(estimate_module_bytes(module, floor_gib=floor_gib), 32)
+
     def test_limit_zero_keeps_single_group(self):
         layers = [nn.Linear(2, 2), nn.Linear(2, 2)]
 
@@ -39,6 +45,19 @@ class StagePlannerTest(unittest.TestCase):
         groups = split_layers_by_memory_limit(layers, layer_gib * 0.5)
 
         self.assertEqual([len(group) for group in groups], [1, 1])
+
+    def test_layer_size_floor_affects_stage_splitting(self):
+        layers = [nn.Linear(1, 1, bias=False) for _ in range(3)]
+        floor_gib = 10 / 1024**3
+        limit_gib = 21 / 1024**3
+
+        groups = split_layers_by_memory_limit(
+            layers,
+            limit_gib,
+            layer_size_floor_gib=floor_gib,
+        )
+
+        self.assertEqual([len(group) for group in groups], [2, 1])
 
 
 if __name__ == "__main__":

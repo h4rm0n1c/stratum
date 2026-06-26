@@ -9,7 +9,10 @@ from stratum.pipeline import StratumPipeline
 from stratum.assign import assign_layers_to_devices
 from stratum.planner import split_layers_by_memory_limit
 from stratum.stage import DeviceStage
-from stratum.upload import prepare_nf4, upload_stream, ensure_weights, free_weights, NF4_ATTR
+from stratum.upload import (
+    prepare_nf4, prepare_fp16_staged, upload_stream,
+    ensure_weights, free_weights, NF4_ATTR, FP16_ATTR,
+)
 from stratum.nf4_linear import NF4Linear
 from stratum.utils import log_event
 
@@ -46,8 +49,10 @@ class ModelArch:
         use_nf4: bool = True,
         nf4_cache_dir: Optional[str] = None,
         nf4_scope: str = "all",
+        nf4_min_numel: int = 4096,
         checkpoint_decoder_layer: bool = False,
         stage_memory_limit_gib: float = 0.0,
+        nf4_layer_size_floor_gib: float = 0.0,
         prefetch_nf4: bool = False,
         verbose: bool = True,
         **kwargs,
@@ -73,8 +78,14 @@ class ModelArch:
             n_layers, tensor_split=tensor_split, device_ids=device_ids,
         )
 
-        # Build prefix (stays on CPU for now)
-        prefix = self.build_prefix(core, **kwargs)
+        # Build prefix (stays on CPU for now).
+        # Pop MoE params from kwargs to avoid duplicate keyword errors
+        # when passed explicitly (kwargs still carries them from subclass).
+        _moe_rl = kwargs.pop("output_router_logits", False)
+        _moe_coef = kwargs.pop("router_aux_loss_coef", 0.0)
+        prefix = self.build_prefix(
+            core, output_router_logits=_moe_rl, **kwargs,
+        )
 
         # Build wrapped layers
         raw_layers = list(core.model.layers)
@@ -101,6 +112,7 @@ class ModelArch:
                 stage_groups = split_layers_by_memory_limit(
                     device_groups[dev],
                     stage_memory_limit_gib,
+                    layer_size_floor_gib=nf4_layer_size_floor_gib,
                 )
                 if stage_memory_limit_gib > 0 and len(stage_groups) > 1:
                     log_event(
@@ -109,45 +121,62 @@ class ModelArch:
                         layers=len(device_groups[dev]),
                         substages=len(stage_groups),
                         limit_gib=stage_memory_limit_gib,
+                        layer_size_floor_gib=nf4_layer_size_floor_gib,
                     )
                 for group in stage_groups:
                     stages.append(DeviceStage(group, device_id=dev))
 
-        # Build postfix (stays on CPU)
-        last_device = stages[-1].device_id if stages else device_ids[0]
-        postfix = self.build_postfix(core, **kwargs)
+        # Build postfix (stays on CPU).
+        postfix = self.build_postfix(
+            core, router_aux_loss_coef=_moe_coef, **kwargs,
+        )
 
         pipeline = StratumPipeline(prefix, stages, postfix, prefetch_nf4=prefetch_nf4)
 
-        # Phase 1: NF4 preparation (quantize frozen 2D weights, drop originals)
+        # Phase 1: Prepare frozen weight streaming.
+        # NF4 mode: quantize frozen 2D weights, drop originals (upload per-step as FP16).
+        # Non-NF4 mode: pin frozen 2D weights on CPU, drop GPU copy (upload per-step as FP16).
+        # Both paths leave param.data = empty(0) for staged weights; Phase 2 uploads only
+        # the non-staged params (trainable LoRA, small norms/biases) permanently to GPU.
         if nf4_scope not in {"all", "layers"}:
             raise ValueError(f"nf4_scope must be 'all' or 'layers', got {nf4_scope!r}")
 
         if use_nf4:
+            nf4_kwargs = dict(cache_dir=nf4_cache_dir, verbose=verbose, min_numel=nf4_min_numel)
             if nf4_scope == "all":
-                prepare_nf4(pipeline.prefix, cache_dir=nf4_cache_dir, verbose=verbose)
+                prepare_nf4(pipeline.prefix, **nf4_kwargs)
             for stage in stages:
-                prepare_nf4(stage, cache_dir=nf4_cache_dir, verbose=verbose)
+                prepare_nf4(stage, **nf4_kwargs)
             if nf4_scope == "all":
-                prepare_nf4(pipeline.postfix, cache_dir=nf4_cache_dir, verbose=verbose)
+                prepare_nf4(pipeline.postfix, **nf4_kwargs)
+        else:
+            fp16_kwargs = dict(verbose=verbose, min_numel=nf4_min_numel)
+            prepare_fp16_staged(pipeline.prefix, **fp16_kwargs)
+            for stage in stages:
+                prepare_fp16_staged(stage, **fp16_kwargs)
+            prepare_fp16_staged(pipeline.postfix, **fp16_kwargs)
 
-        # Phase 2: Upload non-NF4 params (trainable, norms, biases) permanently.
-        # NF4-eligible frozen weights stay on CPU and are streamed per-step
-        # by ensure_weights()/free_weights() in the pipeline.
+        # Phase 2: Upload non-staged params (trainable LoRA, small norms/biases) permanently.
+        # NF4-eligible frozen weights and FP16-staged frozen weights stay on CPU and are
+        # uploaded per-step by ensure_weights()/free_weights() in the pipeline.
+        def _is_staged(param: torch.nn.Parameter) -> bool:
+            return hasattr(param, NF4_ATTR) or hasattr(param, FP16_ATTR)
+
         for name, param in pipeline.prefix.named_parameters():
-            if not hasattr(param, NF4_ATTR):
+            if not _is_staged(param):
                 param.data = param.data.to(f"cuda:{device_ids[0]}", non_blocking=False)
         for dev in set(s.device_id for s in stages):
             for s in stages:
                 if s.device_id != dev:
                     continue
                 for name, param in s.named_parameters():
-                    if not hasattr(param, NF4_ATTR):
+                    if not _is_staged(param):
                         param.data = param.data.to(f"cuda:{dev}", non_blocking=False)
                 for buf in s.buffers():
                     buf.data = buf.data.to(f"cuda:{dev}", non_blocking=False)
+        last_device = stages[-1].device_id if stages else device_ids[0]
         for name, param in pipeline.postfix.named_parameters():
-            if not hasattr(param, NF4_ATTR):
+            if not _is_staged(param):
                 param.data = param.data.to(f"cuda:{last_device}", non_blocking=False)
 
         return pipeline
@@ -175,6 +204,7 @@ def build_pipeline(
     use_nf4: bool = True,
     nf4_cache_dir: Optional[str] = None,
     nf4_scope: str = "all",
+    nf4_min_numel: int = 4096,
     checkpoint_decoder_layer: bool = False,
     loss_token_chunk_size: int = 4096,
     postfix_loss_token_chunk_size: int = 0,
@@ -185,11 +215,14 @@ def build_pipeline(
     mlp_token_chunk_size: int = 0,
     torch_compile_loss: bool = False,
     stage_memory_limit_gib: float = 0.0,
+    nf4_layer_size_floor_gib: float = 0.0,
     prefetch_nf4: bool = False,
-    volta_layers: str = "",
-    volta_window_left: int = -1,
-    volta_window_right: int = 0,
+    flash_layers: str = "",
+    flash_window_left: int = -1,
+    flash_window_right: int = 0,
     dense_attention_masks: bool = False,
+    output_router_logits: bool = False,
+    router_aux_loss_coef: float = 0.0,
 ) -> StratumPipeline:
     """Build a StratumPipeline for a registered model architecture."""
     if model_name not in _registry:
@@ -201,7 +234,9 @@ def build_pipeline(
     return arch.build(
         hf_model, tensor_split=tensor_split, device_ids=device_ids,
         use_nf4=use_nf4, nf4_cache_dir=nf4_cache_dir,
-        nf4_scope=nf4_scope,
+        nf4_scope=nf4_scope, nf4_min_numel=nf4_min_numel,
+        output_router_logits=output_router_logits,
+        router_aux_loss_coef=router_aux_loss_coef,
         checkpoint_decoder_layer=checkpoint_decoder_layer,
         loss_token_chunk_size=loss_token_chunk_size,
         postfix_loss_token_chunk_size=postfix_loss_token_chunk_size,
@@ -212,9 +247,10 @@ def build_pipeline(
         mlp_token_chunk_size=mlp_token_chunk_size,
         torch_compile_loss=torch_compile_loss,
         stage_memory_limit_gib=stage_memory_limit_gib,
+        nf4_layer_size_floor_gib=nf4_layer_size_floor_gib,
         prefetch_nf4=prefetch_nf4,
-        volta_layers=volta_layers,
-        volta_window_left=volta_window_left,
-        volta_window_right=volta_window_right,
+        flash_layers=flash_layers,
+        flash_window_left=flash_window_left,
+        flash_window_right=flash_window_right,
         dense_attention_masks=dense_attention_masks,
     )

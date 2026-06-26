@@ -61,6 +61,7 @@ def main() -> int:
         "bitsandbytes",
         "flash_attn_v100",
         "flash_attn",
+        "fla",
         "causal_conv1d",
         "stratum",
     ):

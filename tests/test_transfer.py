@@ -45,6 +45,16 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(result.tensor.requires_grad)
         self.assertIsNot(result.tensor, tensor)
 
+    def test_async_h2d_cpu_path_can_preserve_autograd(self):
+        tensor = torch.tensor([1.0, 2.0], requires_grad=True)
+        result = async_h2d(tensor, "cpu", preserve_autograd=True)
+
+        result.tensor.sum().backward()
+
+        self.assertTrue(result.tensor.requires_grad)
+        self.assertIsNotNone(result.tensor.grad_fn)
+        self.assertTrue(torch.equal(tensor.grad, torch.tensor([1.0, 1.0])))
+
     def test_async_h2d_cuda_unavailable_is_explicit(self):
         if torch.cuda.is_available():
             self.skipTest("CUDA is available")
@@ -61,6 +71,16 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(tensor.requires_grad)
         self.assertTrue(torch.equal(result.tensor, tensor.detach()))
         self.assertIsNone(result.event)
+
+    def test_async_d2h_cpu_path_can_preserve_autograd(self):
+        tensor = torch.tensor([1.0, 2.0], requires_grad=True)
+        result = async_d2h(tensor, preserve_autograd=True)
+
+        (result.tensor * 2.0).sum().backward()
+
+        self.assertTrue(result.tensor.requires_grad)
+        self.assertIsNotNone(result.tensor.grad_fn)
+        self.assertTrue(torch.equal(tensor.grad, torch.tensor([2.0, 2.0])))
 
     def test_pinned_upload_cpu_autograd(self):
         tensor = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -102,6 +122,34 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(torch.equal(host_tensor, tensor.cpu()))
         self.assertTrue(host_tensor.is_pinned())
         self.assertIsNotNone(result.event)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_async_cuda_preserve_autograd_with_preallocated_buffers(self):
+        source = torch.tensor([1.0, 2.0], device="cuda:0", requires_grad=True)
+        stream = torch.cuda.current_stream(device=source.device)
+        host_out = torch.empty_like(source, device="cpu", pin_memory=True)
+        d2h = async_d2h(
+            source,
+            stream=stream,
+            preserve_autograd=True,
+            out=host_out,
+        )
+        host_tensor = d2h.wait()
+
+        device_out = torch.empty_like(source, device="cuda:0")
+        h2d = async_h2d(
+            host_tensor,
+            "cuda:0",
+            stream=stream,
+            preserve_autograd=True,
+            out=device_out,
+        )
+        device_tensor = h2d.wait()
+        (device_tensor * 3.0).sum().backward()
+
+        self.assertIs(host_tensor, host_out)
+        self.assertIs(device_tensor, device_out)
+        self.assertTrue(torch.equal(source.grad, torch.tensor([3.0, 3.0], device="cuda:0")))
 
 
 if __name__ == "__main__":

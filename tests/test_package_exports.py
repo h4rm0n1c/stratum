@@ -14,9 +14,9 @@ class PackageExportsTest(unittest.TestCase):
     def test_build_pipeline_accepts_train_forwarded_kwargs(self):
         params = inspect.signature(stratum.build_pipeline).parameters
         for name in [
-            "volta_layers",
-            "volta_window_left",
-            "volta_window_right",
+            "flash_layers",
+            "flash_window_left",
+            "flash_window_right",
             "dense_attention_masks",
             "stage_memory_limit_gib",
         ]:
