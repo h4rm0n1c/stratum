@@ -407,6 +407,123 @@ def estimate_module_upload_gib(module: torch.nn.Module) -> float:
 
 
 @torch.no_grad()
+def load_module_fp16_from_checkpoint(
+    module: torch.nn.Module,
+    hf_model_name: str,
+    *,
+    verbose: bool = False,
+) -> bool:
+    """Load FP16 weights for one pipeline *module* from the HF checkpoint.
+
+    Uses ``safetensors.safe_open`` to stream individual tensors — never
+    materialises the full checkpoint into RAM.  The module's meta-device
+    parameters are populated with their trained FP16 values, ready for
+    ``prepare_nf4()`` to quantise.
+
+    Pipeline parameter names (e.g. ``layers.0.layer.self_attn.q_proj.weight``)
+    differ from checkpoint keys (``model.layers.0.self_attn.q_proj.weight``).
+    This function tries the pipeline name and a suffix-matched key.
+
+    Returns ``True`` if every module parameter was loaded, ``False`` on
+    any failure.
+    """
+    import json as _json
+    import re as _re
+    from pathlib import Path as _Path
+    from safetensors import safe_open
+    from transformers.utils.hub import cached_file as _cached_file
+
+    # Find checkpoint files.
+    try:
+        _idx = _cached_file(hf_model_name, "model.safetensors.index.json", cache_dir=None)
+    except OSError:
+        _idx = None
+
+    # Build a list of (pipeline_name, parameter) for params still on meta.
+    _needed: list[tuple[str, torch.nn.Parameter]] = []
+    for _n, _p in module.named_parameters():
+        if _p.device.type != "meta":
+            continue
+        if _p.requires_grad:
+            continue  # LoRA adapter — initialised by PEFT
+        _needed.append((_n, _p))
+
+    if not _needed:
+        return True  # nothing to load
+
+    # Generate candidate checkpoint key for a pipeline param name.
+    def _ckpt_keys(pname: str) -> list[str]:
+        keys = [pname]
+        # Pipeline wrapped layers insert ".layer." before sub-modules.
+        # The checkpoint uses the unwrapped name.
+        stripped = _re.sub(r'\.layer\.(?!layer)', '.', pname)
+        if stripped != pname:
+            keys.append(stripped)
+        # Some models prefix with "model." in the checkpoint.
+        keys.append(f"model.{pname}")
+        keys.append(f"model.{stripped}")
+        return list(dict.fromkeys(keys))  # deduplicate
+
+    if _idx is not None and _Path(_idx).exists():
+        # Sharded checkpoint.
+        _base = _Path(_idx).parent
+        with open(_idx) as _f:
+            _wm = _json.load(_f)["weight_map"]
+        # Group by shard for efficient loading.
+        _shard_reqs: dict[str, list[tuple[str, torch.nn.Parameter]]] = {}
+        for _n, _p in _needed:
+            _found = False
+            for _ck in _ckpt_keys(_n):
+                if _ck in _wm:
+                    _s = _wm[_ck]
+                    _shard_reqs.setdefault(_s, []).append((_ck, _p))
+                    _found = True
+                    break
+            if not _found:
+                if verbose:
+                    print(f"  load_module: no checkpoint key for {_n}", flush=True)
+                return False
+        for _s, _items in _shard_reqs.items():
+            _sp = _base / _s
+            if not _sp.exists():
+                return False
+            with safe_open(str(_sp), framework="pt") as _f:
+                for _ck, _p in _items:
+                    _t = _f.get_tensor(_ck)
+                    try:
+                        _p.data = _t.to("cpu", non_blocking=True)
+                    except (RuntimeError, TypeError):
+                        if verbose:
+                            print(f"  load_module: can't set data for {_ck}", flush=True)
+                        return False
+    else:
+        # Single-file checkpoint.
+        try:
+            _sf = _cached_file(hf_model_name, "model.safetensors", cache_dir=None)
+        except OSError:
+            _sf = None
+        if _sf is None or not _Path(_sf).exists():
+            return False
+        with safe_open(str(_sf), framework="pt") as _f:
+            _all = set(_f.keys())
+            for _n, _p in _needed:
+                _found = False
+                for _ck in _ckpt_keys(_n):
+                    if _ck in _all:
+                        _t = _f.get_tensor(_ck)
+                        try:
+                            _p.data = _t.to("cpu", non_blocking=True)
+                        except (RuntimeError, TypeError):
+                            return False
+                        _found = True
+                        break
+                if not _found:
+                    return False
+
+    return True
+
+
+@torch.no_grad()
 def upload_stream(
     module: torch.nn.Module,
     device_id: int,
@@ -479,6 +596,7 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
     tensors = 0
     dequantize_4bit = None
     QuantState = None
+    _ensure_owner_map = _build_param_owner_map(module)
     for name, param in module.named_parameters():
         fp16_payload = getattr(param, FP16_ATTR, None)
         if fp16_payload is not None:
@@ -511,7 +629,14 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
             # Shared frozen weights can be used by prefix and postfix on
             # different GPUs. Re-materialize from the CPU NF4 payload instead
             # of trying to keep one Parameter's data on two devices.
-            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+            # For meta-device params (from cache fast-path), force CPU.
+            _target_dev = "cpu" if param.device.type == "meta" else param.device
+            _owner, _pname = _ensure_owner_map.get(id(param), (None, None))
+            _replace_param_data(
+                param,
+                torch.empty(0, dtype=param.dtype, device=_target_dev),
+                owner=_owner, pname=_pname,
+            )
         if dequantize_4bit is None or QuantState is None:
             from bitsandbytes.functional import QuantState as _QuantState
             from bitsandbytes.functional import dequantize_4bit as _dequantize_4bit
@@ -526,10 +651,38 @@ def ensure_weights(module: torch.nn.Module, device_id: int) -> int:
             absmax=a_gpu, shape=shape, code=c_gpu,
             blocksize=payload.blocksize, quant_type=payload.quant_type, dtype=dtype,
         )
-        param.data = dequantize_4bit(q_gpu, q_state).contiguous()
+        _owner2, _pname2 = _ensure_owner_map.get(id(param), (None, None))
+        _replace_param_data(
+            param,
+            dequantize_4bit(q_gpu, q_state).contiguous(),
+            owner=_owner2, pname=_pname2,
+        )
         tensors += 1
     for buf in module.buffers():
-        if buf.data.device != device:
+        _buf_replaced = False
+        if buf.device.type == "meta":
+            # Meta buffer — materialize a CPU buffer of the same shape.
+            try:
+                buf.data = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
+            except (RuntimeError, TypeError):
+                # Direct .data replacement blocked — find the owner module
+                # and replace via register_buffer.
+                for _m_name, _submod in module.named_modules():
+                    for _b_name, _b in _submod.named_buffers(recurse=False):
+                        if _b is buf:
+                            new_b = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
+                            _submod.register_buffer(_b_name, new_b)
+                            buf = new_b
+                            _buf_replaced = True
+                            break
+                    else:
+                        continue
+                    break
+        if _buf_replaced:
+            # Already on CPU from register_buffer above.
+            buf.data = buf.data.to(device, non_blocking=True)
+            tensors += 1
+        elif buf.data.device != device:
             buf.data = buf.data.to(device, non_blocking=True)
             tensors += 1
     return tensors
@@ -617,3 +770,264 @@ def free_weights(module: torch.nn.Module) -> int:
         param.data = torch.empty(0, dtype=param.dtype, device=param.device)
         tensors += 1
     return tensors
+
+
+@torch.no_grad()
+def prepare_nf4_from_cache(
+    module: torch.nn.Module,
+    cache_dir: str | Path | None,
+    *,
+    min_numel: int = 4096,
+    blocksize: int = 64,
+    quant_type: str = "nf4",
+    verbose: bool = True,
+) -> NF4Stats | None:
+    """Load NF4 payloads from cache for all qualifying parameters in *module*.
+
+    Unlike ``prepare_nf4()``, this does NOT require the original FP16 weight
+    data — it works on meta-device parameters (shape/dtype metadata only).
+    This allows loading a model directly into NF4 format without ever
+    materialising the FP16 weights, saving ~2x model size in host RAM.
+
+    Returns ``NF4Stats`` if every qualifying parameter had a cache hit.
+    Returns ``None`` on any cache miss — the caller should fall back to
+    the normal FP16 load + ``prepare_nf4()`` path.
+
+    Parameters are left with ``data = empty(0)`` on CPU after a payload is
+    attached, matching the contract of ``prepare_nf4()``.
+    """
+    if cache_dir is None:
+        return None
+
+    cache_root = Path(cache_dir)
+    stats = NF4Stats()
+    _owner_map = _build_param_owner_map(module)
+
+    for name, param in module.named_parameters():
+        if param.requires_grad:
+            continue
+        if param.ndim < 2:
+            continue
+        if param.numel() < min_numel:
+            continue
+        if param.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            continue
+        if hasattr(param, NF4_ATTR):
+            payload = cast(NF4Payload, getattr(param, NF4_ATTR))
+            stats.tensors += 1
+            stats.source_bytes += payload.source_bytes
+            stats.payload_bytes += payload.payload_bytes
+            continue
+
+        cache_path = _cache_path(cache_root, name)
+        payload = _load_payload_from_cache(
+            cache_path, param, blocksize=blocksize, quant_type=quant_type,
+        )
+        if payload is None:
+            if verbose:
+                print(f"  nf4 cache miss: {name} — requires FP16 load", flush=True)
+            return None  # caller must fall back
+
+        stats.cache_hits += 1
+        setattr(param, NF4_ATTR, payload)
+        # Move param from meta to CPU with empty data so downstream
+        # ensure_weights() can set gpu-dequantized tensor data.
+        _owner, _pname = _owner_map.get(id(param), (None, None))
+        _replace_param_data(
+            param,
+            torch.empty(0, dtype=payload.dtype, device="cpu"),
+            owner=_owner, pname=_pname,
+        )
+        stats.tensors += 1
+        stats.source_bytes += payload.source_bytes
+        stats.payload_bytes += payload.payload_bytes
+
+    if verbose:
+        print(f"  nf4 from cache: {stats.tensors} tensors, "
+              f"{stats.source_bytes/1024**3:.2f} GiB source -> "
+              f"{stats.payload_bytes/1024**3:.2f} GiB payload "
+              f"(cache hits={stats.cache_hits})",
+              flush=True)
+    return stats
+
+
+def _replace_param_data(
+    param: torch.nn.Parameter,
+    new_data: torch.Tensor,
+    owner: torch.nn.Module | None = None,
+    pname: str | None = None,
+) -> None:
+    """Set *param*'s data to *new_data*, handling custom Parameter subclasses.
+
+    Standard ``torch.nn.Parameter`` instances accept ``param.data = tensor``.
+    Custom subclasses (PEFT LoRA, bitsandbytes quantized, etc.) may reject
+    direct ``.data`` assignment.  When *owner* and *pname* are provided the
+    param is replaced in the parent module's ``_parameters`` OrderdDict,
+    which works for all parameter types.
+    """
+    try:
+        param.data = new_data
+        return
+    except (RuntimeError, TypeError):
+        pass
+    if owner is not None and pname is not None:
+        new_param = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+        owner.register_parameter(pname, new_param)
+
+
+def _build_param_owner_map(
+    module: torch.nn.Module,
+) -> dict[int, tuple[torch.nn.Module, str]]:
+    """Build a dict mapping parameter ids to ``(owner_module, param_name)``."""
+    pmap: dict[int, tuple[torch.nn.Module, str]] = {}
+    for _m_name, _submodule in module.named_modules():
+        for _p_name, _p in _submodule.named_parameters(recurse=False):
+            pmap[id(_p)] = (_submodule, _p_name)
+    return pmap
+
+
+@torch.no_grad()
+def populate_from_hf_checkpoint(
+    model: torch.nn.Module,
+    hf_model_name: str,
+    nf4_cache_dir: str | Path | None = None,
+    *,
+    min_numel: int = 4096,
+    verbose: bool = True,
+) -> bool:
+    """Populate a meta-device model from NF4 cache + HF checkpoint.
+
+    For NF4-eligible frozen parameters (2D, numel >= min_numel):
+    load pre-computed NF4 payloads from ``nf4_cache_dir``.
+
+    For non-NF4 parameters (norms, biases): stream their values from
+    the HF checkpoint files using ``safetensors.safe_open`` so only
+    the individual tensor (a few KB) is loaded into memory, not the
+    full shard.
+
+    For trainable parameters (LoRA adapters): left as-is — they were
+    initialised on CPU by ``get_peft_model``.
+
+    Returns ``True`` on success.  Returns ``False`` if any NF4 cache
+    entry is missing or the HF checkpoint cannot be read — caller
+    should fall back to the normal FP16 load path.
+    """
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+    from transformers.utils.hub import cached_file
+
+    # 1. Determine which frozen params are NF4-eligible (will come from
+    #    cache) and which need HF checkpoint data (norms, biases).
+    non_nf4_params: dict[str, torch.nn.Parameter] = {}
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            continue  # LoRA adapter — already on CPU
+        if param.ndim >= 2 and param.numel() >= min_numel and param.dtype in (
+            torch.float16, torch.bfloat16, torch.float32,
+        ):
+            continue  # NF4-eligible — handled by cache below
+        # Small 1D param (norm, bias) — needs HF checkpoint data
+        # Skip if already populated (e.g. LoRA was placed on CPU)
+        if param.device.type != "meta":
+            continue
+        non_nf4_params[name] = param
+
+    # 2. Load NF4 payloads from cache.
+    if nf4_cache_dir is not None:
+        result = prepare_nf4_from_cache(
+            model, nf4_cache_dir,
+            min_numel=min_numel,
+            verbose=verbose,
+        )
+        if result is None:
+            if verbose:
+                print("  populate: NF4 cache miss — falling back to FP16 load",
+                      flush=True)
+            return False
+
+    # 3. Load non-NF4 params from HF checkpoint (streaming, one tensor
+    #    at a time — never loads a full shard into memory).
+    if non_nf4_params:
+        if verbose:
+            print(f"  populate: loading {len(non_nf4_params)} non-NF4 params "
+                  f"from HF checkpoint", flush=True)
+
+        # Find the local checkpoint directory and its weight index.
+        try:
+            # cached_file returns the local path of the index file.
+            index_path = cached_file(
+                hf_model_name, "model.safetensors.index.json",
+                cache_dir=None,
+            )
+        except OSError:
+            index_path = None
+
+        if index_path is not None and Path(index_path).exists():
+            # Sharded checkpoint.
+            base_dir = Path(index_path).parent
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            # Group requested keys by shard file.
+            shard_keys: dict[str, list[str]] = {}
+            for pname in non_nf4_params:
+                if pname in weight_map:
+                    shard = weight_map[pname]
+                    shard_keys.setdefault(shard, []).append(pname)
+            for shard_file, keys in shard_keys.items():
+                shard_path = base_dir / shard_file
+                if not shard_path.exists():
+                    if verbose:
+                        print(f"  populate: shard not found: {shard_path}",
+                              flush=True)
+                    return False
+                with safe_open(str(shard_path), framework="pt") as f:
+                    for key in keys:
+                        tensor = f.get_tensor(key)
+                        non_nf4_params[key].data = tensor.to(
+                            "cpu", non_blocking=True,
+                        )
+        else:
+            # Single safetensors file.
+            try:
+                single_path = cached_file(
+                    hf_model_name, "model.safetensors",
+                    cache_dir=None,
+                )
+            except OSError:
+                single_path = None
+            if single_path is not None and Path(single_path).exists():
+                with safe_open(str(single_path), framework="pt") as f:
+                    keys_in_file = set(f.keys())
+                    for pname, param in non_nf4_params.items():
+                        if pname not in keys_in_file:
+                            if verbose:
+                                print(f"  populate: key {pname} not in "
+                                      f"checkpoint", flush=True)
+                            return False
+                        tensor = f.get_tensor(pname)
+                        param.data = tensor.to("cpu", non_blocking=True)
+            else:
+                if verbose:
+                    print("  populate: no checkpoint files found", flush=True)
+                return False
+
+    if verbose:
+        # Log total RSS impact (approximate).
+        nf4_bytes = sum(
+            getattr(p, NF4_ATTR).payload_bytes
+            for p in model.parameters()
+            if hasattr(p, NF4_ATTR)
+        )
+        small_bytes = sum(
+            p.numel() * p.element_size()
+            for p in model.parameters()
+            if not hasattr(p, NF4_ATTR) and p.device.type != "meta"
+        )
+        print(f"  populate: loaded {nf4_bytes/1024**3:.2f} GiB NF4 + "
+              f"{small_bytes/1024**3:.3f} GiB small params from cache+checkpoint",
+              flush=True)
+
+    return True

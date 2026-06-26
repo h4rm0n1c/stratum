@@ -143,18 +143,71 @@ class ModelArch:
 
         if use_nf4:
             nf4_kwargs = dict(cache_dir=nf4_cache_dir, verbose=verbose, min_numel=nf4_min_numel)
+            nf4_modules = []
             if nf4_scope == "all":
-                prepare_nf4(pipeline.prefix, **nf4_kwargs)
-            for stage in stages:
-                prepare_nf4(stage, **nf4_kwargs)
+                nf4_modules.append(pipeline.prefix)
+            nf4_modules.extend(stages)
             if nf4_scope == "all":
-                prepare_nf4(pipeline.postfix, **nf4_kwargs)
+                nf4_modules.append(pipeline.postfix)
+
+            # Try cache-only fast path first.  When every qualifying param
+            # has a cached NF4 payload we skip ``quantize_4bit()`` entirely
+            # and just load the pre-computed payloads from disk.
+            _need_fallback = True
+            if nf4_cache_dir is not None:
+                from stratum.upload import prepare_nf4_from_cache
+                _all_cached = True
+                for _mod in nf4_modules:
+                    if prepare_nf4_from_cache(_mod, nf4_cache_dir, verbose=False) is None:
+                        _all_cached = False
+                        break
+                if _all_cached:
+                    _need_fallback = False
+                    if verbose:
+                        print("  nf4: all payloads loaded from cache", flush=True)
+
+            if _need_fallback:
+                # Check whether the model was loaded on meta (staged load)
+                # or on CPU (normal FP16 load — params already populated).
+                _first_param = next(iter(pipeline.prefix.parameters()), None)
+                _is_meta = _first_param is not None and _first_param.device.type == "meta"
+
+                if _is_meta:
+                    # Staged FP16 load: for each module, load only its
+                    # weights from the HF checkpoint (streaming via
+                    # safe_open), quantize to NF4, and free the FP16 data
+                    # before loading the next module.  Peak RSS stays at
+                    # ~max module size rather than the full model.
+                    from stratum.upload import (
+                        load_module_fp16_from_checkpoint,
+                        release_cached_memory as _rcm,
+                    )
+                    _hf_name = getattr(model, "name_or_path", None) or "LiquidAI/LFM2.5-8B-A1B"
+                    for idx, _mod in enumerate(nf4_modules):
+                        ok = load_module_fp16_from_checkpoint(_mod, _hf_name, verbose=verbose)
+                        if not ok:
+                            raise RuntimeError(f"staged FP16 load failed for module {idx}")
+                        prepare_nf4(_mod, **nf4_kwargs)
+                        _rcm(verbose=False)
+                    if verbose:
+                        print("  staged FP16 load: all modules processed", flush=True)
+                else:
+                    # Normal path: params already on CPU, just quantize.
+                    for _mod in nf4_modules:
+                        prepare_nf4(_mod, **nf4_kwargs)
         else:
             fp16_kwargs = dict(verbose=verbose, min_numel=nf4_min_numel)
             prepare_fp16_staged(pipeline.prefix, **fp16_kwargs)
             for stage in stages:
                 prepare_fp16_staged(stage, **fp16_kwargs)
             prepare_fp16_staged(pipeline.postfix, **fp16_kwargs)
+
+        # After NF4/FP16 prep the original FP16 model weights are freed
+        # (param.data = empty(0)).  Force the allocator to release the
+        # cached pages back to the OS so RSS reflects our actual memory
+        # footprint, not stale heap pages.
+        from stratum.utils import release_cached_memory
+        release_cached_memory(verbose=verbose)
 
         # Phase 2: Upload non-staged params (trainable LoRA, small norms/biases) permanently.
         # NF4-eligible frozen weights and FP16-staged frozen weights stay on CPU and are
@@ -163,20 +216,21 @@ class ModelArch:
             return hasattr(param, NF4_ATTR) or hasattr(param, FP16_ATTR)
 
         for name, param in pipeline.prefix.named_parameters():
-            if not _is_staged(param):
+            if not _is_staged(param) and param.device.type != "meta":
                 param.data = param.data.to(f"cuda:{device_ids[0]}", non_blocking=False)
         for dev in set(s.device_id for s in stages):
             for s in stages:
                 if s.device_id != dev:
                     continue
                 for name, param in s.named_parameters():
-                    if not _is_staged(param):
+                    if not _is_staged(param) and param.device.type != "meta":
                         param.data = param.data.to(f"cuda:{dev}", non_blocking=False)
                 for buf in s.buffers():
-                    buf.data = buf.data.to(f"cuda:{dev}", non_blocking=False)
+                    if buf.device.type != "meta":
+                        buf.data = buf.data.to(f"cuda:{dev}", non_blocking=False)
         last_device = stages[-1].device_id if stages else device_ids[0]
         for name, param in pipeline.postfix.named_parameters():
-            if not _is_staged(param):
+            if not _is_staged(param) and param.device.type != "meta":
                 param.data = param.data.to(f"cuda:{last_device}", non_blocking=False)
 
         return pipeline

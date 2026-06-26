@@ -173,6 +173,10 @@ def main():
     ap.add_argument("--pytree-batch", action="store_true",
                     help="Use pytree-based batch splitting (supports arbitrary input shapes, "
                          "mirrors RoundPipe's guess_split_spec). Default uses fixed-tensor path.")
+    ap.add_argument("--packing", action="store_true",
+                    help="Enable sample packing (padding-free training). Concatenates variable-length "
+                         "samples into a single 1D sequence with per-segment position IDs, eliminating "
+                         "wasted compute on padding tokens. Requires flash attention.")
     ap.add_argument("--no-nf4", action="store_true",
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
     ap.add_argument("--nf4-scope", default="all", choices=["all", "layers"],
@@ -297,6 +301,10 @@ def main():
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
     if args.stratum_stage_memory_limit_gib < 0:
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
+
+    def _safe_cache_component(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "model"
+
     # Detect devices
     devices = get_device_info()
     if not devices:
@@ -320,11 +328,15 @@ def main():
         device_ids = args.device_ids or list(range(n_gpu))
         tensor_split = get_optimal_tensor_split(device_ids)[:n_devices]
 
+    # NF4 cache directory
+    nf4_cache_dir = None
+    if not args.no_nf4 and args.nf4_cache_dir:
+        nf4_cache_dir = str(Path(args.nf4_cache_dir) / _safe_cache_component(args.hf_model))
+        print({"nf4_cache_dir": nf4_cache_dir}, flush=True)
+
     # Load base model
     mark_phase("before_model_load")
     print(f"Loading model {args.hf_model}...", flush=True)
-    # Map Stratum flash mode to eager HF loading, then patch full-attention
-    # layers with capability-dispatched flash kernels.
     hf_attn_impl = "eager" if args.attn_implementation == "flash" else args.attn_implementation
     hf_model = AutoModelForCausalLM.from_pretrained(
         args.hf_model,
@@ -335,7 +347,6 @@ def main():
         attn_implementation=hf_attn_impl,
     )
     hf_model.config.use_cache = False
-    # Record effective attn implementation
     hf_model.config._attn_implementation = hf_attn_impl
     print({"attn_implementation": args.attn_implementation,
            "hf_attn_implementation": hf_attn_impl}, flush=True)
@@ -343,36 +354,23 @@ def main():
 
     # Apply LoRA
     def _lora_target_modules(target_set: str) -> list[str]:
-        attention_input = [
-            "q_proj", "k_proj", "v_proj",
-            "in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z",
-            "qkv",
-        ]
+        attention_input = ["q_proj", "k_proj", "v_proj",
+                           "in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "qkv"]
         attention_output = ["o_proj", "out_proj"]
         mlp = ["gate_proj", "up_proj", "down_proj", "linear_fc1", "linear_fc2"]
         broad = ["proj"]
-        if target_set == "attention_input":
-            return attention_input
-        if target_set == "attention":
-            return attention_input + attention_output
-        if target_set == "mlp":
-            return mlp
+        if target_set == "attention_input": return attention_input
+        if target_set == "attention": return attention_input + attention_output
+        if target_set == "mlp": return mlp
         return attention_input + attention_output + mlp + broad
 
-    target_modules = _lora_target_modules(args.lora_target_set)
     lora_cfg = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=16,
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=target_modules,
+        r=args.lora_r, lora_alpha=16, lora_dropout=0.0,
+        bias="none", task_type="CAUSAL_LM",
+        target_modules=_lora_target_modules(args.lora_target_set),
     )
     hf_model = get_peft_model(hf_model, lora_cfg)
     hf_model.print_trainable_parameters()
-
-    def _safe_cache_component(value: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "model"
 
     # Operator telemetry hooks (on base model before extraction)
     if args.operator_telemetry_layers:
@@ -388,10 +386,6 @@ def main():
 
     # Build stratified pipeline
     print("Building Stratum pipeline...", flush=True)
-    nf4_cache_dir = None
-    if not args.no_nf4 and args.nf4_cache_dir:
-        nf4_cache_dir = str(Path(args.nf4_cache_dir) / _safe_cache_component(args.hf_model))
-        print({"nf4_cache_dir": nf4_cache_dir}, flush=True)
     if args.nf4_layer_size_floor_gib > 0:
         print({"nf4_layer_size_floor_gib": args.nf4_layer_size_floor_gib}, flush=True)
     pipeline = build_pipeline(
@@ -421,6 +415,15 @@ def main():
         output_router_logits=args.output_router_logits,
         router_aux_loss_coef=args.router_aux_loss_coef,
     )
+
+    # The pipeline's prefix/stages/postfix reference the core model
+    # parameters directly. The original hf_model (PEFT wrapper) is no
+    # longer needed — drop it so any HF loading buffers can be reclaimed.
+    from stratum.utils import release_cached_memory
+    del hf_model
+    release_cached_memory(verbose=True)
+    mark_memory_phase("after_pipeline_build", args.host_ram_limit_gib)
+
     timing_recorder = TimingRecorder(args.timing_jsonl, enabled=bool(args.timing_jsonl))
     pipeline.set_timing_recorder(timing_recorder if args.timing_jsonl else None)
 
@@ -497,9 +500,17 @@ def main():
     # Load dataset
     ds = PretokJsonlDataset(args.data, max_seq_len=args.max_seq_len, shuffle=True,
                             longest_first=args.longest_first)
-    def collate(batch):
-        return collate_one(batch, pad_to_multiple=args.pad_to_multiple,
-                           pad_to_length=args.pad_to_length)
+
+    if args.packing:
+        from stratum.packing import pack_collate
+        def collate(batch):
+            return pack_collate(batch, max_seq_len=args.max_seq_len)
+        print({"packing": True, "max_seq_len": args.max_seq_len}, flush=True)
+    else:
+        def collate(batch):
+            return collate_one(batch, pad_to_multiple=args.pad_to_multiple,
+                               pad_to_length=args.pad_to_length)
+
     dl = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,
         collate_fn=collate, num_workers=0,
@@ -554,9 +565,19 @@ def main():
             finish_optimizer_step()
             pending_async_optimizer_step = False
 
-        input_ids = batch["input_ids"].cuda(input_device)
-        attention_mask = batch["attention_mask"].cuda(input_device)
-        labels = batch["labels"].cuda(input_device)
+        if args.packing:
+            input_ids = batch["input_ids"].cuda(input_device)
+            labels = batch["labels"].cuda(input_device)
+            cu_seqlens = batch["cu_seqlens"].cuda(input_device)
+            position_ids = batch["position_ids"].cuda(input_device)
+            max_seqlen = batch["max_seqlen"]
+            packed_n_samples = batch.get("n_samples", 1)
+            attention_mask = {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
+        else:
+            input_ids = batch["input_ids"].cuda(input_device)
+            attention_mask = batch["attention_mask"].cuda(input_device)
+            labels = batch["labels"].cuda(input_device)
+            position_ids = None
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -570,7 +591,33 @@ def main():
         loss = None
         try:
             if nmb > 1:
-                if args.pytree_batch:
+                if args.packing:
+                    from stratum.packing import split_packed_batch
+                    from stratum.batch import TokenWeightedReducer
+                    packed_gpu = {
+                        "input_ids": input_ids,
+                        "labels": labels,
+                        "cu_seqlens": attention_mask["cu_seqlens"],
+                        "position_ids": position_ids,
+                        "max_seqlen": attention_mask["max_seqlen"],
+                        "n_samples": packed_n_samples,
+                    }
+                    mbs = split_packed_batch(packed_gpu, num_microbatch=nmb)
+                    total_trainable = sum(mb["trainable_tokens"] for mb in mbs)
+                    reducer = TokenWeightedReducer()
+                    for mb in mbs:
+                        attn_mask = {"cu_seqlens": mb["cu_seqlens"], "max_seqlen": mb["max_seqlen"]}
+                        mb_out = pipeline(
+                            mb["input_ids"], attention_mask=attn_mask,
+                            labels=mb["labels"], position_ids=mb["position_ids"],
+                        )
+                        scale = microbatch_loss_scale(mb["trainable_tokens"], total_trainable, len(mbs))
+                        scaled_loss = scaler.scale(mb_out.loss * scale)
+                        with compute_stream_context_for(scaled_loss):
+                            scaled_loss.backward()
+                        reducer.accumulate(mb_out.loss.detach(), mb["trainable_tokens"])
+                    loss = reducer.reduce()
+                elif args.pytree_batch:
                     # Pytree path: split kwargs dict, supports arbitrary input shapes.
                     from stratum.batch import split_kwargs_pytree, TokenWeightedReducer
                     batch_kwargs = {
@@ -625,7 +672,12 @@ def main():
                         trainable_counts.append(mb.trainable_tokens)
                     loss = reduce_microbatch_losses(detached_losses, trainable_counts)
             else:
-                output = pipeline(input_ids, attention_mask=attention_mask, labels=labels)
+                output = pipeline(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    position_ids=position_ids,
+                )
                 scaled_loss = scaler.scale(output.loss)
                 with compute_stream_context_for(scaled_loss):
                     scaled_loss.backward()

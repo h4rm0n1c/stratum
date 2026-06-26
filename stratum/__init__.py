@@ -47,7 +47,7 @@ from stratum.transfer import (
     async_h2d,
 )
 from stratum.model.registry import build_pipeline
-from stratum.upload import prepare_nf4, prepare_fp16_staged, upload_stream, NF4Stats, estimate_module_upload_gib
+from stratum.upload import prepare_nf4, prepare_nf4_from_cache, prepare_fp16_staged, upload_stream, NF4Stats, estimate_module_upload_gib
 from stratum.upload import NF4Prefetch, ensure_prefetched_weights, prefetch_weights
 from stratum.upload import FP16_ATTR, FP16StagedPayload
 from stratum.nf4_linear import NF4Linear
@@ -159,6 +159,7 @@ __all__ = [
     "async_h2d",
     "build_pipeline",
     "prepare_nf4",
+    "prepare_nf4_from_cache",
     "prepare_fp16_staged",
     "FP16_ATTR",
     "FP16StagedPayload",

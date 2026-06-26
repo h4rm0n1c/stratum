@@ -87,6 +87,28 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
                 return None
         return None
 
+    def _select_varlen_flash_backend(self, device: torch.device) -> _FlashBackend | None:
+        """Pick the varlen flash attention backend for the current GPU."""
+        if device.type != "cuda":
+            return None
+        try:
+            sm = torch.cuda.get_device_capability(device)
+        except RuntimeError:
+            return None
+        if sm[0] == 7 and sm[1] == 0:
+            try:
+                from flash_attn_v100 import flash_attn_varlen_func as fn
+                return _FlashBackend("flash_attn_v100_varlen", fn)
+            except ImportError:
+                return None
+        if sm[0] >= 8:
+            try:
+                from flash_attn import flash_attn_varlen_func as fn
+                return _FlashBackend("flash_attn_varlen", fn)
+            except ImportError:
+                return None
+        return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -100,6 +122,63 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
         if kwargs.get("output_attentions", False):
             raise ValueError("Lfm25FlashAttention does not return attention weights")
 
+        # Detect packed mode: attention_mask is a dict with cu_seqlens.
+        _is_packed = (
+            isinstance(attention_mask, dict)
+            and "cu_seqlens" in attention_mask
+        )
+
+        if _is_packed:
+            # Packed path: hidden_states is (total_tokens, hidden).
+            # flash_attn_varlen_func expects (total_tokens, heads, head_dim).
+            cos, sin = position_embeddings
+            cu_seqlens = attention_mask["cu_seqlens"]
+            max_seqlen = attention_mask["max_seqlen"]
+            n_tot = hidden_states.shape[0]
+
+            q = self.q_layernorm(
+                self.q_proj(hidden_states).view(n_tot, -1, self.head_dim)
+            )
+            k = self.k_layernorm(
+                self.k_proj(hidden_states).view(n_tot, -1, self.head_dim)
+            )
+            v = self.v_proj(hidden_states).view(n_tot, -1, self.head_dim)
+
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+            # GQA: repeat k/v heads to match q heads
+            if self.num_key_value_groups > 1:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+
+            varlen_backend = self._select_varlen_flash_backend(hidden_states.device)
+            if varlen_backend is None:
+                raise RuntimeError(
+                    f"no varlen flash-attention backend for LFM2.5 layer "
+                    f"{self.layer_idx} on {hidden_states.device}"
+                )
+
+            try:
+                attn_output = varlen_backend.fn(
+                    q, k, v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=0.0,
+                    softmax_scale=self.scaling,
+                    causal=True,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{varlen_backend.name} failed for LFM2.5 layer {self.layer_idx}; "
+                    "not falling back to quadratic eager attention"
+                ) from exc
+
+            attn_output = self.out_proj(attn_output)
+            return attn_output, None
+
+        # Standard batched path below.
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -227,40 +306,62 @@ class LFM25ForCausalLMPrefix(nn.Module):
 
         use_cache = False
         past_key_values = None
-        if cache_position is None:
-            cache_position = torch.arange(
-                0, inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
 
-        if not isinstance(attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
+        # Detect packed mode: attention_mask is a dict with cu_seqlens.
+        _is_packed = (
+            isinstance(attention_mask, dict)
+            and "cu_seqlens" in attention_mask
+        )
+
+        if _is_packed:
+            # Packed path: position_ids come from the collation function.
+            if position_ids is None:
+                raise ValueError(
+                    "packed training requires position_ids to be provided "
+                    "(per-segment positions that reset at boundaries)"
+                )
+            # HF RoPE expects 2D (1, seq). Unsqueeze packed 1D positions.
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            causal_mask_mapping = {
+                "cu_seqlens": attention_mask["cu_seqlens"],
+                "max_seqlen": attention_mask["max_seqlen"],
             }
-            if self.dense_attention_masks:
-                causal_mask_mapping = {
-                    "full_attention": _compat_mask_call(create_causal_mask, mask_kwargs),
-                    "linear_attention": attention_mask,
-                }
-                if self.has_sliding_layers:
-                    causal_mask_mapping["sliding_attention"] = _compat_mask_call(
-                        create_sliding_window_causal_mask,
-                        mask_kwargs,
-                    )
-            else:
-                # Long-context flash mode relies on kernel-native causal handling.
-                causal_mask_mapping = {
-                    "full_attention": None,
-                    "linear_attention": attention_mask,
-                }
         else:
-            causal_mask_mapping = attention_mask
+            if cache_position is None:
+                cache_position = torch.arange(
+                    0, inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+            if not isinstance(attention_mask, dict):
+                mask_kwargs = {
+                    "config": self.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "cache_position": cache_position,
+                    "past_key_values": past_key_values,
+                    "position_ids": position_ids,
+                }
+                if self.dense_attention_masks:
+                    causal_mask_mapping = {
+                        "full_attention": _compat_mask_call(create_causal_mask, mask_kwargs),
+                        "linear_attention": attention_mask,
+                    }
+                    if self.has_sliding_layers:
+                        causal_mask_mapping["sliding_attention"] = _compat_mask_call(
+                            create_sliding_window_causal_mask,
+                            mask_kwargs,
+                        )
+                else:
+                    # Long-context flash mode relies on kernel-native causal handling.
+                    causal_mask_mapping = {
+                        "full_attention": None,
+                        "linear_attention": attention_mask,
+                    }
+            else:
+                causal_mask_mapping = attention_mask
 
         hidden_states = inputs_embeds
         if self.pos_emb is None:

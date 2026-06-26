@@ -84,6 +84,28 @@ class Qwen35FlashAttention(Qwen3_5Attention):
 
         return None
 
+    def _select_varlen_flash_backend(self, device: torch.device) -> _FlashBackend | None:
+        """Pick the varlen flash attention backend for the current GPU."""
+        if device.type != "cuda":
+            return None
+        try:
+            sm = torch.cuda.get_device_capability(device)
+        except RuntimeError:
+            return None
+        if sm[0] == 7 and sm[1] == 0:
+            try:
+                from flash_attn_v100 import flash_attn_varlen_func as fn
+                return _FlashBackend("flash_attn_v100_varlen", fn)
+            except ImportError:
+                return None
+        if sm[0] >= 8:
+            try:
+                from flash_attn import flash_attn_varlen_func as fn
+                return _FlashBackend("flash_attn_varlen", fn)
+            except ImportError:
+                return None
+        return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -99,6 +121,62 @@ class Qwen35FlashAttention(Qwen3_5Attention):
 
         flash_backend = self._select_flash_backend(hidden_states.device)
 
+        # Detect packed mode: attention_mask is a dict with cu_seqlens.
+        _is_packed = (
+            isinstance(attention_mask, dict)
+            and "cu_seqlens" in attention_mask
+        )
+
+        if _is_packed:
+            # Packed path: hidden_states is (total_tokens, hidden).
+            cos, sin = position_embeddings
+            cu_seqlens = attention_mask["cu_seqlens"]
+            max_seqlen = attention_mask["max_seqlen"]
+            n_tot = hidden_states.shape[0]
+
+            # QKV with gate for packed mode (no batch/seq transposes).
+            qg = self.q_proj(hidden_states).view(n_tot, -1, self.head_dim * 2)
+            query_states, gate = torch.chunk(qg, 2, dim=-1)
+            gate = gate.reshape(n_tot, -1)
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(
+                self.k_proj(hidden_states).view(n_tot, -1, self.head_dim)
+            )
+            value_states = self.v_proj(hidden_states).view(n_tot, -1, self.head_dim)
+
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            varlen_backend = self._select_varlen_flash_backend(hidden_states.device)
+            if varlen_backend is None:
+                raise RuntimeError(
+                    f"no varlen flash-attention backend for Qwen3.5 layer "
+                    f"{self.layer_idx} on {hidden_states.device}"
+                )
+
+            try:
+                flash_kwargs = dict(
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=0.0,
+                    softmax_scale=self.scaling,
+                    causal=True,
+                )
+                if self.window_size is not None:
+                    flash_kwargs["window_size"] = self.window_size
+                attn_output = varlen_backend.fn(query_states, key_states, value_states, **flash_kwargs)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{varlen_backend.name} failed for Qwen3.5 layer {self.layer_idx}; "
+                    "not falling back to quadratic eager attention"
+                ) from exc
+
+            attn_output = attn_output * torch.sigmoid(gate)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None
+
+        # Standard batched path below.
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -211,9 +289,29 @@ class Qwen35ForCausalLMPrefix(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        batch, seq_len = input_ids.shape if inputs_embeds is None else inputs_embeds.shape[:2]
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, device=input_ids.device if input_ids is not None else inputs_embeds.device).unsqueeze(0)
+        # Detect packed mode before shape unpacking — input_ids is 1D.
+        _is_packed = (
+            isinstance(attention_mask, dict)
+            and "cu_seqlens" in attention_mask
+        )
+
+        if _is_packed:
+            # Packed path: position_ids are provided by the collation function.
+            if position_ids is None:
+                raise ValueError(
+                    "packed training requires position_ids to be provided "
+                    "(per-segment positions that reset at boundaries)"
+                )
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            causal_mask_mapping = {
+                "cu_seqlens": attention_mask["cu_seqlens"],
+                "max_seqlen": attention_mask["max_seqlen"],
+            }
+        else:
+            batch, seq_len = input_ids.shape if inputs_embeds is None else inputs_embeds.shape[:2]
+            if position_ids is None:
+                position_ids = torch.arange(seq_len, device=input_ids.device if input_ids is not None else inputs_embeds.device).unsqueeze(0)
 
         if not isinstance(attention_mask, dict):
             cache_position = torch.arange(seq_len, device=inputs_embeds.device)

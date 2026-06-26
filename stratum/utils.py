@@ -1,6 +1,9 @@
 """Device detection, memory probes, and logging utilities."""
 
+import ctypes
+import gc
 import logging
+import os
 import sys
 
 import torch
@@ -102,3 +105,43 @@ def get_optimal_tensor_split(
         return [1.0 / len(device_ids)] * len(device_ids)
 
     return [f / total_free for f in free]
+
+
+def host_rss_gib() -> float:
+    """Return the current process RSS in GiB."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024**2
+    except (OSError, IndexError, ValueError):
+        return 0.0
+    return 0.0
+
+
+def release_cached_memory(*, verbose: bool = False) -> None:
+    """Force release of cached heap memory back to the OS.
+
+    Calls ``gc.collect()`` to reap Python-level garbage and
+    ``malloc_trim(0)`` to release glibc free pages.  This is safe
+    to call after ``prepare_nf4()`` frees the FP16 model weights;
+    without it, freed pages stay in RSS because the allocator caches
+    them for reuse.
+
+    Does nothing on non-glibc platforms (Windows, macOS, musl).
+    """
+    before = host_rss_gib()
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # not glibc
+    after = host_rss_gib()
+    if verbose:
+        print({
+            "event": "release_cached_memory",
+            "rss_before_gib": round(before, 2),
+            "rss_after_gib": round(after, 2),
+            "freed_gib": round(before - after, 2),
+        }, flush=True)
