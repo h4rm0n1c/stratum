@@ -852,7 +852,7 @@ Default checkpoints are LoRA/QLoRA-style and portable:
 checkpoint-5000/
 ├── adapter_model.safetensors     ← PEFT-compatible LoRA weights (portable)
 ├── adapter_config.json            ← PEFT adapter config
-├── optimizer_state.pt             ← opt-in: Adam moments keyed by param name
+├── optimizer_state.safetensors    ← opt-in: Adam moments keyed by param name
 └── trainer_state.json             ← step number and lightweight metadata
 ```
 
@@ -860,10 +860,12 @@ checkpoint-5000/
 + `adapter_config.json`. PEFT only saves LoRA parameters; frozen base weights
 (`empty(0)` after NF4 prep) are ignored.
 
-`optimizer_state.pt` is written only with `--save-optimizer-state`. It is a
-single file keyed by parameter name (`{name: {exp_avg, exp_avg_sq, step}}`),
-not sharded by device. This makes it topology-portable: you can save on a
-2-GPU split and resume on a 1-GPU split or any other configuration.
+`optimizer_state.safetensors` is written only with `--save-optimizer-state`.
+It is a single safetensors file with tensor keys of the form
+`"{param_name}:exp_avg"`, `"{param_name}:exp_avg_sq"`, `"{param_name}:step"`,
+and param_group metadata (lr, betas, etc.) stored as JSON in the file's
+metadata header. No pickle. Topology-portable: save on a 2-GPU split and
+resume on 1 GPU or any other configuration.
 
 Disk policy:
 

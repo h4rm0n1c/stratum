@@ -3,8 +3,13 @@
 Checkpoint format is LoRA/QLoRA-style and topology-portable:
   1. PEFT adapter files: adapter_model.safetensors + adapter_config.json.
   2. trainer_state.json for step metadata.
-  3. optimizer_state.pt (opt-in): Adam moments keyed by parameter name,
-     not by device — portable across GPU split changes.
+  3. optimizer_state.safetensors (opt-in): Adam moments keyed by parameter
+     name, not by device — portable across GPU split changes.
+
+optimizer_state.safetensors layout:
+  tensors: "{param_name}:exp_avg", "{param_name}:exp_avg_sq",
+           "{param_name}:step" — one entry per moment per LoRA param.
+  metadata["param_groups"]: JSON list of param_group dicts (lr, betas, etc.).
 """
 
 import json
@@ -15,6 +20,8 @@ from typing import Optional
 
 import torch
 from stratum.utils import log_event
+
+_OPTIM_FILE = "optimizer_state.safetensors"
 
 
 def _optimizer_param_names(modules: list) -> list[str]:
@@ -46,7 +53,7 @@ def save_checkpoint(
         step: Current training step.
         out_dir: Output directory.
         peft_model: The PeftModel for PEFT-compatible adapter save.
-        save_optimizer_state: Save optimizer_state.pt keyed by parameter name.
+        save_optimizer_state: Save optimizer_state.safetensors keyed by param name.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -63,9 +70,11 @@ def save_checkpoint(
                   file=sys.stderr, flush=True)
             raise
 
-    # 2. Optimizer state: single file keyed by parameter name, topology-portable.
+    # 2. Optimizer state: safetensors, keyed by parameter name, topology-portable.
     if save_optimizer_state and optimizer is not None:
-        merged_state: dict = {}
+        from safetensors.torch import save_file as _save_file
+
+        tensors: dict[str, torch.Tensor] = {}
         merged_groups = None
         for device_id, modules in modules_per_device.items():
             opt = optimizer.optimizers.get(device_id)
@@ -75,19 +84,18 @@ def save_checkpoint(
             sd = opt.state_dict()
             for i, name in enumerate(names):
                 if i in sd["state"]:
-                    merged_state[name] = {
-                        k: v.cpu() if isinstance(v, torch.Tensor) else v
-                        for k, v in sd["state"][i].items()
-                    }
+                    for moment, val in sd["state"][i].items():
+                        t = val if isinstance(val, torch.Tensor) else torch.tensor(val)
+                        # safetensors requires contiguous CPU float/int tensors;
+                        # step is a scalar — keep as 0-d (safetensors supports it).
+                        tensors[f"{name}:{moment}"] = t.detach().cpu().contiguous()
             if merged_groups is None:
                 merged_groups = [
                     {k: v for k, v in g.items() if k != "params"}
                     for g in sd["param_groups"]
                 ]
-        torch.save(
-            {"format_version": 1, "state": merged_state, "param_groups": merged_groups or []},
-            out_dir / "optimizer_state.pt",
-        )
+        metadata = {"param_groups": json.dumps(merged_groups or [])}
+        _save_file(tensors, out_dir / _OPTIM_FILE, metadata=metadata)
 
     # 3. Lightweight metadata.
     trainer_state = {
@@ -147,10 +155,18 @@ def load_checkpoint(
             raise
 
     # 2. Optimizer state: name-keyed, topology-portable.
-    optim_path = checkpoint_dir / "optimizer_state.pt"
+    optim_path = checkpoint_dir / _OPTIM_FILE
     if optim_path.exists() and optimizer is not None:
-        ckpt = torch.load(optim_path, map_location="cpu", weights_only=False)
-        name_to_state = ckpt["state"]
+        from safetensors import safe_open as _safe_open
+
+        # Reconstruct {param_name: {moment: tensor}} from flat "{name}:{moment}" keys.
+        name_to_state: dict[str, dict[str, torch.Tensor]] = {}
+        with _safe_open(str(optim_path), framework="pt", device="cpu") as f:
+            saved_groups = json.loads(f.metadata().get("param_groups", "[]"))
+            for key in f.keys():
+                param_name, _, moment = key.rpartition(":")
+                name_to_state.setdefault(param_name, {})[moment] = f.get_tensor(key)
+
         for device_id, modules in modules_per_device.items():
             opt = optimizer.optimizers.get(device_id)
             if opt is None:
@@ -163,7 +179,7 @@ def load_checkpoint(
             }
             current_sd = opt.state_dict()
             current_sd["state"] = indexed
-            for saved_g, cur_g in zip(ckpt.get("param_groups", []), current_sd["param_groups"]):
+            for saved_g, cur_g in zip(saved_groups, current_sd["param_groups"]):
                 for k, v in saved_g.items():
                     if k != "params":
                         cur_g[k] = v

@@ -1,3 +1,4 @@
+import importlib
 import tempfile
 import unittest
 import json
@@ -8,6 +9,9 @@ from torch import nn
 
 from stratum.checkpoint import load_checkpoint, save_checkpoint
 
+_have_safetensors = importlib.util.find_spec("safetensors") is not None
+_skip_no_safetensors = unittest.skipUnless(_have_safetensors, "safetensors not installed")
+
 
 class CheckpointMetadataTest(unittest.TestCase):
     def test_default_checkpoint_uses_json_metadata_without_pt_files(self):
@@ -17,6 +21,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             save_checkpoint({}, optimizer=None, step=123, out_dir=out_dir)
 
             self.assertTrue((out_dir / "trainer_state.json").exists())
+            self.assertFalse((out_dir / "optimizer_state.safetensors").exists())
             self.assertEqual(list(out_dir.glob("*.pt")), [])
             state = json.loads((out_dir / "trainer_state.json").read_text())
             self.assertEqual(state["step"], 123)
@@ -29,6 +34,7 @@ class CheckpointMetadataTest(unittest.TestCase):
 
             self.assertEqual(load_checkpoint({}, checkpoint_dir=out_dir), 0)
 
+    @_skip_no_safetensors
     def test_optimizer_state_saves_single_name_keyed_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
@@ -47,12 +53,12 @@ class CheckpointMetadataTest(unittest.TestCase):
                 save_optimizer_state=True,
             )
 
-            self.assertTrue((out_dir / "optimizer_state.pt").exists())
+            self.assertTrue((out_dir / "optimizer_state.safetensors").exists())
             self.assertFalse((out_dir / "optim_0.pt").exists())
             self.assertFalse((out_dir / "device_0.pt").exists())
             self.assertFalse((out_dir / "meta.pt").exists())
 
-            ckpt = torch.load(out_dir / "optimizer_state.pt", map_location="cpu",
+            ckpt = torch.load(out_dir / "optimizer_state.safetensors", map_location="cpu",
                               weights_only=False)
             self.assertEqual(ckpt["format_version"], 1)
             self.assertIsInstance(ckpt["state"], dict)
@@ -60,6 +66,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             for key in ckpt["state"]:
                 self.assertIsInstance(key, str)
 
+    @_skip_no_safetensors
     def test_optimizer_state_loads_lr_and_restores_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
@@ -94,6 +101,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             self.assertEqual(step, 4)
             self.assertEqual(loaded_opt.param_groups[0]["lr"], 0.123)
 
+    @_skip_no_safetensors
     def test_optimizer_adam_moments_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
@@ -142,6 +150,7 @@ class CheckpointMetadataTest(unittest.TestCase):
                 self.assertTrue(torch.allclose(saved_ps["exp_avg"], loaded_ps["exp_avg"]))
                 self.assertTrue(torch.allclose(saved_ps["exp_avg_sq"], loaded_ps["exp_avg_sq"]))
 
+    @_skip_no_safetensors
     def test_optimizer_state_portable_across_device_split(self):
         """Params saved from device 0 load correctly into device 1."""
         with tempfile.TemporaryDirectory() as tmp:
