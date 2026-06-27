@@ -885,6 +885,12 @@ class StratumPipeline(nn.Module):
                             param_stream=_group_param_stream,
                             first_layer_fence=_first_layer_fence,
                         )
+                # Free NF4/FP16-staged weight data after forward so GPU memory
+                # holds at most one group's dequantized weights at a time.
+                # LoRA params are skipped (no NF4_ATTR/FP16_ATTR). The backward
+                # _free_stage_group hook still fires but free_weights returns 0
+                # (already empty), while the scheduler notification fires normally.
+                free_weights(self._fwd_group_modules[fwd_group_id])
                 complete_group = self._register_scheduler_complete_hook(
                     tracker=tracker,
                     stage_index=stage_index,

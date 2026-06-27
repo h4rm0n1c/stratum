@@ -173,6 +173,47 @@ class PipelineLookAheadWiringTest(unittest.TestCase):
                 "second group should have a look_ahead_upload callback",
             )
 
+    def test_free_weights_called_after_each_group_forward(self):
+        """free_weights fires on each group's module immediately after its forward."""
+        from stratum.pipeline import StratumPipeline
+        from stratum.stage import DeviceStage
+        from stratum.scheduler import ModelExecutePlan
+        from stratum.upload import NF4_ATTR
+
+        freed_modules = []
+
+        def _capture_free(module):
+            freed_modules.append(id(module))
+            return 0
+
+        layers = [nn.Identity() for _ in range(2)]
+        stage = DeviceStage(layers=layers, device_id=0)
+        plan = ModelExecutePlan.from_stage_lengths([2])
+
+        class _P(nn.Module):
+            def forward(self, *, input_ids, attention_mask=None, labels=None, **kw):
+                h = torch.ones(1, 4, requires_grad=True)
+                return (h, None, None, None, None, labels, None)
+
+        class _Q(nn.Module):
+            def forward(self, data):
+                return data[0].mean()
+
+        pipe = StratumPipeline(_P(), [stage], _Q(), execute_plan=plan)
+        group_module_ids = [id(m) for m in pipe._fwd_group_modules]
+
+        with patch("stratum.pipeline.free_weights", side_effect=_capture_free):
+            try:
+                pipe.forward(input_ids=torch.zeros(1, dtype=torch.long))
+            except Exception:
+                pass
+
+        for gid in group_module_ids:
+            self.assertIn(
+                gid, freed_modules,
+                "free_weights must be called for every group module after its forward",
+            )
+
     def test_pending_bwd_fences_cleared_each_step(self):
         """_pending_bwd_fences resets to empty at the start of forward_range."""
         from stratum.pipeline import StratumPipeline
