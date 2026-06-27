@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from stratum.batch import training_token_counts
 from stratum.packing import (
     compute_cu_seqlens,
     pack_collate,
@@ -168,6 +169,32 @@ class PackedBatchFormatTest(unittest.TestCase):
         samples = [self._make_sample(3), self._make_sample(4)]
         result = pack_samples(samples, max_seq_len=20)
         self.assertEqual(result["labels"].dim(), 1)
+
+    def test_training_token_counts_accepts_packed_attention_metadata(self):
+        samples = [
+            {
+                "input_ids": torch.arange(3),
+                "attention_mask": torch.ones(3, dtype=torch.long),
+                "labels": torch.tensor([-100, 1, 2]),
+            },
+            {
+                "input_ids": torch.arange(4),
+                "attention_mask": torch.ones(4, dtype=torch.long),
+                "labels": torch.tensor([3, -100, 5, 6]),
+            },
+        ]
+        packed = pack_samples(samples, max_seq_len=20)
+        attention_mask = {
+            "cu_seqlens": packed["cu_seqlens"],
+            "max_seqlen": packed["max_seqlen"],
+        }
+
+        total, trainable = training_token_counts(
+            packed["input_ids"], attention_mask, packed["labels"]
+        )
+
+        self.assertEqual(total, 7)
+        self.assertEqual(trainable, 5)
 
 
 class SplitPackedBatchTest(unittest.TestCase):

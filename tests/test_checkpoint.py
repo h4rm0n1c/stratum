@@ -89,6 +89,61 @@ class CheckpointMetadataTest(unittest.TestCase):
             self.assertEqual(step, 4)
             self.assertEqual(loaded_opt.param_groups[0]["lr"], 0.123)
 
+    def test_optimizer_adam_moments_round_trip_without_legacy_device_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            module = nn.Linear(2, 2)
+            saved_opt = torch.optim.AdamW(module.parameters(), lr=0.123)
+
+            x = torch.ones(1, 2)
+            module(x).sum().backward()
+            saved_opt.step()
+            saved_state = saved_opt.state_dict()
+
+            class SavedOptimizer:
+                cpu_offload = True
+                optimizers = {0: saved_opt}
+
+            save_checkpoint(
+                {0: [module]},
+                optimizer=SavedOptimizer(),
+                step=9,
+                out_dir=out_dir,
+                save_optimizer_state=True,
+                save_legacy_device_state=False,
+            )
+
+            loaded_module = nn.Linear(2, 2)
+            loaded_opt = torch.optim.AdamW(loaded_module.parameters(), lr=0.001)
+
+            class LoadedOptimizer:
+                cpu_offload = True
+                optimizers = {0: loaded_opt}
+
+            step = load_checkpoint(
+                {0: [loaded_module]},
+                optimizer=LoadedOptimizer(),
+                checkpoint_dir=out_dir,
+            )
+            loaded_state = loaded_opt.state_dict()
+
+            self.assertEqual(step, 9)
+            self.assertFalse((out_dir / "device_0.pt").exists())
+            self.assertEqual(len(saved_state["state"]), len(loaded_state["state"]))
+            for saved_param_state, loaded_param_state in zip(
+                saved_state["state"].values(),
+                loaded_state["state"].values(),
+            ):
+                self.assertTrue(
+                    torch.equal(saved_param_state["step"], loaded_param_state["step"])
+                )
+                self.assertTrue(
+                    torch.allclose(saved_param_state["exp_avg"], loaded_param_state["exp_avg"])
+                )
+                self.assertTrue(
+                    torch.allclose(saved_param_state["exp_avg_sq"], loaded_param_state["exp_avg_sq"])
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

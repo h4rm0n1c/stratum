@@ -54,6 +54,7 @@ class ModelArch:
         stage_memory_limit_gib: float = 0.0,
         nf4_layer_size_floor_gib: float = 0.0,
         prefetch_nf4: bool = False,
+        hf_model_name_or_path: Optional[str] = None,
         verbose: bool = True,
         **kwargs,
     ) -> StratumPipeline:
@@ -150,6 +151,24 @@ class ModelArch:
             if nf4_scope == "all":
                 nf4_modules.append(pipeline.postfix)
 
+            _is_meta_model = any(
+                param.device.type == "meta"
+                for _mod in nf4_modules
+                for param in _mod.parameters()
+            )
+
+            def _resolve_hf_source() -> str:
+                _hf_name = (
+                    hf_model_name_or_path
+                    or getattr(hf_model, "name_or_path", None)
+                    or getattr(core, "name_or_path", None)
+                )
+                if not _hf_name:
+                    raise RuntimeError(
+                        "staged FP16 load requires hf_model_name_or_path"
+                    )
+                return _hf_name
+
             # Try cache-only fast path first.  When every qualifying param
             # has a cached NF4 payload we skip ``quantize_4bit()`` entirely
             # and just load the pre-computed payloads from disk.
@@ -158,21 +177,36 @@ class ModelArch:
                 from stratum.upload import prepare_nf4_from_cache
                 _all_cached = True
                 for _mod in nf4_modules:
-                    if prepare_nf4_from_cache(_mod, nf4_cache_dir, verbose=False) is None:
+                    if prepare_nf4_from_cache(
+                        _mod,
+                        nf4_cache_dir,
+                        verbose=False,
+                        min_numel=nf4_min_numel,
+                    ) is None:
                         _all_cached = False
                         break
                 if _all_cached:
                     _need_fallback = False
                     if verbose:
                         print("  nf4: all payloads loaded from cache", flush=True)
+                    if _is_meta_model:
+                        from stratum.upload import load_module_fp16_from_checkpoint
+                        from stratum.utils import release_cached_memory as _rcm
+                        _hf_name = _resolve_hf_source()
+                        for idx, _mod in enumerate(nf4_modules):
+                            ok = load_module_fp16_from_checkpoint(
+                                _mod, _hf_name, verbose=verbose,
+                            )
+                            if not ok:
+                                raise RuntimeError(
+                                    f"staged non-NF4 load failed for module {idx}"
+                                )
+                            _rcm(verbose=False)
 
             if _need_fallback:
                 # Check whether the model was loaded on meta (staged load)
                 # or on CPU (normal FP16 load — params already populated).
-                _first_param = next(iter(pipeline.prefix.parameters()), None)
-                _is_meta = _first_param is not None and _first_param.device.type == "meta"
-
-                if _is_meta:
+                if _is_meta_model:
                     # Staged FP16 load: for each module, load only its
                     # weights from the HF checkpoint (streaming via
                     # safe_open), quantize to NF4, and free the FP16 data
@@ -180,9 +214,9 @@ class ModelArch:
                     # ~max module size rather than the full model.
                     from stratum.upload import (
                         load_module_fp16_from_checkpoint,
-                        release_cached_memory as _rcm,
                     )
-                    _hf_name = getattr(model, "name_or_path", None) or "LiquidAI/LFM2.5-8B-A1B"
+                    from stratum.utils import release_cached_memory as _rcm
+                    _hf_name = _resolve_hf_source()
                     for idx, _mod in enumerate(nf4_modules):
                         ok = load_module_fp16_from_checkpoint(_mod, _hf_name, verbose=verbose)
                         if not ok:
@@ -271,6 +305,7 @@ def build_pipeline(
     stage_memory_limit_gib: float = 0.0,
     nf4_layer_size_floor_gib: float = 0.0,
     prefetch_nf4: bool = False,
+    hf_model_name_or_path: Optional[str] = None,
     flash_layers: str = "",
     flash_window_left: int = -1,
     flash_window_right: int = 0,
@@ -303,6 +338,7 @@ def build_pipeline(
         stage_memory_limit_gib=stage_memory_limit_gib,
         nf4_layer_size_floor_gib=nf4_layer_size_floor_gib,
         prefetch_nf4=prefetch_nf4,
+        hf_model_name_or_path=hf_model_name_or_path,
         flash_layers=flash_layers,
         flash_window_left=flash_window_left,
         flash_window_right=flash_window_right,

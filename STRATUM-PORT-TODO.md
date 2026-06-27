@@ -53,7 +53,7 @@ Multi-GPU parity work must stay aligned with that contract:
 
 ---
 
-## Current Remaining Work — 2026-06-26 (updated)
+## Current Remaining Work — 2026-06-27 (updated)
 
 Stratum has reached practical full-feature parity with qz-roundpipe on the
 reference no-P2P RTX 3080 + V100 machine. Every RoundPipe mechanism that is
@@ -150,20 +150,58 @@ The remaining open items are a narrow tail:
     pipeline outputs across calls (lower priority, eval/debug paths covered).
 
 
-5. [~] **Validation depth** — unit coverage exists for the core ported
+5. **[x] Sample packing** (added 2026-06-27): `pack_samples`, `pack_collate`,
+    `split_packed_batch` in `stratum/packing.py`. `--packing` flag in `train.py`.
+    Flash attention dispatches to `flash_attn_varlen_func` on LFM25 and Qwen35
+    when the packed cu_seqlens metadata is present. 25 unit tests.
+    Smoked on LFM2.5 at batch 1 / 1 microbatch — finite loss, SM86+SM70 flash
+    dispatch, host-staged transfers. LFM2.5 ShortConv layers are incompatible
+    with 1D packed input; Qwen35 works cleanly.
+
+6. **[x] Host RAM management for LFM2.5** (added 2026-06-27): `release_cached_memory()` in
+    `stratum/utils.py` calls `gc.collect()` + glibc `malloc_trim(0)` to return
+    cached heap pages to the OS after `prepare_nf4()` frees the FP16 model
+    weights. Measurable: RSS drops from ~33 GiB to ~21.7 GiB after pipeline
+    build (11+ GiB freed). `--low-rss-nf4-build` now builds the HF module
+    skeleton on meta, then `build_pipeline()` streams module tensors from the
+    HF safetensors checkpoint during NF4 preparation. Cached NF4 runs attach
+    precomputed payloads and stream only remaining non-NF4 tensors such as
+    norms/biases. Normal `train.py` remains the default full CPU FP16 path.
+    2026-06-27 audit fixed the staged-load trim import, removed the hardcoded
+    LFM checkpoint fallback/undefined variable, forwards `--nf4-min-numel` to
+    cache loading, keeps the PEFT wrapper for checkpoint save/load, and
+    preserved NF4/FP16 payload metadata across fallback parameter replacement.
+    Docker LFM2.5 low-RSS NF4 smoke then passed on 2026-06-27 with
+    `--host-ram-limit-gib 45`: RSS `6.48 GiB` after pipeline build,
+    `7.12 GiB` after dataloader construction, finite loss `11.8045`, GPU peaks
+    `3.68 GiB` / `14.36 GiB`, and host-staged transfers both directions.
+    A follow-up warm-cache smoke reused
+    `/workspace/cache/nf4-lowrss-fp16/LiquidAI_LFM2.5-8B-A1B`, reported
+    `nf4: all payloads loaded from cache`, completed pipeline build in
+    `12.3s`, and produced the same finite loss without rebuilding NF4 payloads.
+
+7. [~] **Validation depth** — unit coverage exists for the core ported
    infrastructure, but longer LFM2.5/Qwen35 runs, resume/save-load checks under
-   CPU optimizer offload, and failure-mode tests remain useful.
-6. [A] **NUMA-aware host coordination** — this is a future Stratum-specific
+   CPU optimizer offload, and failure-mode tests remain useful. Added
+   2026-06-27 host checks for packed-mode training token accounting and
+   optimizer Adam moment round-trip without legacy `device_*.pt` state.
+8. [A] **NUMA-aware host coordination** — this is a future Stratum-specific
    optimization, not a current RoundPipe parity blocker. See section 16a.
 
 ### Next handover slice
 
-Items 1, 3, and 4 are complete. `set_layer_timer` is now wired into `train.py`
-so timing-fed plan adaptation is active when `--adapt-plan-every N` is passed.
-The pytree batch API (`guess_split_spec` / `split_pytree` / `merge_pytree` /
-`TokenWeightedReducer`) is now ported and wired via `--pytree-batch`.
-Next focus: item 2 tail — mutable-buffer snapshot/restore for non-NF4
-recompute paths that mutate buffers.
+Items 1–6 are complete for the LFM2.5 validation target. `set_layer_timer` is wired into `train.py`
+(`--adapt-plan-every N`). The pytree batch API (`guess_split_spec` /
+`split_pytree` / `merge_pytree` / `TokenWeightedReducer`) is ported and
+wired via `--pytree-batch`. Sample packing (`stratum/packing.py`,
+`--packing`) is implemented with flash_attn_varlen_func dispatch on
+LFM25 and Qwen35. Host RAM trimming (`release_cached_memory()`) frees
+11+ GiB of cached FP16 pages after normal pipeline build. The opt-in
+`--low-rss-nf4-build` path passed a real LFM2.5 Docker runtime smoke with
+streamed HF safetensors, NF4 cache writes/hits, LoRA meta materialization,
+host RSS under 8 GiB after dataloader setup, and finite loss. Next practical
+smoke: Qwen35 low-RSS NF4 build, then packed training past the step log
+boundary plus an opt-in optimizer-state resume.
 
 ---
 

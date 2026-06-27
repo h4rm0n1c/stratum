@@ -13,6 +13,7 @@ Pytree API (adapted from roundpipe/batch.py):
 
 Fixed-tensor API (original Stratum):
     split_training_batch()  — split input_ids/attention_mask/labels tensors
+    training_token_counts() — log token counts for padded or packed batches
     microbatch_loss_scale() — token-weighted backward scale
     reduce_microbatch_losses() — token-weighted detached loss aggregator
 """
@@ -303,6 +304,22 @@ class TrainingMicrobatch:
     attention_mask: torch.Tensor
     labels: torch.Tensor
     trainable_tokens: int
+
+
+def training_token_counts(
+    input_ids: torch.Tensor,
+    attention_mask: Any,
+    labels: torch.Tensor,
+    *,
+    ignore_index: int = -100,
+) -> tuple[int, int]:
+    """Return total and trainable token counts for padded or packed batches."""
+    if isinstance(attention_mask, dict):
+        total_tokens = int(input_ids.numel())
+    else:
+        total_tokens = int(attention_mask.sum().item())
+    trainable_tokens = int((labels != ignore_index).sum().item())
+    return total_tokens, trainable_tokens
 
 
 def _split_sizes(batch_size: int, num_microbatch: int) -> list[int]:

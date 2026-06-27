@@ -13,6 +13,7 @@ from stratum.upload import (
     NF4_ATTR,
     FP16_ATTR,
     FP16StagedPayload,
+    _replace_param_data,
     _load_payload_from_cache,
     estimate_module_upload_gib,
     ensure_prefetched_weights,
@@ -24,6 +25,70 @@ from stratum.upload import (
 
 
 class UploadLifecycleTests(unittest.TestCase):
+    def test_replace_param_data_preserves_nf4_payload_on_fallback_replacement(self):
+        module = nn.Module()
+        param = nn.Parameter(torch.ones(2, 2, dtype=torch.float16), requires_grad=False)
+        payload = NF4Payload(
+            quantized=torch.zeros(2, dtype=torch.uint8),
+            absmax=torch.ones(1, dtype=torch.float16),
+            code=torch.zeros(16, dtype=torch.float16),
+            shape=(2, 2),
+            dtype=torch.float16,
+            blocksize=64,
+            quant_type="nf4",
+            source_numel=4,
+            source_bytes=8,
+            payload_bytes=36,
+        )
+        setattr(param, NF4_ATTR, payload)
+        module.register_parameter("weight", param)
+
+        with mock.patch.object(
+            torch.nn.Parameter,
+            "data",
+            new_callable=mock.PropertyMock,
+            side_effect=RuntimeError("forced fallback"),
+        ):
+            _replace_param_data(
+                param,
+                torch.empty(0, dtype=torch.float16),
+                owner=module,
+                pname="weight",
+            )
+
+        self.assertIsNot(module.weight, param)
+        self.assertIs(getattr(module.weight, NF4_ATTR), payload)
+        self.assertEqual(module.weight.data.numel(), 0)
+
+    def test_replace_param_data_preserves_fp16_payload_on_fallback_replacement(self):
+        module = nn.Module()
+        param = nn.Parameter(torch.ones(2, 2, dtype=torch.float16), requires_grad=False)
+        payload = FP16StagedPayload(
+            data=torch.ones(2, 2, dtype=torch.float16),
+            shape=(2, 2),
+            dtype=torch.float16,
+            source_bytes=8,
+        )
+        setattr(param, FP16_ATTR, payload)
+        module.register_parameter("weight", param)
+
+        with mock.patch.object(
+            torch.nn.Parameter,
+            "data",
+            new_callable=mock.PropertyMock,
+            side_effect=RuntimeError("forced fallback"),
+        ):
+            _replace_param_data(
+                param,
+                torch.empty(0, dtype=torch.float16),
+                owner=module,
+                pname="weight",
+            )
+
+        self.assertIsNot(module.weight, param)
+        self.assertIs(getattr(module.weight, FP16_ATTR), payload)
+        self.assertEqual(module.weight.data.numel(), 0)
+
     def test_estimate_counts_nf4_source_bytes_once_for_shared_params(self):
         shared = nn.Parameter(torch.ones(2, 2), requires_grad=False)
         setattr(

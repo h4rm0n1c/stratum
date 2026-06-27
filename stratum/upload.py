@@ -450,19 +450,92 @@ def load_module_fp16_from_checkpoint(
 
     if not _needed:
         return True  # nothing to load
+    _owner_map = _build_param_owner_map(module)
+
+    _layer_prefixes: list[tuple[str, str]] = []
+    for _module_name, _submodule in module.named_modules():
+        _layer_idx = getattr(_submodule, "idx", None)
+        if isinstance(_layer_idx, int) and hasattr(_submodule, "layer"):
+            _prefix = f"{_module_name}.layer." if _module_name else "layer."
+            _layer_prefixes.append((_prefix, f"model.layers.{_layer_idx}."))
+
+    def _without_peft_base_layer(name: str) -> str:
+        return name.replace(".base_layer.", ".")
 
     # Generate candidate checkpoint key for a pipeline param name.
     def _ckpt_keys(pname: str) -> list[str]:
-        keys = [pname]
-        # Pipeline wrapped layers insert ".layer." before sub-modules.
-        # The checkpoint uses the unwrapped name.
-        stripped = _re.sub(r'\.layer\.(?!layer)', '.', pname)
-        if stripped != pname:
+        keys = []
+
+        def _add(name: str) -> None:
+            keys.append(name)
+            keys.append(_without_peft_base_layer(name))
+            stripped = _re.sub(r'\.layer\.(?!layer)', '.', name)
             keys.append(stripped)
-        # Some models prefix with "model." in the checkpoint.
-        keys.append(f"model.{pname}")
-        keys.append(f"model.{stripped}")
+            keys.append(_without_peft_base_layer(stripped))
+            keys.append(f"model.{name}")
+            keys.append(f"model.{_without_peft_base_layer(name)}")
+            keys.append(f"model.{stripped}")
+            keys.append(f"model.{_without_peft_base_layer(stripped)}")
+
+        _add(pname)
+        if pname == "lm_head.weight":
+            _add("model.embed_tokens.weight")
+            _add("embed_tokens.weight")
+        for _prefix, _global_prefix in _layer_prefixes:
+            if pname.startswith(_prefix):
+                _add(_global_prefix + pname[len(_prefix):])
         return list(dict.fromkeys(keys))  # deduplicate
+
+    def _load_lfm_fused_experts_from_single(
+        handle,
+        keys: set[str],
+        pname: str,
+        param: torch.nn.Parameter,
+    ) -> torch.Tensor | None:
+        suffixes = {
+            ".feed_forward.experts.gate_up_proj": ("gate_up",),
+            ".feed_forward.experts.down_proj": ("down",),
+        }
+        matched_suffix = None
+        for suffix in suffixes:
+            if pname.endswith(suffix):
+                matched_suffix = suffix
+                break
+        if matched_suffix is None or param.ndim != 3:
+            return None
+
+        for candidate in _ckpt_keys(pname):
+            if not candidate.endswith(matched_suffix):
+                continue
+            base = candidate[: -len(matched_suffix)] + ".feed_forward.experts"
+            n_experts = int(param.shape[0])
+            if matched_suffix.endswith("gate_up_proj"):
+                required = [
+                    key
+                    for expert_idx in range(n_experts)
+                    for key in (
+                        f"{base}.{expert_idx}.w1.weight",
+                        f"{base}.{expert_idx}.w3.weight",
+                    )
+                ]
+                if not all(key in keys for key in required):
+                    continue
+                expert_tensors = []
+                for expert_idx in range(n_experts):
+                    w1 = handle.get_tensor(f"{base}.{expert_idx}.w1.weight")
+                    w3 = handle.get_tensor(f"{base}.{expert_idx}.w3.weight")
+                    expert_tensors.append(torch.cat([w1, w3], dim=0))
+                return torch.stack(expert_tensors, dim=0)
+
+            required = [
+                f"{base}.{expert_idx}.w2.weight"
+                for expert_idx in range(n_experts)
+            ]
+            if not all(key in keys for key in required):
+                continue
+            return torch.stack([handle.get_tensor(key) for key in required], dim=0)
+
+        return None
 
     if _idx is not None and _Path(_idx).exists():
         # Sharded checkpoint.
@@ -491,7 +564,13 @@ def load_module_fp16_from_checkpoint(
                 for _ck, _p in _items:
                     _t = _f.get_tensor(_ck)
                     try:
-                        _p.data = _t.to("cpu", non_blocking=True)
+                        _owner, _pname = _owner_map.get(id(_p), (None, None))
+                        _replace_param_data(
+                            _p,
+                            _t.to(device="cpu", dtype=_p.dtype, non_blocking=True),
+                            owner=_owner,
+                            pname=_pname,
+                        )
                     except (RuntimeError, TypeError):
                         if verbose:
                             print(f"  load_module: can't set data for {_ck}", flush=True)
@@ -512,13 +591,37 @@ def load_module_fp16_from_checkpoint(
                     if _ck in _all:
                         _t = _f.get_tensor(_ck)
                         try:
-                            _p.data = _t.to("cpu", non_blocking=True)
+                            _owner, _pname = _owner_map.get(id(_p), (None, None))
+                            _replace_param_data(
+                                _p,
+                                _t.to(device="cpu", dtype=_p.dtype, non_blocking=True),
+                                owner=_owner,
+                                pname=_pname,
+                            )
                         except (RuntimeError, TypeError):
+                            if verbose:
+                                print(f"  load_module: can't set data for {_ck}", flush=True)
                             return False
                         _found = True
                         break
                 if not _found:
-                    return False
+                    _fused = _load_lfm_fused_experts_from_single(_f, _all, _n, _p)
+                    if _fused is None:
+                        if verbose:
+                            print(f"  load_module: no checkpoint key for {_n}", flush=True)
+                        return False
+                    try:
+                        _owner, _pname = _owner_map.get(id(_p), (None, None))
+                        _replace_param_data(
+                            _p,
+                            _fused.to(device="cpu", dtype=_p.dtype, non_blocking=True),
+                            owner=_owner,
+                            pname=_pname,
+                        )
+                    except (RuntimeError, TypeError):
+                        if verbose:
+                            print(f"  load_module: can't set fused data for {_n}", flush=True)
+                        return False
 
     return True
 
@@ -872,6 +975,9 @@ def _replace_param_data(
         pass
     if owner is not None and pname is not None:
         new_param = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
+        for attr in (NF4_ATTR, FP16_ATTR):
+            if hasattr(param, attr):
+                setattr(new_param, attr, getattr(param, attr))
         owner.register_parameter(pname, new_param)
 
 

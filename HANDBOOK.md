@@ -356,6 +356,25 @@ input tensor has no grad path, `free_all_weights()` completes and frees that
 group after backward so checkpoint recompute never sees prematurely emptied
 weights.
 
+Low-RSS NF4 construction was validated on 2026-06-27 in Docker with LFM2.5
+using `--low-rss-nf4-build`, `--host-ram-limit-gib 45`, `--tensor-split 9 32`,
+batch 1, one microbatch, and a dedicated cache
+`/workspace/cache/nf4-lowrss-fp16`. The run built the HF skeleton on meta,
+materialized 84 trainable LoRA meta parameters, streamed HF safetensors into
+NF4 payloads and remaining FP16 staged tensors, then completed a full
+forward/backward step with finite loss `11.8045`. RSS was `6.48 GiB` after
+pipeline build and `7.12 GiB` after dataloader construction. GPU peaks were
+`3.68 GiB` on the RTX 3080 and `14.36 GiB` on the V100. The run logged
+host-staged boundary transfers in both directions and completed with
+`--no-save`.
+
+The same cache was then reused for a warm-cache smoke. Startup reported
+`nf4: all payloads loaded from cache`, confirming that NF4 quantization and
+payload writes were skipped. The pipeline-build phase completed in `12.3s`,
+RSS stayed at `6.48 GiB` after pipeline build / `7.13 GiB` after dataloader
+construction, and the 1-step training run again completed with finite loss
+`11.8045`.
+
 Qwen3.5 status as of 2026-06-26:
 
 | Item | Result |
@@ -422,7 +441,7 @@ The codebase has moved ahead of this document in several areas after the
 | Qwen35 `_FlashBackend` NamedTuple pattern | Structured backend selection with hard failure on flash kernel error; no silent OOMs from eager fallback. |
 | LFM25 `Lfm25FlashAttention` | Uses the same `_FlashBackend` pattern as Qwen35; CUDA flash backend absence or kernel failure is fatal, not a silent eager fallback. |
 
-### Parity status (updated 2026-06-26)
+### Parity status (updated 2026-06-27)
 
 Stratum has reached practical full-feature parity with qz-roundpipe on the
 reference no-P2P RTX 3080 + V100 machine. Every RoundPipe mechanism that is
@@ -456,6 +475,8 @@ adapted. The table below is the complete parity ledger.
 | Qwen3-MoE adapter | `roundpipe/models/qwen3_moe.py` | **Done** — `stratum/model/qwen3_moe.py`; Qwen3-30B-A3B smoke passed |
 | Non-NF4 layer-copy path | `roundpipe/transfer.py` | **Done** — `prepare_fp16_staged` / `copy_tensor_chunked` lifecycle; mutable-buffer snapshot for recompute is an open tail |
 | Pytree batch API | `roundpipe/batch.py` | **Done** — `guess_split_spec` / `split_pytree` / `merge_pytree` / `TokenWeightedReducer`; `--pytree-batch` flag in `train.py` |
+| Sample packing | `roundpipe/batch.py` | **Done** — `pack_samples` / `pack_collate` / `split_packed_batch` in `stratum/packing.py`; `--packing` flag; flash_attn_varlen_func dispatch on LFM25 and Qwen35 |
+| Host RAM management | — | **Done for LFM2.5 / partial for Qwen35 depth** — `release_cached_memory()` frees cached FP16 pages after NF4 prep (measurable: 11+ GiB RSS drop on the normal path); `--low-rss-nf4-build` builds the HF skeleton on meta and streams checkpoint tensors during NF4 preparation. LFM2.5 low-RSS NF4 Docker smoke passed on 2026-06-27; Qwen35 low-RSS depth is still future validation |
 | GPT-OSS adapter | `roundpipe/models/gpt_oss.py` | **Skipped** — no public HF model available |
 
 **What is not yet done (in priority order):**
@@ -472,7 +493,8 @@ adapted. The table below is the complete parity ledger.
 
 3. **Longer save/resume validation** — multi-step resume under CPU optimizer
    offload, checkpoint failure modes. Unit coverage exists; end-to-end
-   integration runs are thin.
+   integration runs are thin. Host unit coverage now verifies opt-in Adam
+   moment round-trip without legacy `device_*.pt` state.
 
 4. **NUMA coordination** — future Stratum optimization (binding staging
    buffers, NF4 prefetch, CPU optimizer, worker affinity to NUMA topology).
@@ -608,12 +630,14 @@ scripts/train.py
 | `layer_transfer.py` | RoundPipe-style standalone layer upload/download helpers for chunked module copies and grad/buffer download |
 | `grad_hooks.py` | `make_boundary_hook()` — backward gradient hook that transfers grads across devices |
 | `runtime.py` | RoundPipe-style explicit group recompute/backward primitive and autograd anchor helper used by active scheduler groups; stream/device orchestration still lives in `pipeline.py` |
+| `packing.py` | Sample packing: `pack_samples`, `pack_collate`, `split_packed_batch` for padding-free training |
+| `batch.py` | Pytree batch API: `guess_split_spec`, `split_pytree`, `merge_pytree`, `split_kwargs_pytree`, `TokenWeightedReducer` |
 
 ### Weight streaming (NF4) — the VRAM enabler
 
 | File | Purpose |
 |---|---|
-| `upload.py` | `prepare_nf4()` → quantizes frozen 2D weights, attaches NF4Payload, drops originals. `ensure_weights()` → uploads NF4→dequant to FP16 per-stage before forward. `free_weights()` → sets param.data=empty(0) after backward. `estimate_module_upload_gib()` → NF4-savvy size estimation. |
+| `upload.py` | `prepare_nf4()` → quantizes frozen 2D weights, attaches NF4Payload, drops originals. `prepare_nf4_from_cache()` → loads precomputed NF4 payloads from disk without re-quantization when used with meta/staged construction. `ensure_weights()` → uploads NF4→dequant to FP16 per-stage before forward. `free_weights()` → sets param.data=empty(0) after backward. `estimate_module_upload_gib()` → NF4-savvy size estimation. `load_module_fp16_from_checkpoint()` → streams individual module weights from the HF checkpoint (safe_open) for staged loading. |
 | `nf4_linear.py` | `NF4Linear` — frozen Linear with 4-bit weight on GPU, JIT-dequant in forward. **Currently not used** — we use CPU→GPU streaming instead. |
 
 ### Model architectures — adding new models
@@ -621,8 +645,11 @@ scripts/train.py
 | File | Purpose |
 |---|---|
 | `model/registry.py` | `ModelArch` base class, `@register("name")` decorator, `build_pipeline()` entry |
-| `model/lfm25.py` | LFM2.5-8B-A1B: prefix, wrapped layer, postfix, `Lfm25FlashAttention` |
-| `model/qwen35.py` | Qwen3.5-9B: same structure, `Qwen35FlashAttention` with sliding window |
+| `model/lfm25.py` | LFM2.5-8B-A1B: prefix, wrapped layer, postfix, `Lfm25FlashAttention`; packed-mode dispatch to `flash_attn_varlen_func` |
+| `model/qwen35.py` | Qwen3.5-9B: same structure, `Qwen35FlashAttention` with sliding window; packed-mode dispatch |
+| `model/llama.py` | Llama-family adapter (TinyLlama validated) |
+| `model/qwen3.py` | Qwen3 dense adapter (Qwen3-0.6B validated) |
+| `model/qwen3_moe.py` | Qwen3-MoE adapter (Qwen3-30B-A3B validated); router aux loss |
 | `model/mlp_opt.py` | Three MLP optimizations: CheckpointedModule, TokenChunkedModule, MemoryFlatFrozenMLP |
 | `model/blocked_loss.py` | `BlockedPostfixCausalLMLoss` — norm+lm_head in blocks with per-chunk backward + CPU grad save |
 
@@ -640,7 +667,7 @@ scripts/train.py
 |---|---|
 | `optim.py` | `PerDeviceOptimizer` — one AdamW per device, synchronised LR scheduling |
 | `checkpoint.py` | `save_checkpoint()` / `load_checkpoint()` — PEFT safetensors + JSON metadata by default; legacy `.pt` opt-in |
-| `utils.py` | device detection, `gpu_memory_snapshot()`, `get_optimal_tensor_split()` |
+| `utils.py` | device detection, `gpu_memory_snapshot()`, `host_rss_gib()`, `release_cached_memory()`, `get_optimal_tensor_split()` |
 
 ## Training Mechanics — How a Single Step Works
 
@@ -906,9 +933,12 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | Flag | Default | Description |
 |---|---|---|
 | `--num-microbatch` | 1 | Split batch into N microbatches (gradient accumulation) |
+| `--pytree-batch` | False | Use pytree-based batch splitting for arbitrary input shapes |
+| `--packing` | False | Sample packing: concatenate variable-length samples into 1D sequences with per-segment position IDs, eliminating wasted compute on padding tokens |
 | `--checkpoint-decoder-layer` | True | Activation checkpointing per decoder layer |
 | `--no-nf4` | False | Disable NF4 frozen weight compression (FP16 direct upload) |
 | `--nf4-scope` | `all` | NF4 prep scope: `all` includes prefix/stages/postfix; `layers` matches qz-roundpipe layers-only prep for large Qwen embedding/head tensors |
+| `--low-rss-nf4-build` | False | Build the HF module skeleton on meta and stream checkpoint tensors during NF4 preparation instead of loading the full FP16 model into host RAM |
 | `--nf4-min-numel` | 4096 | Minimum frozen 2D parameter elements to NF4-quantize |
 | `--nf4-layer-size-floor-gib` | 0.0 | qz-roundpipe-style scheduler hint: floor each layer's estimated stage-planning size |
 | `--nf4-cache-dir` | `/workspace/cache/nf4-frozen` | Directory to cache NF4 payloads; a model-id subdirectory is added automatically |

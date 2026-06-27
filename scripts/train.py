@@ -23,6 +23,7 @@ import argparse
 from contextlib import nullcontext
 import itertools
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 
 from stratum import build_pipeline
@@ -41,6 +42,7 @@ from stratum.batch import (
     microbatch_loss_scale,
     reduce_microbatch_losses,
     split_training_batch,
+    training_token_counts,
 )
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
@@ -64,6 +66,40 @@ def compute_stream_context_for(tensor: torch.Tensor):
     if not torch.is_tensor(tensor) or not tensor.is_cuda:
         return nullcontext()
     return torch.cuda.stream(torch.cuda.default_stream(tensor.device))
+
+
+def init_empty_weights_context():
+    try:
+        from transformers.modeling_utils import init_empty_weights
+        return init_empty_weights()
+    except ImportError:
+        from accelerate import init_empty_weights
+        return init_empty_weights()
+
+
+def materialize_trainable_meta_parameters(module: torch.nn.Module) -> int:
+    """Allocate CPU storage for trainable adapter params created on meta."""
+    count = 0
+    for module_name, submodule in module.named_modules():
+        for param_name, param in list(submodule.named_parameters(recurse=False)):
+            if not param.requires_grad or param.device.type != "meta":
+                continue
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            data = torch.empty(tuple(param.shape), dtype=param.dtype, device="cpu")
+            if "lora_A" in full_name:
+                torch.nn.init.kaiming_uniform_(data, a=math.sqrt(5))
+            elif "lora_B" in full_name:
+                torch.nn.init.zeros_(data)
+            elif data.ndim >= 2:
+                torch.nn.init.kaiming_uniform_(data, a=math.sqrt(5))
+            else:
+                torch.nn.init.zeros_(data)
+            submodule.register_parameter(
+                param_name,
+                torch.nn.Parameter(data, requires_grad=True),
+            )
+            count += 1
+    return count
 
 
 class PretokJsonlDataset(Dataset):
@@ -187,6 +223,8 @@ def main():
                     help="Experimentally prefetch next stage NF4 payloads on a side stream before use")
     ap.add_argument("--nf4-cache-dir", default="/workspace/cache/nf4-frozen",
                     help="Directory to cache quantised NF4 payloads. A model-id subdirectory is added automatically.")
+    ap.add_argument("--low-rss-nf4-build", action="store_true",
+                    help="Build the HF module skeleton on meta and stream weights during NF4 preparation instead of loading the full FP16 model into host RAM.")
     ap.add_argument("--resume", default="",
                     help="Checkpoint path to resume from")
     # MLP optimizations (mutually exclusive with each other)
@@ -301,6 +339,8 @@ def main():
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
     if args.stratum_stage_memory_limit_gib < 0:
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
+    if args.low_rss_nf4_build and args.no_nf4:
+        raise ValueError("--low-rss-nf4-build requires NF4; remove --no-nf4")
 
     def _safe_cache_component(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "model"
@@ -338,14 +378,34 @@ def main():
     mark_phase("before_model_load")
     print(f"Loading model {args.hf_model}...", flush=True)
     hf_attn_impl = "eager" if args.attn_implementation == "flash" else args.attn_implementation
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        args.hf_model,
-        trust_remote_code=True,
-        dtype=torch.float16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        attn_implementation=hf_attn_impl,
-    )
+    if args.low_rss_nf4_build:
+        config = AutoConfig.from_pretrained(
+            args.hf_model,
+            trust_remote_code=True,
+        )
+        config.use_cache = False
+        config._attn_implementation = hf_attn_impl
+        config.torch_dtype = torch.float16
+        with init_empty_weights_context():
+            hf_model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=True,
+                dtype=torch.float16,
+                attn_implementation=hf_attn_impl,
+            )
+        if hasattr(hf_model, "tie_weights"):
+            hf_model.tie_weights()
+        hf_model.name_or_path = args.hf_model
+        print("Model skeleton initialized on meta device", flush=True)
+    else:
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model,
+            trust_remote_code=True,
+            dtype=torch.float16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+            attn_implementation=hf_attn_impl,
+        )
     hf_model.config.use_cache = False
     hf_model.config._attn_implementation = hf_attn_impl
     print({"attn_implementation": args.attn_implementation,
@@ -370,6 +430,9 @@ def main():
         target_modules=_lora_target_modules(args.lora_target_set),
     )
     hf_model = get_peft_model(hf_model, lora_cfg)
+    if args.low_rss_nf4_build:
+        n_materialized = materialize_trainable_meta_parameters(hf_model)
+        print({"trainable_meta_params_materialized": n_materialized}, flush=True)
     hf_model.print_trainable_parameters()
 
     # Operator telemetry hooks (on base model before extraction)
@@ -412,15 +475,15 @@ def main():
         stage_memory_limit_gib=args.stratum_stage_memory_limit_gib,
         nf4_layer_size_floor_gib=args.nf4_layer_size_floor_gib,
         prefetch_nf4=args.prefetch_nf4,
+        hf_model_name_or_path=args.hf_model,
         output_router_logits=args.output_router_logits,
         router_aux_loss_coef=args.router_aux_loss_coef,
     )
 
-    # The pipeline's prefix/stages/postfix reference the core model
-    # parameters directly. The original hf_model (PEFT wrapper) is no
-    # longer needed — drop it so any HF loading buffers can be reclaimed.
+    # The PEFT wrapper is retained for adapter checkpoint save/load. Its base
+    # modules are the same objects referenced by the pipeline; NF4 preparation
+    # has already released or avoided the large FP16 frozen tensors.
     from stratum.utils import release_cached_memory
-    del hf_model
     release_cached_memory(verbose=True)
     mark_memory_phase("after_pipeline_build", args.host_ram_limit_gib)
 
@@ -701,8 +764,9 @@ def main():
         pipeline.free_all_weights()
 
         dt = time.time() - iter_t0
-        total_tokens = int(attention_mask.sum().item())
-        trainable_tokens = int((labels != -100).sum().item())
+        total_tokens, trainable_tokens = training_token_counts(
+            input_ids, attention_mask, labels
+        )
         iter_loss = loss.item()
 
         # Structured step log (same format as RoundPipe)

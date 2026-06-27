@@ -19,6 +19,7 @@ class PackageExportsTest(unittest.TestCase):
             "flash_window_right",
             "dense_attention_masks",
             "stage_memory_limit_gib",
+            "hf_model_name_or_path",
         ]:
             self.assertIn(name, params)
 
