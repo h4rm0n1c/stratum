@@ -54,6 +54,7 @@ class _AnchorMeta:
     on_backward_complete: Optional[Callable[[], None]]
     iter_timer: Optional[IterLayerTimer] = None
     layer_ids: Optional[range] = None
+    look_ahead_upload: Optional[Callable[[], None]] = None
     launched_backward: bool = False
 
 
@@ -145,6 +146,9 @@ class _ExplicitGroupBackward(torch.autograd.Function):
             raise RuntimeError("Stratum explicit group backward does not support double backward")
         meta.launched_backward = True
 
+        if meta.look_ahead_upload is not None:
+            meta.look_ahead_upload()
+
         output_leaves = [None] * meta.output_leaf_count
         for leaf_index, grad in zip(meta.output_indices, grad_outputs):
             output_leaves[leaf_index] = grad
@@ -183,6 +187,7 @@ def anchor_explicit_group_backward(
     on_backward_complete: Optional[Callable[[], None]] = None,
     iter_timer: Optional[IterLayerTimer] = None,
     layer_ids: Optional[range] = None,
+    look_ahead_upload: Optional[Callable[[], None]] = None,
 ) -> Any:
     """Replace one group output's autograd edge with explicit recompute.
 
@@ -240,6 +245,7 @@ def anchor_explicit_group_backward(
         on_backward_complete=on_backward_complete,
         iter_timer=iter_timer,
         layer_ids=layer_ids,
+        look_ahead_upload=look_ahead_upload,
     )
     input_tensors = [flat_input[idx] for idx in input_indices]
     anchored_values = _ExplicitGroupBackward.apply(

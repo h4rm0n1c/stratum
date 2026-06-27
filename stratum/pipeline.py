@@ -131,6 +131,7 @@ class StratumPipeline(nn.Module):
         self._steps_until_adapt: int = 0
         self._total_layers: int = total_layers
         self._param_upstream_streams: dict[int, "torch.cuda.Stream"] = {}
+        self._pending_bwd_fences: dict[int, "torch.cuda.Event"] = {}
 
         log_event(
             "scheduler_plan",
@@ -608,6 +609,12 @@ class StratumPipeline(nn.Module):
         fence.record(param_stream)
         return fence
 
+    def _start_bwd_look_ahead(self, fwd_group_id: int) -> None:
+        """Pre-upload first layer of fwd_group_id on param_upstream for backward recompute."""
+        fence = self._upload_first_layer_with_fence(fwd_group_id)
+        if fence is not None:
+            self._pending_bwd_fences[fwd_group_id] = fence
+
     def _prefetch_stage_group(self, fwd_group_id: int) -> Optional[NF4Prefetch]:
         stage_index, _, _, _ = self._fwd_group_locations[fwd_group_id]
         stage = self.stages[stage_index]
@@ -660,6 +667,7 @@ class StratumPipeline(nn.Module):
         self._active_group_complete_callbacks = {}
         self._active_group_completed = set()
         self._active_group_backward_t0 = {}
+        self._pending_bwd_fences = {}
 
         # Stream prefix weights to device 0 before embedding lookup.
         self._ensure_module(self.prefix, 0, "prefix")
@@ -896,9 +904,13 @@ class StratumPipeline(nn.Module):
                     _local_stop: int = local_stop,
                     _iter_timer: Optional[IterLayerTimer] = iter_timer,
                     _param_stream: Optional["torch.cuda.Stream"] = _group_param_stream,
+                    _fwd_group_id: int = fwd_group_id,
                 ) -> tuple:
-                    # Recompute path: weights were freed after forward; upload per-layer.
-                    # No first_layer_fence — weights start empty.
+                    # Consume any look-ahead fence pre-uploaded by the previous group's
+                    # backward pass. On NF4 paths where weights stay on GPU from forward,
+                    # this is a no-op fence (ensure_weights exits early). On paths where
+                    # weights are freed after forward it provides real overlap.
+                    _fence = self._pending_bwd_fences.pop(_fwd_group_id, None)
                     return self._run_stage_group(
                         _stage,
                         input_data,
@@ -907,6 +919,7 @@ class StratumPipeline(nn.Module):
                         record_layer_timing=False,
                         iter_timer=_iter_timer,
                         param_stream=_param_stream,
+                        first_layer_fence=_fence,
                     )
 
                 group_compute_stream = (
@@ -914,6 +927,13 @@ class StratumPipeline(nn.Module):
                     if torch.is_tensor(group_input_hidden) and group_input_hidden.is_cuda
                     else None
                 )
+                if fwd_group_id > 0:
+                    _prev = fwd_group_id - 1
+
+                    def _look_ahead(*, _p: int = _prev) -> None:
+                        self._start_bwd_look_ahead(_p)
+                else:
+                    _look_ahead = None
                 tuple_data = anchor_explicit_group_backward(
                     run_group=_run_group,
                     group_input=group_input,
@@ -925,6 +945,7 @@ class StratumPipeline(nn.Module):
                     on_backward_complete=complete_group,
                     iter_timer=iter_timer,
                     layer_ids=group_range,
+                    look_ahead_upload=_look_ahead,
                 )
                 pending_scheduler_wait_hooks.append(
                     (stage_index, fwd_group_id, bwd_group_id, group_range, tuple_data[0])
