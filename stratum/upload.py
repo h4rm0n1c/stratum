@@ -406,51 +406,14 @@ def estimate_module_upload_gib(module: torch.nn.Module) -> float:
     return total / 10**9
 
 
-@torch.no_grad()
-def load_module_fp16_from_checkpoint(
-    module: torch.nn.Module,
-    hf_model_name: str,
-    *,
-    verbose: bool = False,
-) -> bool:
-    """Load FP16 weights for one pipeline *module* from the HF checkpoint.
+def _build_ckpt_key_fn(module: torch.nn.Module):
+    """Return a callable ``ckpt_keys(pname) -> list[str]`` for *module*.
 
-    Uses ``safetensors.safe_open`` to stream individual tensors — never
-    materialises the full checkpoint into RAM.  The module's meta-device
-    parameters are populated with their trained FP16 values, ready for
-    ``prepare_nf4()`` to quantise.
-
-    Pipeline parameter names (e.g. ``layers.0.layer.self_attn.q_proj.weight``)
-    differ from checkpoint keys (``model.layers.0.self_attn.q_proj.weight``).
-    This function tries the pipeline name and a suffix-matched key.
-
-    Returns ``True`` if every module parameter was loaded, ``False`` on
-    any failure.
+    Generates candidate HF checkpoint key variants for a pipeline parameter
+    name, accounting for ``.layer.``, ``.base_layer.``, and ``.inner.``
+    wrappers inserted by Stratum/PEFT.
     """
-    import json as _json
     import re as _re
-    from pathlib import Path as _Path
-    from safetensors import safe_open
-    from transformers.utils.hub import cached_file as _cached_file
-
-    # Find checkpoint files.
-    try:
-        _idx = _cached_file(hf_model_name, "model.safetensors.index.json", cache_dir=None)
-    except OSError:
-        _idx = None
-
-    # Build a list of (pipeline_name, parameter) for params still on meta.
-    _needed: list[tuple[str, torch.nn.Parameter]] = []
-    for _n, _p in module.named_parameters():
-        if _p.device.type != "meta":
-            continue
-        if _p.requires_grad:
-            continue  # LoRA adapter — initialised by PEFT
-        _needed.append((_n, _p))
-
-    if not _needed:
-        return True  # nothing to load
-    _owner_map = _build_param_owner_map(module)
 
     _layer_prefixes: list[tuple[str, str]] = []
     for _module_name, _submodule in module.named_modules():
@@ -462,12 +425,10 @@ def load_module_fp16_from_checkpoint(
     def _without_peft_base_layer(name: str) -> str:
         return name.replace(".base_layer.", ".")
 
-    # Generate candidate checkpoint key for a pipeline param name.
     def _ckpt_keys(pname: str) -> list[str]:
-        keys = []
+        keys: list[str] = []
 
         def _add(name: str) -> None:
-            # Expand each candidate with and without stratum-internal .inner. wrapper.
             _variants = [name]
             _no_inner = name.replace(".inner.", ".")
             if _no_inner != name:
@@ -490,58 +451,114 @@ def load_module_fp16_from_checkpoint(
         for _prefix, _global_prefix in _layer_prefixes:
             if pname.startswith(_prefix):
                 _add(_global_prefix + pname[len(_prefix):])
-        return list(dict.fromkeys(keys))  # deduplicate
+        return list(dict.fromkeys(keys))
 
-    def _load_lfm_fused_experts_from_single(
-        handle,
-        keys: set[str],
-        pname: str,
-        param: torch.nn.Parameter,
-    ) -> torch.Tensor | None:
-        suffixes = {
-            ".feed_forward.experts.gate_up_proj": ("gate_up",),
-            ".feed_forward.experts.down_proj": ("down",),
-        }
-        matched_suffix = None
-        for suffix in suffixes:
-            if pname.endswith(suffix):
-                matched_suffix = suffix
-                break
-        if matched_suffix is None or param.ndim != 3:
-            return None
+    return _ckpt_keys
 
-        for candidate in _ckpt_keys(pname):
-            if not candidate.endswith(matched_suffix):
-                continue
-            base = candidate[: -len(matched_suffix)] + ".feed_forward.experts"
-            n_experts = int(param.shape[0])
-            if matched_suffix.endswith("gate_up_proj"):
-                required = [
-                    key
-                    for expert_idx in range(n_experts)
-                    for key in (
-                        f"{base}.{expert_idx}.w1.weight",
-                        f"{base}.{expert_idx}.w3.weight",
-                    )
-                ]
-                if not all(key in keys for key in required):
-                    continue
-                expert_tensors = []
-                for expert_idx in range(n_experts):
-                    w1 = handle.get_tensor(f"{base}.{expert_idx}.w1.weight")
-                    w3 = handle.get_tensor(f"{base}.{expert_idx}.w3.weight")
-                    expert_tensors.append(torch.cat([w1, w3], dim=0))
-                return torch.stack(expert_tensors, dim=0)
 
+def _try_load_fused_experts(
+    handle,
+    keys: set[str],
+    pname: str,
+    param: torch.nn.Parameter,
+    ckpt_key_fn,
+) -> "torch.Tensor | None":
+    """Reconstruct a fused MoE expert tensor from per-expert checkpoint keys.
+
+    Returns the stacked tensor or ``None`` if *pname* is not a fused-expert
+    parameter or the required per-expert keys are not present.
+    """
+    suffixes = {
+        ".feed_forward.experts.gate_up_proj": ("gate_up",),
+        ".feed_forward.experts.down_proj": ("down",),
+    }
+    matched_suffix = None
+    for suffix in suffixes:
+        if pname.endswith(suffix):
+            matched_suffix = suffix
+            break
+    if matched_suffix is None or param.ndim != 3:
+        return None
+
+    for candidate in ckpt_key_fn(pname):
+        if not candidate.endswith(matched_suffix):
+            continue
+        base = candidate[: -len(matched_suffix)] + ".feed_forward.experts"
+        n_experts = int(param.shape[0])
+        if matched_suffix.endswith("gate_up_proj"):
             required = [
-                f"{base}.{expert_idx}.w2.weight"
+                key
                 for expert_idx in range(n_experts)
+                for key in (
+                    f"{base}.{expert_idx}.w1.weight",
+                    f"{base}.{expert_idx}.w3.weight",
+                )
             ]
             if not all(key in keys for key in required):
                 continue
-            return torch.stack([handle.get_tensor(key) for key in required], dim=0)
+            expert_tensors = []
+            for expert_idx in range(n_experts):
+                w1 = handle.get_tensor(f"{base}.{expert_idx}.w1.weight")
+                w3 = handle.get_tensor(f"{base}.{expert_idx}.w3.weight")
+                expert_tensors.append(torch.cat([w1, w3], dim=0))
+            return torch.stack(expert_tensors, dim=0)
 
-        return None
+        required = [
+            f"{base}.{expert_idx}.w2.weight"
+            for expert_idx in range(n_experts)
+        ]
+        if not all(key in keys for key in required):
+            continue
+        return torch.stack([handle.get_tensor(key) for key in required], dim=0)
+
+    return None
+
+
+@torch.no_grad()
+def load_module_fp16_from_checkpoint(
+    module: torch.nn.Module,
+    hf_model_name: str,
+    *,
+    verbose: bool = False,
+) -> bool:
+    """Load FP16 weights for one pipeline *module* from the HF checkpoint.
+
+    Uses ``safetensors.safe_open`` to stream individual tensors — never
+    materialises the full checkpoint into RAM.  The module's meta-device
+    parameters are populated with their trained FP16 values, ready for
+    ``prepare_nf4()`` to quantise.
+
+    Pipeline parameter names (e.g. ``layers.0.layer.self_attn.q_proj.weight``)
+    differ from checkpoint keys (``model.layers.0.self_attn.q_proj.weight``).
+    This function tries the pipeline name and a suffix-matched key.
+
+    Returns ``True`` if every module parameter was loaded, ``False`` on
+    any failure.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from safetensors import safe_open
+    from transformers.utils.hub import cached_file as _cached_file
+
+    # Find checkpoint files.
+    try:
+        _idx = _cached_file(hf_model_name, "model.safetensors.index.json", cache_dir=None)
+    except OSError:
+        _idx = None
+
+    # Build a list of (pipeline_name, parameter) for params still on meta.
+    _needed: list[tuple[str, torch.nn.Parameter]] = []
+    for _n, _p in module.named_parameters():
+        if _p.device.type != "meta":
+            continue
+        if _p.requires_grad:
+            continue  # LoRA adapter — initialised by PEFT
+        _needed.append((_n, _p))
+
+    if not _needed:
+        return True  # nothing to load
+    _owner_map = _build_param_owner_map(module)
+    _ckpt_keys = _build_ckpt_key_fn(module)
 
     if _idx is not None and _Path(_idx).exists():
         # Sharded checkpoint.
@@ -611,7 +628,7 @@ def load_module_fp16_from_checkpoint(
                         _found = True
                         break
                 if not _found:
-                    _fused = _load_lfm_fused_experts_from_single(_f, _all, _n, _p)
+                    _fused = _try_load_fused_experts(_f, _all, _n, _p, _ckpt_keys)
                     if _fused is None:
                         if verbose:
                             print(f"  load_module: no checkpoint key for {_n}", flush=True)
@@ -630,6 +647,243 @@ def load_module_fp16_from_checkpoint(
                         return False
 
     return True
+
+
+@torch.no_grad()
+def stream_load_and_quantize_module(
+    module: torch.nn.Module,
+    hf_model_name: str,
+    *,
+    min_numel: int = 4096,
+    cache_dir: Optional[Path | str] = None,
+    blocksize: int = 64,
+    quant_type: str = "nf4",
+    verbose: bool = False,
+) -> Optional[NF4Stats]:
+    """Load and NF4-quantize a meta-device module in a single streaming pass.
+
+    Replaces the two-step ``load_module_fp16_from_checkpoint`` + ``prepare_nf4``
+    sequence used in the ``--low-rss-nf4-build`` path.  For each frozen param:
+
+    - NF4-eligible + cache hit  → load tiny cache file, skip FP16 load entirely
+    - NF4-eligible + cache miss → load single FP16 tensor, quantize immediately,
+      free FP16 before moving to next param
+    - Non-eligible (small/grad) → load FP16, keep
+
+    Peak RSS = accumulated NF4 payloads so far + one FP16 tensor, rather than
+    the entire module in FP16 simultaneously.
+
+    Returns ``NF4Stats`` on success, ``None`` on any checkpoint key miss.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from safetensors import safe_open
+    from transformers.utils.hub import cached_file as _cached_file
+    from bitsandbytes.functional import quantize_4bit
+
+    try:
+        _idx = _cached_file(hf_model_name, "model.safetensors.index.json", cache_dir=None)
+    except OSError:
+        _idx = None
+
+    cache_root = _Path(cache_dir) if cache_dir else None
+    _owner_map = _build_param_owner_map(module)
+    _ckpt_keys = _build_ckpt_key_fn(module)
+
+    def _nf4_eligible(param: torch.nn.Parameter) -> bool:
+        return (
+            param.ndim >= 2
+            and param.numel() >= min_numel
+            and param.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+
+    def _quantize_and_attach(
+        name: str, param: torch.nn.Parameter, data: torch.Tensor, stats: NF4Stats,
+    ) -> None:
+        orig_shape = tuple(data.shape)
+        weight = data.contiguous()
+        if weight.ndim > 2:
+            weight = weight.reshape(-1, weight.shape[-1])
+        quantized, q_state = quantize_4bit(
+            weight, blocksize=blocksize, compress_statistics=False, quant_type=quant_type,
+        )
+        del weight
+        payload = NF4Payload(
+            quantized=_pin_cpu(quantized),
+            absmax=_pin_cpu(q_state.absmax),
+            code=_pin_cpu(q_state.code),
+            shape=orig_shape,
+            dtype=q_state.dtype,
+            blocksize=int(q_state.blocksize),
+            quant_type=str(q_state.quant_type),
+            source_numel=int(param.numel()),
+            source_bytes=int(param.numel() * param.element_size()),
+            payload_bytes=_payload_bytes(quantized, q_state.absmax, q_state.code),
+        )
+        cache_path = _cache_path(cache_root, name) if cache_root else None
+        if cache_path:
+            _save_payload_to_cache(cache_path, payload)
+            stats.cache_writes += 1
+            stats.cache_misses += 1
+        setattr(param, NF4_ATTR, payload)
+        _owner, _pname = _owner_map.get(id(param), (None, None))
+        _replace_param_data(
+            param, torch.empty(0, dtype=payload.dtype, device="cpu"),
+            owner=_owner, pname=_pname,
+        )
+        stats.tensors += 1
+        stats.source_bytes += payload.source_bytes
+        stats.payload_bytes += payload.payload_bytes
+
+    def _attach_from_cache(
+        name: str, param: torch.nn.Parameter, stats: NF4Stats,
+    ) -> bool:
+        if cache_root is None:
+            return False
+        payload = _load_payload_from_cache(
+            _cache_path(cache_root, name), param, blocksize=blocksize, quant_type=quant_type,
+        )
+        if payload is None:
+            return False
+        setattr(param, NF4_ATTR, payload)
+        _owner, _pname = _owner_map.get(id(param), (None, None))
+        _replace_param_data(
+            param, torch.empty(0, dtype=payload.dtype, device="cpu"),
+            owner=_owner, pname=_pname,
+        )
+        stats.tensors += 1
+        stats.source_bytes += payload.source_bytes
+        stats.payload_bytes += payload.payload_bytes
+        stats.cache_hits += 1
+        return True
+
+    # Collect params that need attention: on meta device, not LoRA, not already processed.
+    _needed: list[tuple[str, torch.nn.Parameter]] = []
+    for _n, _p in module.named_parameters():
+        if _p.requires_grad:
+            continue
+        if hasattr(_p, NF4_ATTR):
+            _s = cast(NF4Payload, getattr(_p, NF4_ATTR))
+            # Already quantized — count it in stats at the end.
+            continue
+        if _p.device.type != "meta" and _p.data.numel() != 0:
+            continue  # already populated non-NF4 param
+        _needed.append((_n, _p))
+
+    stats = NF4Stats()
+
+    # Count already-attached payloads from a prior prepare_nf4_from_cache pass.
+    for _n, _p in module.named_parameters():
+        if hasattr(_p, NF4_ATTR):
+            _pl = cast(NF4Payload, getattr(_p, NF4_ATTR))
+            stats.tensors += 1
+            stats.source_bytes += _pl.source_bytes
+            stats.payload_bytes += _pl.payload_bytes
+
+    if not _needed:
+        if verbose:
+            print(
+                f"  stream_nf4: {stats.tensors} tensors already processed "
+                f"({stats.source_bytes/1024**3:.2f} GiB -> {stats.payload_bytes/1024**3:.2f} GiB)",
+                flush=True,
+            )
+        return stats
+
+    if _idx is not None and _Path(_idx).exists():
+        # Sharded checkpoint.
+        _base = _Path(_idx).parent
+        with open(_idx) as _f:
+            _wm = _json.load(_f)["weight_map"]
+
+        # Phase 1: serve cache hits without touching the checkpoint shards.
+        _load_needed: list[tuple[str, torch.nn.Parameter, str]] = []
+        for _n, _p in _needed:
+            if _nf4_eligible(_p) and _attach_from_cache(_n, _p, stats):
+                continue
+            _found = False
+            for _ck in _ckpt_keys(_n):
+                if _ck in _wm:
+                    _load_needed.append((_n, _p, _ck))
+                    _found = True
+                    break
+            if not _found:
+                if verbose:
+                    print(f"  stream_nf4: no checkpoint key for {_n}", flush=True)
+                return None
+
+        # Phase 2: open each shard once, process tensor by tensor.
+        _shard_groups: dict[str, list[tuple[str, torch.nn.Parameter, str]]] = {}
+        for _n, _p, _ck in _load_needed:
+            _shard_groups.setdefault(_wm[_ck], []).append((_n, _p, _ck))
+
+        for _shard, _items in _shard_groups.items():
+            _sp = _base / _shard
+            if not _sp.exists():
+                return None
+            with safe_open(str(_sp), framework="pt") as _f:
+                for _n, _p, _ck in _items:
+                    _t = _f.get_tensor(_ck).to(device="cpu", dtype=_p.dtype)
+                    if _nf4_eligible(_p):
+                        _quantize_and_attach(_n, _p, _t, stats)
+                        del _t
+                    else:
+                        _owner, _pname = _owner_map.get(id(_p), (None, None))
+                        try:
+                            _replace_param_data(_p, _t, owner=_owner, pname=_pname)
+                        except (RuntimeError, TypeError):
+                            if verbose:
+                                print(f"  stream_nf4: can't set data for {_n}", flush=True)
+                            return None
+    else:
+        # Single-file checkpoint.
+        try:
+            _sf = _cached_file(hf_model_name, "model.safetensors", cache_dir=None)
+        except OSError:
+            _sf = None
+        if _sf is None or not _Path(_sf).exists():
+            return None
+
+        with safe_open(str(_sf), framework="pt") as _f:
+            _all = set(_f.keys())
+            for _n, _p in _needed:
+                # Cache hit: skip FP16 load entirely.
+                if _nf4_eligible(_p) and _attach_from_cache(_n, _p, stats):
+                    continue
+                # Load from checkpoint.
+                _t = None
+                for _ck in _ckpt_keys(_n):
+                    if _ck in _all:
+                        _t = _f.get_tensor(_ck).to(device="cpu", dtype=_p.dtype)
+                        break
+                if _t is None:
+                    _t = _try_load_fused_experts(_f, _all, _n, _p, _ckpt_keys)
+                    if _t is not None:
+                        _t = _t.to(device="cpu", dtype=_p.dtype)
+                if _t is None:
+                    if verbose:
+                        print(f"  stream_nf4: no checkpoint key for {_n}", flush=True)
+                    return None
+                if _nf4_eligible(_p):
+                    _quantize_and_attach(_n, _p, _t, stats)
+                    del _t
+                else:
+                    _owner, _pname = _owner_map.get(id(_p), (None, None))
+                    try:
+                        _replace_param_data(_p, _t, owner=_owner, pname=_pname)
+                    except (RuntimeError, TypeError):
+                        if verbose:
+                            print(f"  stream_nf4: can't set data for {_n}", flush=True)
+                        return None
+
+    if verbose:
+        print(
+            f"  nf4 total: {stats.tensors} tensors, "
+            f"{stats.source_bytes/1024**3:.2f} GiB -> {stats.payload_bytes/1024**3:.2f} GiB payload "
+            f"(compression {stats.compression:.2f}x, "
+            f"cache hits={stats.cache_hits} misses={stats.cache_misses} writes={stats.cache_writes})",
+            flush=True,
+        )
+    return stats
 
 
 @torch.no_grad()

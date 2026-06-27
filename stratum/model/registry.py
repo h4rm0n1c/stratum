@@ -170,66 +170,33 @@ class ModelArch:
                     )
                 return _hf_name
 
-            # Try cache-only fast path first.  When every qualifying param
-            # has a cached NF4 payload we skip ``quantize_4bit()`` entirely
-            # and just load the pre-computed payloads from disk.
-            _need_fallback = True
-            if nf4_cache_dir is not None:
-                from stratum.upload import prepare_nf4_from_cache
-                _all_cached = True
-                for _mod in nf4_modules:
-                    if prepare_nf4_from_cache(
+            if _is_meta_model:
+                # Single streaming pass per module: check NF4 cache first for
+                # each param, quantize cache misses inline, load small non-NF4
+                # params as FP16.  Peak RSS = accumulated NF4 payloads + one
+                # FP16 tensor rather than the entire module in FP16.
+                from stratum.upload import stream_load_and_quantize_module
+                from stratum.utils import release_cached_memory as _rcm
+                _hf_name = _resolve_hf_source()
+                for idx, _mod in enumerate(nf4_modules):
+                    _stats = stream_load_and_quantize_module(
                         _mod,
-                        nf4_cache_dir,
-                        verbose=False,
+                        _hf_name,
                         min_numel=nf4_min_numel,
-                    ) is None:
-                        _all_cached = False
-                        break
-                if _all_cached:
-                    _need_fallback = False
-                    if verbose:
-                        vwrite("  nf4: all payloads loaded from cache")
-                    if _is_meta_model:
-                        from stratum.upload import load_module_fp16_from_checkpoint
-                        from stratum.utils import release_cached_memory as _rcm
-                        _hf_name = _resolve_hf_source()
-                        for idx, _mod in enumerate(nf4_modules):
-                            ok = load_module_fp16_from_checkpoint(
-                                _mod, _hf_name, verbose=verbose,
-                            )
-                            if not ok:
-                                raise RuntimeError(
-                                    f"staged non-NF4 load failed for module {idx}"
-                                )
-                            _rcm()
-
-            if _need_fallback:
-                # Check whether the model was loaded on meta (staged load)
-                # or on CPU (normal FP16 load — params already populated).
-                if _is_meta_model:
-                    # Staged FP16 load: for each module, load only its
-                    # weights from the HF checkpoint (streaming via
-                    # safe_open), quantize to NF4, and free the FP16 data
-                    # before loading the next module.  Peak RSS stays at
-                    # ~max module size rather than the full model.
-                    from stratum.upload import (
-                        load_module_fp16_from_checkpoint,
+                        cache_dir=nf4_cache_dir,
+                        blocksize=nf4_kwargs.get("blocksize", 64),
+                        quant_type=nf4_kwargs.get("quant_type", "nf4"),
+                        verbose=verbose,
                     )
-                    from stratum.utils import release_cached_memory as _rcm
-                    _hf_name = _resolve_hf_source()
-                    for idx, _mod in enumerate(nf4_modules):
-                        ok = load_module_fp16_from_checkpoint(_mod, _hf_name, verbose=verbose)
-                        if not ok:
-                            raise RuntimeError(f"staged FP16 load failed for module {idx}")
-                        prepare_nf4(_mod, **nf4_kwargs)
-                        _rcm()
-                    if verbose:
-                        vwrite("  staged FP16 load: all modules processed")
-                else:
-                    # Normal path: params already on CPU, just quantize.
-                    for _mod in nf4_modules:
-                        prepare_nf4(_mod, **nf4_kwargs)
+                    if _stats is None:
+                        raise RuntimeError(f"stream NF4 build failed for module {idx}")
+                    _rcm()
+                if verbose:
+                    vwrite("  stream NF4 build: all modules processed")
+            else:
+                # Model already on CPU: params populated, just quantize.
+                for _mod in nf4_modules:
+                    prepare_nf4(_mod, **nf4_kwargs)
         else:
             fp16_kwargs = dict(verbose=verbose, min_numel=nf4_min_numel)
             prepare_fp16_staged(pipeline.prefix, **fp16_kwargs)
