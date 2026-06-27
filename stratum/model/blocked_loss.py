@@ -21,6 +21,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase as _log_phase
+from stratum.output import vprint
 
 
 def _make_block_loss(
@@ -137,13 +138,13 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
             ctx.hidden_states_dtype = hidden_states.dtype
             ctx.memory_telemetry = memory_telemetry
             if memory_telemetry:
-                print({
+                vprint({
                     "postfix_saved_grad": {
                         "shape": list(grad_hidden_states.shape),
                         "dtype": str(grad_hidden_states.dtype),
                         "element_size": grad_hidden_states.element_size(),
                     }
-                }, flush=True)
+                })
             ctx.save_for_backward(grad_hidden_states.detach().to("cpu", copy=True))
             detached_hidden.grad = None
             del grad_hidden_states

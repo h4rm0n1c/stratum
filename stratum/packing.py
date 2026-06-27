@@ -16,6 +16,24 @@ from typing import Any
 import torch
 
 
+def compute_seq_idx(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Compute per-token segment indices from cumulative sequence lengths.
+
+    For cu_seqlens = [0, 3, 7, 10], returns:
+        [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]   (int32, same device as cu_seqlens)
+
+    This is the format expected by ``causal_conv1d_fn(seq_idx=...)``, which
+    resets the convolution state at segment boundaries.  Used to make
+    ShortConv / SSM layers packing-safe.
+    """
+    total = int(cu_seqlens[-1].item())
+    device = cu_seqlens.device
+    seq_idx = torch.zeros(total, dtype=torch.int32, device=device)
+    for i, start in enumerate(cu_seqlens[1:-1], start=1):
+        seq_idx[int(start):] = i
+    return seq_idx
+
+
 def compute_cu_seqlens(lengths: list[int], device: torch.device | str = "cpu") -> torch.Tensor:
     """Compute cumulative sequence lengths from a list of sample lengths.
 
@@ -50,6 +68,8 @@ def pack_samples(
     samples: list[dict[str, torch.Tensor]],
     max_seq_len: int,
     ignore_index: int = -100,
+    strategy: str = "first_fit",
+    mask_boundaries: bool = True,
 ) -> dict[str, Any]:
     """Pack variable-length samples into a single 1D sequence.
 
@@ -60,9 +80,16 @@ def pack_samples(
     Args:
         samples: List of dicts with ``input_ids``, ``attention_mask``,
             and ``labels`` tensors (each 1D).
-        max_seq_len: Maximum total packed tokens. Samples that would
-            exceed this are dropped.
+        max_seq_len: Maximum total packed tokens.
         ignore_index: Label value for ignored tokens (default -100).
+        strategy: Packing strategy.  ``"greedy"`` stops at the first sample
+            that would overflow (original behaviour).  ``"first_fit"`` skips
+            oversized samples and continues scanning for smaller ones that
+            still fit, improving context-window utilisation.
+        mask_boundaries: When ``True`` (default) set ``labels[boundary]``
+            to ``ignore_index`` for each sample boundary after the first.
+            This prevents the model from being trained on the cross-sample
+            next-token prediction (A's last token predicts B's first token).
 
     Returns:
         Dict with:
@@ -79,18 +106,23 @@ def pack_samples(
     packed_ids: list[torch.Tensor] = []
     packed_labels: list[torch.Tensor] = []
     lengths: list[int] = []
+    used: int = 0
 
     for sample in samples:
         ids = sample["input_ids"]
         labels = sample["labels"]
         length = ids.numel()
 
-        if sum(lengths) + length > max_seq_len:
-            break
+        if used + length > max_seq_len:
+            if strategy == "greedy":
+                break
+            # first_fit: skip and try later samples
+            continue
 
         packed_ids.append(ids)
         packed_labels.append(labels)
         lengths.append(length)
+        used += length
 
     if not packed_ids:
         raise ValueError("no samples fit within max_seq_len")
@@ -102,6 +134,18 @@ def pack_samples(
     position_ids = unpack_positions(cu_seqlens)
     max_seqlen = max(lengths)
 
+    # Mask the first label of each sample after the first.  Without this,
+    # the shifted-label CE trains the model on "A's last token → B's first
+    # token", leaking information across sample boundaries.
+    if mask_boundaries and len(lengths) > 1:
+        for boundary in cu_seqlens[1:-1]:
+            labels[int(boundary)] = ignore_index
+
+    # seq_idx: per-token segment membership for causal_conv1d_fn (ShortConv
+    # / SSM layers).  Resets convolution state at boundaries so packing is
+    # correct for hybrid attention-conv models such as LFM2.5.
+    seq_idx = compute_seq_idx(cu_seqlens) if len(lengths) > 1 else None
+
     return {
         "input_ids": input_ids,
         "labels": labels,
@@ -110,6 +154,7 @@ def pack_samples(
         "max_seqlen": max_seqlen,
         "n_samples": len(lengths),
         "lengths": lengths,
+        "seq_idx": seq_idx,
     }
 
 
@@ -117,14 +162,25 @@ def pack_collate(
     batch: list[dict[str, torch.Tensor]],
     max_seq_len: int,
     ignore_index: int = -100,
+    strategy: str = "first_fit",
+    mask_boundaries: bool = True,
 ) -> dict[str, Any]:
     """Collation function for packed training.
 
     Takes a list of samples from a DataLoader and packs them into a
     single 1D sequence. Use as ``DataLoader(..., collate_fn=collate_fn)``
     where ``collate_fn = lambda b: pack_collate(b, max_seq_len=...)``.
+
+    Uses ``strategy="first_fit"`` and ``mask_boundaries=True`` by default —
+    see :func:`pack_samples` for details.
     """
-    return pack_samples(batch, max_seq_len=max_seq_len, ignore_index=ignore_index)
+    return pack_samples(
+        batch,
+        max_seq_len=max_seq_len,
+        ignore_index=ignore_index,
+        strategy=strategy,
+        mask_boundaries=mask_boundaries,
+    )
 
 
 def _split_sample_counts(n_samples: int, num_microbatch: int) -> list[int]:
@@ -162,6 +218,7 @@ def split_packed_batch(
     n_samples = packed["n_samples"]
     lengths = [int(cu[i + 1] - cu[i]) for i in range(n_samples)]
     counts = _split_sample_counts(n_samples, num_microbatch)
+    full_seq_idx = packed.get("seq_idx")  # may be None for single-sample packs
 
     mbs: list[dict[str, Any]] = []
     sample_start = 0
@@ -178,6 +235,13 @@ def split_packed_batch(
         mb_cu = mb_cu - base
         mb_max_seqlen = max(lengths[sample_start:sample_end])
 
+        if full_seq_idx is not None:
+            mb_seq_idx_raw = full_seq_idx[tok_start:tok_end]
+            seg_offset = int(mb_seq_idx_raw[0].item())
+            mb_seq_idx = mb_seq_idx_raw - seg_offset
+        else:
+            mb_seq_idx = None
+
         mbs.append({
             "input_ids": packed["input_ids"][tok_start:tok_end],
             "labels": mb_labels,
@@ -187,6 +251,7 @@ def split_packed_batch(
             "n_samples": count,
             "lengths": lengths[sample_start:sample_end],
             "trainable_tokens": trainable_tokens,
+            "seq_idx": mb_seq_idx,
         })
         sample_start = sample_end
 

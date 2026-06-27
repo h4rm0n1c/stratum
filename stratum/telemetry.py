@@ -13,8 +13,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import json
 import torch
 import torch.nn as nn
+from stratum.output import vprint, vwrite
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +163,7 @@ def enable_operator_telemetry(
         raise TypeError("expected a model with core.model.layers")
     if not layer_indices:
         if verbose:
-            print({"operator_telemetry": "no layers selected"}, flush=True)
+            vprint({"operator_telemetry": "no layers selected"})
         return 0
 
     registered = 0
@@ -172,10 +174,10 @@ def enable_operator_telemetry(
             module = getattr(layer, module_name, None)
             if module is None:
                 if verbose:
-                    print({
+                    vprint({
                         "operator_telemetry_missing_module": module_name,
                         "layer_idx": idx,
-                    }, flush=True)
+                    })
                 continue
 
             def make_pre_hook(_idx, _name):
@@ -242,8 +244,7 @@ def enable_operator_telemetry(
             registered += 1
 
     if verbose and registered:
-        print(f"  operator telemetry: {registered} hooks on layers {sorted(layer_indices)}",
-              flush=True)
+        vwrite(f"  operator telemetry: {registered} hooks on layers {sorted(layer_indices)}")
     return registered
 
 

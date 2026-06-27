@@ -9,6 +9,7 @@ requested by the caller. It is not appropriate for normal QLoRA checkpoints.
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -53,7 +54,7 @@ def save_checkpoint(
             peft_model.save_pretrained(str(out_dir))
             peft_saved = True
         except Exception as exc:
-            print({"checkpoint_peft_save_failed": str(exc)}, flush=True)
+            print(json.dumps({"event": "error", "checkpoint_peft_save_failed": str(exc)}), file=sys.stderr, flush=True)
             raise
 
     # 2. Optional legacy per-device trainable params. This deliberately walks
@@ -156,7 +157,7 @@ def load_checkpoint(
             log_event("checkpoint_load_peft", tensors=len(state_dict))
             peft_loaded = True
         except Exception as exc:
-            print({"checkpoint_peft_load_failed": str(exc)}, flush=True)
+            print(json.dumps({"event": "error", "checkpoint_peft_load_failed": str(exc)}), file=sys.stderr, flush=True)
             # Fall through to legacy load
 
     # 2. Legacy per-device .pt load (backward compatible). Skip legacy module

@@ -7,6 +7,7 @@ import torch
 from stratum.batch import training_token_counts
 from stratum.packing import (
     compute_cu_seqlens,
+    compute_seq_idx,
     pack_collate,
     pack_samples,
     split_packed_batch,
@@ -82,10 +83,23 @@ class PackSamplesTest(unittest.TestCase):
             {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([10, 20, 30])},
             {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([40, 50])},
         ]
-        result = pack_samples(samples, max_seq_len=20)
-
+        # mask_boundaries=False: verify raw concatenation without the boundary guard
+        result = pack_samples(samples, max_seq_len=20, mask_boundaries=False)
         expected_labels = torch.tensor([10, 20, 30, 40, 50])
         self.assertTrue(torch.equal(result["labels"], expected_labels))
+
+    def test_boundary_label_is_masked_by_default(self):
+        """Default packing masks the first label of each sample after the first."""
+        samples = [
+            {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([10, 20, 30])},
+            {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([40, 50])},
+        ]
+        result = pack_samples(samples, max_seq_len=20)
+        # Position 3 is the first label of the second sample — masked to -100.
+        self.assertEqual(int(result["labels"][3].item()), -100)
+        # Other labels unchanged.
+        self.assertEqual(int(result["labels"][0].item()), 10)
+        self.assertEqual(int(result["labels"][4].item()), 50)
 
     def test_max_seqlen_is_longest_sample(self):
         samples = [self._make_sample(3), self._make_sample(7), self._make_sample(2)]
@@ -100,6 +114,51 @@ class PackSamplesTest(unittest.TestCase):
         samples = [self._make_sample(100)]
         with self.assertRaises(ValueError):
             pack_samples(samples, max_seq_len=10)
+
+    def test_greedy_stops_at_first_overflow(self):
+        """greedy strategy stops at the first sample that doesn't fit."""
+        # 3 + 10 = 13 > 12, so greedy stops after the first sample
+        samples = [self._make_sample(3), self._make_sample(10), self._make_sample(2)]
+        result = pack_samples(samples, max_seq_len=12, strategy="greedy")
+        self.assertEqual(result["n_samples"], 1)
+
+    def test_first_fit_skips_oversized_samples(self):
+        """first_fit skips samples that don't fit and packs smaller ones."""
+        # 3 + 10 > 8 (overflow), but 3 + 2 = 5 fits
+        samples = [self._make_sample(3), self._make_sample(10), self._make_sample(2)]
+        result = pack_samples(samples, max_seq_len=8, strategy="first_fit")
+        self.assertEqual(result["n_samples"], 2)
+        self.assertEqual(result["input_ids"].numel(), 5)
+
+    def test_boundary_masking_sets_first_label_of_each_segment_to_ignore(self):
+        """Labels at packed-sample boundaries are set to ignore_index."""
+        samples = [
+            {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([10, 20, 30])},
+            {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([40, 50])},
+            {"input_ids": torch.tensor([6]), "labels": torch.tensor([60])},
+        ]
+        result = pack_samples(samples, max_seq_len=20, mask_boundaries=True)
+        # Segment 1 starts at index 3, segment 2 starts at index 5
+        self.assertEqual(int(result["labels"][3].item()), -100)
+        self.assertEqual(int(result["labels"][5].item()), -100)
+        # Labels inside segments unchanged
+        self.assertEqual(int(result["labels"][0].item()), 10)
+        self.assertEqual(int(result["labels"][4].item()), 50)
+
+    def test_no_boundary_masking_when_disabled(self):
+        """mask_boundaries=False leaves labels untouched."""
+        samples = [
+            {"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([10, 20])},
+            {"input_ids": torch.tensor([3, 4]), "labels": torch.tensor([30, 40])},
+        ]
+        result = pack_samples(samples, max_seq_len=20, mask_boundaries=False)
+        self.assertEqual(int(result["labels"][2].item()), 30)
+
+    def test_boundary_masking_single_sample_unchanged(self):
+        """Boundary masking has no effect when there is only one sample."""
+        samples = [self._make_sample(5, label_start=10)]
+        result = pack_samples(samples, max_seq_len=20, mask_boundaries=True)
+        self.assertFalse(any(l == -100 for l in result["labels"].tolist()))
 
 
 class PackCollateTest(unittest.TestCase):
@@ -171,6 +230,10 @@ class PackedBatchFormatTest(unittest.TestCase):
         self.assertEqual(result["labels"].dim(), 1)
 
     def test_training_token_counts_accepts_packed_attention_metadata(self):
+        # Sample 1 labels: [-100, 1, 2]  → 2 trainable
+        # Sample 2 labels: [3, -100, 5, 6] → 3 trainable originally
+        # Boundary masking sets label[3] (first of sample 2) to -100 → 2 trainable
+        # Total trainable: 2 + 2 = 4
         samples = [
             {
                 "input_ids": torch.arange(3),
@@ -194,7 +257,7 @@ class PackedBatchFormatTest(unittest.TestCase):
         )
 
         self.assertEqual(total, 7)
-        self.assertEqual(trainable, 5)
+        self.assertEqual(trainable, 4)  # boundary label masked to -100
 
 
 class SplitPackedBatchTest(unittest.TestCase):
@@ -282,6 +345,69 @@ class SplitPackedBatchTest(unittest.TestCase):
                     f"position_ids not reset at boundary {i}: "
                     f"got {pos[start:end]}, expected {expected}"
                 )
+
+
+class ComputeSeqIdxTest(unittest.TestCase):
+    def test_basic(self):
+        cu = torch.tensor([0, 3, 7, 10], dtype=torch.int32)
+        seq_idx = compute_seq_idx(cu)
+        expected = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2], dtype=torch.int32)
+        self.assertTrue(torch.equal(seq_idx, expected))
+
+    def test_single_segment(self):
+        cu = torch.tensor([0, 5], dtype=torch.int32)
+        seq_idx = compute_seq_idx(cu)
+        self.assertTrue(torch.equal(seq_idx, torch.zeros(5, dtype=torch.int32)))
+
+
+class SplitPackedBatchSeqIdxTest(unittest.TestCase):
+    def _make_packed(self, *lengths):
+        ids = [torch.arange(n) for n in lengths]
+        labels = [torch.full((n,), 100 + i * 10) for i, n in enumerate(lengths)]
+        return pack_samples(
+            [{"input_ids": i, "attention_mask": torch.ones_like(i), "labels": l}
+             for i, l in zip(ids, labels)],
+            max_seq_len=sum(lengths) * 2,
+        )
+
+    def test_seq_idx_propagated_to_microbatches(self):
+        packed = self._make_packed(3, 5, 2, 4)
+        self.assertIsNotNone(packed["seq_idx"])
+        mbs = split_packed_batch(packed, num_microbatch=2)
+        for mb in mbs:
+            self.assertIn("seq_idx", mb)
+            self.assertIsNotNone(mb["seq_idx"])
+
+    def test_seq_idx_starts_at_zero_in_each_microbatch(self):
+        packed = self._make_packed(3, 5, 2, 4)
+        mbs = split_packed_batch(packed, num_microbatch=2)
+        for mb in mbs:
+            self.assertEqual(int(mb["seq_idx"][0].item()), 0,
+                             "seq_idx must start at 0 in each microbatch")
+
+    def test_seq_idx_values_match_cu_seqlens(self):
+        """seq_idx value at each token matches its sample index within the microbatch."""
+        packed = self._make_packed(3, 5, 2, 4)
+        mbs = split_packed_batch(packed, num_microbatch=2)
+        for mb in mbs:
+            cu = mb["cu_seqlens"]
+            seq_idx = mb["seq_idx"]
+            for seg_i in range(mb["n_samples"]):
+                start = int(cu[seg_i])
+                end = int(cu[seg_i + 1])
+                for tok in range(start, end):
+                    self.assertEqual(int(seq_idx[tok].item()), seg_i)
+
+    def test_single_microbatch_seq_idx_preserved(self):
+        packed = self._make_packed(3, 5, 2)
+        mbs = split_packed_batch(packed, num_microbatch=1)
+        self.assertTrue(torch.equal(mbs[0]["seq_idx"], packed["seq_idx"]))
+
+    def test_single_sample_pack_seq_idx_is_none(self):
+        packed = self._make_packed(5)
+        self.assertIsNone(packed["seq_idx"])
+        mbs = split_packed_batch(packed, num_microbatch=1)
+        self.assertIsNone(mbs[0]["seq_idx"])
 
 
 if __name__ == "__main__":

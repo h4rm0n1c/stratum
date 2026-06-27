@@ -21,6 +21,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
 from stratum.model.mlp_opt import apply_mlp_optimizations
+from stratum.output import vprint, vwrite
 from stratum.model.blocked_loss import BlockedPostfixCausalLMLoss
 from stratum.model.chunked_loss import chunked_linear_cross_entropy
 from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
@@ -195,13 +196,13 @@ class Qwen35FlashAttention(Qwen3_5Attention):
 
         if flash_backend is not None:
             if not getattr(self, "_stratum_flash_backend_logged", False):
-                print({
+                vprint({
                     "event": "flash_attention_backend",
                     "model": "qwen35",
                     "layer": int(self.layer_idx),
                     "backend": flash_backend.name,
                     "device": str(hidden_states.device),
-                }, flush=True)
+                })
                 self._stratum_flash_backend_logged = True
             q = query_states.transpose(1, 2).contiguous()
             k = key_states.transpose(1, 2).contiguous()
@@ -385,8 +386,17 @@ class Qwen35ForCausalLMWrappedLayer(nn.Module):
 
     def forward(self, input_data):
         hidden, causal_mask, pos_ids, pos_embeds, kwargs, labels, _lk = input_data
+        # packed mode: causal_mask carries cu_seqlens instead of per-type masks
+        _is_packed = (
+            isinstance(causal_mask, dict)
+            and "cu_seqlens" in causal_mask
+        )
         attention_type = getattr(self.layer, "attention_type", "full_attention")
-        if attention_type in causal_mask:
+        if _is_packed and attention_type == "full_attention":
+            # Pass the packed cu_seqlens dict so flash_attn_varlen_func is
+            # selected in Qwen35FlashAttention.forward.
+            attn_mask = causal_mask
+        elif attention_type in causal_mask:
             attn_mask = causal_mask[attention_type]
         elif attention_type == "full_attention":
             attn_mask = causal_mask.get("full_attention", causal_mask.get("linear_attention"))
@@ -615,7 +625,7 @@ class Qwen35Arch(ModelArch):
         if output_router_logits:
             n_patched = patch_moe_block_for_router_logits(core)
             if n_patched > 0:
-                print(f"MoE router logit capture: patched {n_patched} MoE blocks", flush=True)
+                vwrite(f"MoE router logit capture: patched {n_patched} MoE blocks")
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
@@ -656,5 +666,4 @@ def _patch_qwen35_attention(
         layer.self_attn = new_attn
         patched += 1
 
-    print(f"Patched {patched} Qwen3.5 attention layers with capability-dispatched flash attention",
-          flush=True)
+    vwrite(f"Patched {patched} Qwen3.5 attention layers with capability-dispatched flash attention")

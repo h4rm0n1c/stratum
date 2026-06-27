@@ -71,8 +71,13 @@ def patch_moe_block_for_router_logits(module: nn.Module) -> int:
             original_forward: Callable[[torch.Tensor], torch.Tensor | tuple],
         ) -> Callable[[torch.Tensor], torch.Tensor | tuple]:
             def patched_forward(hidden_states: torch.Tensor) -> torch.Tensor | tuple:
-                # Original forward computes gate internally but returns only hiddens.
-                result = original_forward(hidden_states)
+                # In packed mode hidden_states is 2D (total_tokens, hidden_dim);
+                # the HF block expects 3D (batch, seq, hidden_dim).
+                _packed = hidden_states.dim() == 2
+                hs_3d = hidden_states.unsqueeze(0) if _packed else hidden_states
+                result = original_forward(hs_3d)
+                if _packed and isinstance(result, torch.Tensor):
+                    result = result.squeeze(0)
                 # Recompute gate to capture router_logits (single linear layer).
                 hidden_dim = hidden_states.shape[-1]
                 flat_hidden = hidden_states.reshape(-1, hidden_dim)

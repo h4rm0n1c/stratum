@@ -24,6 +24,8 @@ RUN if [[ "${STRATUM_REFRESH_INSTALL_FLA}" == "1" ]]; then \
         pip install --no-cache-dir "flash-linear-attention[cuda]"; \
     fi
 
+RUN pip install --no-cache-dir "mlflow>=2.0"
+
 RUN rm -rf /workspace/stratum /tmp/stratum-src
 
 WORKDIR /tmp/stratum-src

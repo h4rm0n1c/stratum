@@ -5,11 +5,16 @@ Ported from train_lfm25_roundpipe_lora.py:
   - mark_phase()             — elapsed-time phase marker
   - mark_memory_phase()      — system RAM snapshot
   - mark_gpu_memory_phase()  — GPU allocator snapshot
+
+Call set_log_file(f) from train.py after opening the log file so that
+phase/memory events are routed there instead of being dropped.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import threading
 import time
 from typing import Any, Optional
@@ -17,6 +22,26 @@ from typing import Any, Optional
 import torch
 
 from stratum.telemetry import gpu_memory_snapshot
+
+
+# ---------------------------------------------------------------------------
+# Log file routing
+# ---------------------------------------------------------------------------
+
+_log_file = None
+
+
+def set_log_file(f) -> None:
+    """Register the open log file handle for diagnostic event routing."""
+    global _log_file
+    _log_file = f
+
+
+def _log(d: dict) -> None:
+    """Write a structured event to the log file; silently drop if not set."""
+    if _log_file is not None:
+        _log_file.write(json.dumps(d) + "\n")
+        _log_file.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -64,18 +89,18 @@ _PHASE_T0 = time.perf_counter()
 
 
 def mark_phase(name: str) -> None:
-    """Print a timing phase marker (elapsed from first call)."""
+    """Record a timing phase marker to the log file."""
     now = time.perf_counter()
-    print({"phase": name, "elapsed_sec": round(now - _PHASE_T0, 2)}, flush=True)
+    _log({"event": "phase", "phase": name, "elapsed_sec": round(now - _PHASE_T0, 2)})
 
 
 def mark_memory_phase(name: str, host_ram_limit_gib: float = 0.0) -> None:
-    """Print a memory phase marker with system RAM snapshot.
+    """Record a memory phase marker to the log file.
 
     If *host_ram_limit_gib* > 0 and RSS exceeds it, raises MemoryError.
     """
     snap = memory_snapshot()
-    print({"phase_memory": name, **snap}, flush=True)
+    _log({"event": "phase_memory", "phase": name, **snap})
     if host_ram_limit_gib and snap["rss_gib"] > host_ram_limit_gib:
         raise MemoryError(
             f"host RSS {snap['rss_gib']} GiB exceeded --host-ram-limit-gib={host_ram_limit_gib}"
@@ -83,10 +108,10 @@ def mark_memory_phase(name: str, host_ram_limit_gib: float = 0.0) -> None:
 
 
 def mark_gpu_memory_phase(name: str) -> None:
-    """Print a GPU memory phase marker."""
+    """Record a GPU memory phase marker to the log file."""
     if not torch.cuda.is_available():
         return
-    print({"phase_gpu_memory": name, **gpu_memory_snapshot()}, flush=True)
+    _log({"event": "phase_gpu_memory", "phase": name, **gpu_memory_snapshot()})
 
 
 # ---------------------------------------------------------------------------
@@ -106,14 +131,13 @@ def start_memory_watchdog(host_ram_limit_gib: float, interval_sec: float = 1.0) 
         while True:
             rss_gib = _proc_status_kib("VmRSS") / 1024**2
             if rss_gib > host_ram_limit_gib:
-                print(
-                    {
-                        "memory_watchdog": "rss_limit_exceeded",
-                        "rss_gib": round(rss_gib, 3),
-                        "host_ram_limit_gib": host_ram_limit_gib,
-                    },
-                    flush=True,
-                )
+                # Always emit to stderr — this is a fatal error event.
+                print(json.dumps({
+                    "event": "error",
+                    "msg": "memory_watchdog_rss_limit_exceeded",
+                    "rss_gib": round(rss_gib, 3),
+                    "host_ram_limit_gib": host_ram_limit_gib,
+                }), file=sys.stderr, flush=True)
                 os._exit(137)
             time.sleep(interval_sec)
 

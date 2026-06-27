@@ -26,6 +26,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
 from stratum.model.mlp_opt import apply_mlp_optimizations
+from stratum.output import vprint, vwrite
 from stratum.model.blocked_loss import BlockedPostfixCausalLMLoss
 from stratum.model.chunked_loss import chunked_linear_cross_entropy
 from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
@@ -117,13 +118,13 @@ class Qwen3MoeFlashAttention(Qwen3MoeAttention):
 
         if flash_backend is not None:
             if not getattr(self, "_stratum_flash_backend_logged", False):
-                print({
+                vprint({
                     "event": "flash_attention_backend",
                     "model": "qwen3-moe",
                     "layer": int(self.layer_idx),
                     "backend": flash_backend.name,
                     "device": str(hidden_states.device),
-                }, flush=True)
+                })
                 self._stratum_flash_backend_logged = True
             q = query_states.transpose(1, 2).contiguous()
             k = key_states.transpose(1, 2).contiguous()
@@ -495,9 +496,9 @@ class Qwen3MoeArch(ModelArch):
         if output_router_logits:
             n_patched = patch_moe_block_for_router_logits(core)
             if n_patched > 0:
-                print(f"MoE router logit capture: patched {n_patched} MoE blocks", flush=True)
+                vwrite(f"MoE router logit capture: patched {n_patched} MoE blocks")
             else:
-                print("MoE router logit capture: no MoE blocks found to patch", flush=True)
+                vwrite("MoE router logit capture: no MoE blocks found to patch")
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
@@ -534,5 +535,4 @@ def _patch_qwen3moe_attention(
         layer.self_attn = new_attn
         patched += 1
 
-    print(f"Patched {patched} Qwen3-MoE attention layers with capability-dispatched flash attention",
-          flush=True)
+    vwrite(f"Patched {patched} Qwen3-MoE attention layers with capability-dispatched flash attention")

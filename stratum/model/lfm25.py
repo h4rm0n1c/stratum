@@ -22,6 +22,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
 from stratum.model.mlp_opt import apply_mlp_optimizations
+from stratum.output import vprint, vwrite
 from stratum.model.blocked_loss import BlockedPostfixCausalLMLoss
 from stratum.model.chunked_loss import chunked_linear_cross_entropy
 from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
@@ -43,6 +44,74 @@ _lfm2_mod.is_fast_path_available = True
 def _compat_mask_call(fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
     sig = inspect.signature(fn)
     return fn(**{k: v for k, v in kwargs.items() if k in sig.parameters})
+
+
+# ---------------------------------------------------------------------------
+# Packed-mode ShortConv wrapper.
+# ---------------------------------------------------------------------------
+
+class Lfm25ShortConvPacked(nn.Module):
+    """Wrapper that makes Lfm2MoeShortConv packing-safe.
+
+    ``causal_conv1d_fn`` (used in the fast path) expects 3-D input
+    ``(batch, dim, seqlen)``, but in packed mode ``hidden_states`` arrives
+    as 2-D ``(total_tokens, hidden_dim)``.  This wrapper adds and removes
+    the batch dimension around the inner ShortConv call and passes
+    ``seq_idx`` so the convolution state resets at sample boundaries.
+    In normal (non-packed) mode the wrapper is a transparent pass-through.
+    """
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Any = None,
+        attention_mask: Any = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if hidden_states.dim() == 2:
+            # Move seq_idx to the same device as the hidden states.
+            if seq_idx is not None:
+                seq_idx = seq_idx.to(hidden_states.device)
+            # Pass attention_mask=None in packed mode: the HF kernel calls
+            # apply_mask_to_padding_states(x, mask) which does mask.shape —
+            # but in packed mode mask is our cu_seqlens dict, not a tensor.
+            # There is no padding to zero out; seq_idx handles boundaries.
+            out = self.inner(
+                hidden_states.unsqueeze(0),  # (1, total_tokens, hidden_dim)
+                past_key_values=past_key_values,
+                attention_mask=None,
+                seq_idx=seq_idx,
+            )
+            return out.squeeze(0)  # (total_tokens, hidden_dim)
+        return self.inner(
+            hidden_states,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            seq_idx=seq_idx,
+        )
+
+
+def _patch_lfm25_short_conv_for_packing(model: nn.Module) -> int:
+    """Replace each ShortConv layer with Lfm25ShortConvPacked.
+
+    Safe to call unconditionally: the wrapper is a transparent pass-through
+    for normal (non-packed) 3-D input and only activates the
+    unsqueeze/squeeze when hidden_states is 2-D (packed mode).
+
+    Returns the number of layers patched.
+    """
+    core = model.get_base_model() if hasattr(model, "get_base_model") else model
+    patched = 0
+    for layer in core.model.layers:
+        if hasattr(layer, "conv") and not isinstance(layer.conv, Lfm25ShortConvPacked):
+            layer.conv = Lfm25ShortConvPacked(layer.conv)
+            patched += 1
+    return patched
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +213,14 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
             )
             v = self.v_proj(hidden_states).view(n_tot, -1, self.head_dim)
 
+            # apply_rotary_pos_emb expects (batch, n_heads, seqlen, head_dim).
+            # In packed mode q/k are (total_tokens, n_heads, head_dim), so
+            # we temporarily permute to 4D, apply RoPE, then permute back.
+            q = q.unsqueeze(0).permute(0, 2, 1, 3)  # (1, n_heads, total_tokens, head_dim)
+            k = k.unsqueeze(0).permute(0, 2, 1, 3)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            q = q.permute(0, 2, 1, 3).squeeze(0)    # (total_tokens, n_heads, head_dim)
+            k = k.permute(0, 2, 1, 3).squeeze(0)
 
             # GQA: repeat k/v heads to match q heads
             if self.num_key_value_groups > 1:
@@ -175,6 +251,7 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
                     "not falling back to quadratic eager attention"
                 ) from exc
 
+            attn_output = attn_output.reshape(n_tot, -1)  # (total_tokens, n_heads * head_dim)
             attn_output = self.out_proj(attn_output)
             return attn_output, None
 
@@ -195,13 +272,13 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
 
         if flash_backend is not None:
             if not getattr(self, "_stratum_flash_backend_logged", False):
-                print({
+                vprint({
                     "event": "flash_attention_backend",
                     "model": "lfm25",
                     "layer": int(self.layer_idx),
                     "backend": flash_backend.name,
                     "device": str(hidden_states.device),
-                }, flush=True)
+                })
                 self._stratum_flash_backend_logged = True
             # Flash path with GQA
             k_fa = repeat_kv(key_states, self.num_key_value_groups)
@@ -327,6 +404,10 @@ class LFM25ForCausalLMPrefix(nn.Module):
                 "cu_seqlens": attention_mask["cu_seqlens"],
                 "max_seqlen": attention_mask["max_seqlen"],
             }
+            # seq_idx flows in kwargs so ShortConv layers (Lfm25ShortConvPacked)
+            # can reset their conv state at sample boundaries via causal_conv1d_fn.
+            # The decoder layer already does: seq_idx=kwargs.get("seq_idx").
+            # Nothing extra is needed here — just ensure it stays in kwargs.
         else:
             if cache_position is None:
                 cache_position = torch.arange(
@@ -424,22 +505,42 @@ class LFM25ForCausalLMWrappedLayer(nn.Module):
             logits_to_keep,
         ) = input_data
 
+        # packed mode: hidden_states is 2D [total_tokens, hidden_dim]
+        _is_packed = (
+            isinstance(causal_mask_mapping, dict)
+            and "cu_seqlens" in causal_mask_mapping
+        )
+
         if self.memory_telemetry:
-            mark_model_gpu_phase(
-                "layer_enter",
-                layer_idx=self.idx,
-                seq_len=int(hidden_states.shape[1]),
-                hidden_size=int(hidden_states.shape[2]),
-                attention_type=getattr(self.layer, "attention_type", "full_attention"),
-                checkpoint_decoder_layer=bool(self.checkpoint_decoder_layer),
-            )
+            if _is_packed:
+                mark_model_gpu_phase(
+                    "layer_enter",
+                    layer_idx=self.idx,
+                    seq_len=int(hidden_states.shape[0]),
+                    hidden_size=int(hidden_states.shape[1]),
+                    attention_type=getattr(self.layer, "attention_type", "full_attention"),
+                    checkpoint_decoder_layer=bool(self.checkpoint_decoder_layer),
+                )
+            else:
+                mark_model_gpu_phase(
+                    "layer_enter",
+                    layer_idx=self.idx,
+                    seq_len=int(hidden_states.shape[1]),
+                    hidden_size=int(hidden_states.shape[2]),
+                    attention_type=getattr(self.layer, "attention_type", "full_attention"),
+                    checkpoint_decoder_layer=bool(self.checkpoint_decoder_layer),
+                )
 
         layer_kwargs = dict(kwargs)
         layer_kwargs.pop("return_logits", None)
         layer_kwargs.pop("_router_logits", None)
 
         attention_type = getattr(self.layer, "attention_type", "full_attention")
-        if attention_type in causal_mask_mapping:
+        if _is_packed and attention_type == "full_attention":
+            # Pass the packed cu_seqlens dict directly so flash_attn_varlen_func
+            # is selected in Lfm25FlashAttention.forward.
+            attn_mask = causal_mask_mapping
+        elif attention_type in causal_mask_mapping:
             attn_mask = causal_mask_mapping[attention_type]
         elif attention_type == "full_attention":
             attn_mask = causal_mask_mapping.get("full_attention")
@@ -704,9 +805,13 @@ class LFM25Arch(ModelArch):
         if output_router_logits:
             n_patched = patch_moe_block_for_router_logits(core)
             if n_patched > 0:
-                print(f"MoE router logit capture: patched {n_patched} MoE blocks", flush=True)
+                vwrite(f"MoE router logit capture: patched {n_patched} MoE blocks")
             else:
-                print("MoE router logit capture: no MoE blocks found to patch", flush=True)
+                vwrite("MoE router logit capture: no MoE blocks found to patch")
+        # Packing-safe ShortConv wrapper — no-op in normal (non-packed) mode.
+        n_conv = _patch_lfm25_short_conv_for_packing(hf_model)
+        if n_conv > 0:
+            vwrite(f"ShortConv packing wrapper: {n_conv} layers wrapped")
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
@@ -778,5 +883,4 @@ def _patch_lfm25_attention(model, layer_indices: Optional[set[int]] = None):
         patched += 1
 
     if patched:
-        print(f"Patched {patched} LFM2.5 attention layers with capability-dispatched flash attention",
-              flush=True)
+        vwrite(f"Patched {patched} LFM2.5 attention layers with capability-dispatched flash attention")

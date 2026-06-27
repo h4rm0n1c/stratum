@@ -150,13 +150,44 @@ The remaining open items are a narrow tail:
     pipeline outputs across calls (lower priority, eval/debug paths covered).
 
 
-5. **[x] Sample packing** (added 2026-06-27): `pack_samples`, `pack_collate`,
+5. **[x] Sample packing** (updated 2026-06-27): `pack_samples`, `pack_collate`,
     `split_packed_batch` in `stratum/packing.py`. `--packing` flag in `train.py`.
     Flash attention dispatches to `flash_attn_varlen_func` on LFM25 and Qwen35
-    when the packed cu_seqlens metadata is present. 25 unit tests.
-    Smoked on LFM2.5 at batch 1 / 1 microbatch — finite loss, SM86+SM70 flash
-    dispatch, host-staged transfers. LFM2.5 ShortConv layers are incompatible
-    with 1D packed input; Qwen35 works cleanly.
+    when the packed cu_seqlens metadata is present.
+
+    **Fixes applied 2026-06-27:**
+    - Fixed critical attention routing bug: wrapped layers now pass the packed
+      `{"cu_seqlens": ..., "max_seqlen": ...}` dict directly to full-attention
+      layers when in packed mode.  Previously they resolved to `None`, so
+      `flash_attn_varlen_func` was never called.
+    - Added boundary label masking (`mask_boundaries=True` default in
+      `pack_samples`): sets `labels[boundary] = -100` at every sample boundary
+      after the first, preventing the model from training on cross-sample
+      next-token predictions (A's last token → B's first token).
+    - Added `strategy="first_fit"` (default): instead of stopping at the first
+      sample that overflows `max_seq_len`, skips it and tries later samples,
+      improving context-window utilisation.  `strategy="greedy"` preserves the
+      original stop-on-overflow behaviour.
+    - Added `seq_idx` support for LFM2.5 ShortConv / causal-conv1d: `compute_seq_idx`
+      builds a per-token segment index tensor; `Lfm25ShortConvPacked` wrapper
+      unsqueezes to 3D, passes `seq_idx` and `attention_mask=None` to the HF
+      kernel (preventing dict `.shape` error in `apply_mask_to_padding_states`);
+      `split_packed_batch` slices and reindexes `seq_idx` per microbatch;
+      `seq_idx` wired into both single- and multi-microbatch pipeline calls.
+    - Fixed three additional packed-mode bugs in `Lfm25FlashAttention.forward`:
+      RoPE permute to 4D (apply_rotary_pos_emb expects 4D q/k); `attn_output.reshape(n_tot, -1)`
+      before `out_proj`; `attention_mask=None` in `Lfm25ShortConvPacked`.
+    - Fixed MoE packed-mode: `patched_forward` in `moe.py` unsqueezes 2D→3D
+      for packed mode (HF block unpacks `batch, seq, hidden = hidden_states.shape`).
+    - 234 unit tests pass, 15 skipped.
+
+    **LFM2.5 multi-sample packing container smoke passed 2026-06-27:**
+    batch 2 / 2 microbatch / 8192 ctx, finite loss 7.883, 791 trainable tokens,
+    host-staged boundary transfers both directions, ShortConv seq_idx boundary
+    reset active, MoE packed-mode working, flash_attn_varlen_func dispatched.
+    LFM2.5 is a fully supported packing target.
+
+    Remaining: container smoke of multi-sample Qwen35 packed training.
 
 6. **[x] Host RAM management for LFM2.5** (added 2026-06-27): `release_cached_memory()` in
     `stratum/utils.py` calls `gc.collect()` + glibc `malloc_trim(0)` to return
@@ -987,3 +1018,80 @@ Recommended order for reaching practical parity with qz-roundpipe/RoundPipe:
 | 23. GradScaler | **PORTED** | Async-aware dual scaler wired into training and scheduler skip gating |
 | 24. CLI flags | **PORTED** | --attn-implementation, --optim-dtype, --nf4-min-numel, --nf4-layer-size-floor-gib, and --recompute-grain are wired |
 | 25. Model adapters | **PENDING** | Llama/Qwen3/MoE/GPT-OSS parity not present in Stratum |
+
+---
+
+## Future: Multi-node distributed pipeline over TCP
+
+**Idea:** Spread pipeline stages across machines on a local network instead of
+(or in addition to) spreading across GPUs in one box.
+
+**Why it's feasible:**  
+- Stage-boundary activations are tiny (~2 MiB hidden-state slice per boundary
+  crossing). At 10G fiber bandwidth this is negligible — a 10-step/sec training
+  run uses ~100 Mbit/s peak, less than 1% of link capacity.
+- The seam already exists: `HostStagingPool.transfer(tensor, dst_device,
+  src_device)` in `stratum/host_staging.py` is the only interface the pipeline
+  calls at stage boundaries. A `RemoteStage` that implements the same
+  `.transfer()` signature can be injected without changing `pipeline.py`,
+  `grad_hooks.py`, or `train.py`.
+
+**The one hard part:**  
+Stage-boundary tensors are autograd-live. You cannot send an autograd graph over
+a socket. The solution is a `torch.autograd.Function` subclass
+(`RemoteStageFunction`) that makes the network hop opaque to PyTorch autograd:
+`forward()` sends the hidden tensor to the worker and returns the output as a
+new local tensor; `backward()` sends `grad_output` to the worker and returns the
+`grad_input` it computes there. The worker runs its own recompute-based backward
+(same pattern as `run_explicit_group_backward` in `stratum/runtime.py:258`) and
+its own LoRA optimizer slice.
+
+**What would need to be built:**  
+- `stratum/distributed.py` — `RemoteStageFunction`, `RemoteStage`,
+  `NetworkTransport` (raw TCP tensor encode/decode, or `torch.distributed` gloo)
+- `scripts/worker.py` — long-running daemon: receives stage slice + NF4
+  payloads at startup, then loops forward/backward per step
+- `stratum/pipeline.py` — detect `RemoteStage` in stage list, use
+  `RemoteStageFunction` at those boundaries instead of `HostStagingPool`
+- `stratum/model/registry.py` / `scripts/train.py` — `--workers host:port`
+  arg, stage slice assignment, startup serialization of NF4 payloads to workers
+
+**What would not change:** local multi-GPU path, training loop, NF4/weight
+streaming, optimizer, MLflow, all existing tests.
+
+**Recommended delivery order:** (1) `NetworkTransport` loopback self-test,
+(2) `RemoteStageFunction` autograd correctness with two local processes,
+(3) `worker.py` stub + two-process loopback smoke, (4) cross-machine smoke.
+
+Full design notes: `/home/harri/.claude/plans/enumerated-zooming-kay.md`
+
+**Refined architectural notes (additions to the above):**
+
+*Server/client always — no local special case (Source Engine model):*  
+The coordinator and workers always communicate through the same protocol. When
+running on one machine the workers are just local processes connected via
+loopback. There is no "local mode" code path — the coordinator never knows or
+cares whether a worker socket is 127.0.0.1 or a remote IP. This keeps the
+implementation simple and means local single-machine runs are a free regression
+test for the distributed path.
+
+*Worker-local NF4 cache (XGrid model):*  
+Each worker maintains its own NF4 cache keyed on `{model_id}/{layer_range}`.
+On first connection the master sends the NF4 payloads for that worker's slice;
+on subsequent connections the worker checks its local cache and skips the
+transfer entirely if the payloads are already there. This means the multi-GiB
+startup cost is paid once per worker machine, not once per training run.
+The existing `nf4_cache_dir` + model-id subdirectory convention maps directly
+onto this — extend the cache key to include layer range.
+
+*Checkpoint / resume format problem:*  
+Per-device `optim_*.pt` blobs do not survive any change in worker topology
+(different number of workers, different layer split, different machine). They
+are already opt-in, already discouraged in CLAUDE.md, and already labelled
+legacy. For distributed-safe resume:
+- LoRA adapter: already correct — PEFT safetensors is device-independent.
+- Optimizer state: must be keyed by **parameter name**, not device index.
+  One unified file (e.g. `optimizer.safetensors` or structured JSON + raw
+  tensors), each worker loads only the keys belonging to its layer slice.
+  This is the blocker to fix before distributed resume can work, but it also
+  improves the single-machine case (resume survives tensor-split changes).

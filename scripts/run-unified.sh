@@ -11,6 +11,7 @@ docker_memory_swap="${STRATUM_DOCKER_MEMORY_SWAP:-88g}"
 cache_dir="${STRATUM_CACHE_DIR:-$repo_root/cache}"
 out_dir="${STRATUM_OUT_DIR:-$repo_root/out}"
 data_dir="${STRATUM_DATA_DIR:-$repo_root/data}"
+mlflow_port="${STRATUM_MLFLOW_PORT:-}"
 
 mkdir -p \
   "$cache_dir/home" \
@@ -62,6 +63,19 @@ if [ -n "$cuda_visible_devices" ]; then
   docker_args+=(-e CUDA_VISIBLE_DEVICES="$cuda_visible_devices")
 fi
 
+mlflow_container=""
+if [ -n "$mlflow_port" ]; then
+  mlflow_container="stratum-mlflow-${mlflow_port}"
+  docker rm -f "$mlflow_container" 2>/dev/null || true
+  docker run -d --rm \
+    --name "$mlflow_container" \
+    -p "${mlflow_port}:5000" \
+    -v "$out_dir:/workspace/out" \
+    "$image" \
+    mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri "sqlite:////workspace/out/mlflow.db" \
+    >/dev/null
+fi
+
 if [ -d "$data_dir" ]; then
   docker_args+=(-v "$data_dir:/workspace/data:ro")
 fi
@@ -77,6 +91,10 @@ if [ -d "$data_dir" ]; then
   echo "data:      $data_dir -> /workspace/data:ro"
 else
   echo "data:      $data_dir not mounted (directory missing)"
+fi
+if [ -n "$mlflow_port" ]; then
+  _ml_ip=$(python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); print(s.getsockname()[0]); s.close()" 2>/dev/null || hostname -I | awk '{print $1}')
+  echo "mlflow: http://${_ml_ip}:${mlflow_port}"
 fi
 echo
 

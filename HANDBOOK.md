@@ -475,7 +475,7 @@ adapted. The table below is the complete parity ledger.
 | Qwen3-MoE adapter | `roundpipe/models/qwen3_moe.py` | **Done** — `stratum/model/qwen3_moe.py`; Qwen3-30B-A3B smoke passed |
 | Non-NF4 layer-copy path | `roundpipe/transfer.py` | **Done** — `prepare_fp16_staged` / `copy_tensor_chunked` lifecycle; mutable-buffer snapshot for recompute is an open tail |
 | Pytree batch API | `roundpipe/batch.py` | **Done** — `guess_split_spec` / `split_pytree` / `merge_pytree` / `TokenWeightedReducer`; `--pytree-batch` flag in `train.py` |
-| Sample packing | `roundpipe/batch.py` | **Done** — `pack_samples` / `pack_collate` / `split_packed_batch` in `stratum/packing.py`; `--packing` flag; flash_attn_varlen_func dispatch on LFM25 and Qwen35 |
+| Sample packing | `roundpipe/batch.py` | **Done** — `pack_samples` / `pack_collate` / `split_packed_batch` in `stratum/packing.py`; `--packing` flag; flash_attn_varlen_func dispatch on LFM25 and Qwen35; LFM2.5 packing smoke passed 2026-06-27 (batch 2 / 2 microbatch / 8192 ctx, finite loss 7.883, 791 trainable tokens, host-staged boundary transfers, ShortConv seq_idx boundary reset, MoE packed-mode wrapper) |
 | Host RAM management | — | **Done for LFM2.5 / partial for Qwen35 depth** — `release_cached_memory()` frees cached FP16 pages after NF4 prep (measurable: 11+ GiB RSS drop on the normal path); `--low-rss-nf4-build` builds the HF skeleton on meta and streams checkpoint tensors during NF4 preparation. LFM2.5 low-RSS NF4 Docker smoke passed on 2026-06-27; Qwen35 low-RSS depth is still future validation |
 | GPT-OSS adapter | `roundpipe/models/gpt_oss.py` | **Skipped** — no public HF model available |
 

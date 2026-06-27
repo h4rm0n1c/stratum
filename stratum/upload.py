@@ -467,15 +467,21 @@ def load_module_fp16_from_checkpoint(
         keys = []
 
         def _add(name: str) -> None:
-            keys.append(name)
-            keys.append(_without_peft_base_layer(name))
-            stripped = _re.sub(r'\.layer\.(?!layer)', '.', name)
-            keys.append(stripped)
-            keys.append(_without_peft_base_layer(stripped))
-            keys.append(f"model.{name}")
-            keys.append(f"model.{_without_peft_base_layer(name)}")
-            keys.append(f"model.{stripped}")
-            keys.append(f"model.{_without_peft_base_layer(stripped)}")
+            # Expand each candidate with and without stratum-internal .inner. wrapper.
+            _variants = [name]
+            _no_inner = name.replace(".inner.", ".")
+            if _no_inner != name:
+                _variants.append(_no_inner)
+            for _v in _variants:
+                keys.append(_v)
+                keys.append(_without_peft_base_layer(_v))
+                _stripped = _re.sub(r'\.layer\.(?!layer)', '.', _v)
+                keys.append(_stripped)
+                keys.append(_without_peft_base_layer(_stripped))
+                keys.append(f"model.{_v}")
+                keys.append(f"model.{_without_peft_base_layer(_v)}")
+                keys.append(f"model.{_stripped}")
+                keys.append(f"model.{_without_peft_base_layer(_stripped)}")
 
         _add(pname)
         if pname == "lm_head.weight":

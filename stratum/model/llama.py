@@ -21,6 +21,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from stratum.model.registry import ModelArch, register
 from stratum.model.mlp_opt import apply_mlp_optimizations
+from stratum.output import vprint, vwrite
 from stratum.model.blocked_loss import BlockedPostfixCausalLMLoss
 from stratum.model.chunked_loss import chunked_linear_cross_entropy
 from stratum.telemetry import assert_finite_tensor, mark_model_gpu_phase
@@ -108,13 +109,13 @@ class LlamaFlashAttention(LlamaAttention):
 
         if flash_backend is not None:
             if not getattr(self, "_stratum_flash_backend_logged", False):
-                print({
+                vprint({
                     "event": "flash_attention_backend",
                     "model": "llama",
                     "layer": int(self.layer_idx),
                     "backend": flash_backend.name,
                     "device": str(hidden_states.device),
-                }, flush=True)
+                })
                 self._stratum_flash_backend_logged = True
             q = query_states.transpose(1, 2).contiguous()
             k = key_states.transpose(1, 2).contiguous()
@@ -468,5 +469,4 @@ def _patch_llama_attention(
         layer.self_attn = new_attn
         patched += 1
 
-    print(f"Patched {patched} Llama attention layers with capability-dispatched flash attention",
-          flush=True)
+    vwrite(f"Patched {patched} Llama attention layers with capability-dispatched flash attention")

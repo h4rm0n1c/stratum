@@ -3,6 +3,7 @@
 from typing import Any, Optional
 
 import torch
+from stratum.output import vwrite
 import torch.nn as nn
 
 from stratum.pipeline import StratumPipeline
@@ -188,7 +189,7 @@ class ModelArch:
                 if _all_cached:
                     _need_fallback = False
                     if verbose:
-                        print("  nf4: all payloads loaded from cache", flush=True)
+                        vwrite("  nf4: all payloads loaded from cache")
                     if _is_meta_model:
                         from stratum.upload import load_module_fp16_from_checkpoint
                         from stratum.utils import release_cached_memory as _rcm
@@ -201,7 +202,7 @@ class ModelArch:
                                 raise RuntimeError(
                                     f"staged non-NF4 load failed for module {idx}"
                                 )
-                            _rcm(verbose=False)
+                            _rcm()
 
             if _need_fallback:
                 # Check whether the model was loaded on meta (staged load)
@@ -222,9 +223,9 @@ class ModelArch:
                         if not ok:
                             raise RuntimeError(f"staged FP16 load failed for module {idx}")
                         prepare_nf4(_mod, **nf4_kwargs)
-                        _rcm(verbose=False)
+                        _rcm()
                     if verbose:
-                        print("  staged FP16 load: all modules processed", flush=True)
+                        vwrite("  staged FP16 load: all modules processed")
                 else:
                     # Normal path: params already on CPU, just quantize.
                     for _mod in nf4_modules:
@@ -241,7 +242,7 @@ class ModelArch:
         # cached pages back to the OS so RSS reflects our actual memory
         # footprint, not stale heap pages.
         from stratum.utils import release_cached_memory
-        release_cached_memory(verbose=verbose)
+        release_cached_memory()
 
         # Phase 2: Upload non-staged params (trainable LoRA, small norms/biases) permanently.
         # NF4-eligible frozen weights and FP16-staged frozen weights stay on CPU and are

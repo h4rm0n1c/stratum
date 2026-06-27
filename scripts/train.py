@@ -25,6 +25,7 @@ import itertools
 import json
 import math
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -48,8 +49,25 @@ from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, load_checkpoint
 from stratum.timing import ModelLayerTimer, TimingRecorder
 from stratum.utils import get_device_info, gpu_memory_snapshot
-from stratum.watchdog import mark_phase, mark_memory_phase
+from stratum.watchdog import mark_phase, mark_memory_phase, memory_snapshot, set_log_file as watchdog_set_log_file
 from stratum.grad_scaler import GradScaler as CPUOffloadGradScaler
+from stratum.output import set_verbose
+
+
+def jprint(d: dict) -> None:
+    """Emit a structured event as a single JSON line on stdout (step/checkpoint/done only)."""
+    print(json.dumps(d), flush=True)
+
+
+# Module-level log file for log_event (set early in main before config events fire).
+_log_file = None
+
+
+def log_event(d: dict) -> None:
+    """Write a structured event to the log file only — not stdout, not stderr."""
+    if _log_file is not None:
+        _log_file.write(json.dumps(d) + "\n")
+        _log_file.flush()
 
 
 def make_grad_scaler(*, enabled: bool, cpu_offload: bool):
@@ -125,11 +143,11 @@ class PretokJsonlDataset(Dataset):
             random.shuffle(self.rows)
         if longest_first:
             self.rows.sort(key=lambda r: len(r["input_ids"]), reverse=True)
-        print({
+        self.dataset_stats = {
             "dataset_rows": len(self.rows),
             "min_len": min(len(r["input_ids"]) for r in self.rows) if self.rows else 0,
             "max_len": max(len(r["input_ids"]) for r in self.rows) if self.rows else 0,
-        }, flush=True)
+        }
 
     def __len__(self):
         return len(self.rows)
@@ -254,6 +272,10 @@ def main():
     # Memory watchdog
     ap.add_argument("--host-ram-limit-gib", type=float, default=0.0,
                     help="Abort when host RSS exceeds this many GiB (0 = disabled)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Emit diagnostic events (flash backend picks, patch counts) to stderr")
+    ap.add_argument("--mlflow", action="store_true",
+                    help="Log metrics and params to MLflow (serve via STRATUM_MLFLOW_PORT in run-unified.sh)")
     # Selective flash-attention patching. The implementation dispatches by GPU
     # capability: standard flash-attn on SM80+/SM86, flash-attn-v100 on SM70.
     ap.add_argument("--flash-layers", default="",
@@ -317,15 +339,55 @@ def main():
                          "after NF4 prep to force smaller stages.")
     args = ap.parse_args()
 
+    # Activate verbose diagnostics before anything emits.
+    set_verbose(args.verbose)
+
+    # Open log file early — before any config events — so log_event has a target.
+    global _log_file
+    if args.out:
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        _log_file = open(Path(args.out) / "training.jsonl", "w")
+        watchdog_set_log_file(_log_file)
+
+    # MLflow tracking (opt-in via --mlflow).
+    # Writes directly to <out>/mlruns/ on the shared volume.
+    # The UI server is managed by run-unified.sh as a separate named container.
+    _mlflow_run = None
+    if args.mlflow:
+        try:
+            import mlflow
+            mlflow.set_tracking_uri(f"sqlite:///{Path(args.out).resolve() / 'mlflow.db'}")
+            mlflow.set_experiment(Path(args.out).name)
+            _mlflow_run = mlflow.start_run(run_name=f"train-{Path(args.out).name}")
+            mlflow.log_params({
+                "model": args.model,
+                "lr": args.lr,
+                "lr_scheduler": args.lr_scheduler,
+                "warmup_steps": args.warmup_steps,
+                "weight_decay": args.weight_decay,
+                "batch_size": args.batch_size,
+                "num_microbatch": args.num_microbatch,
+                "max_seq_len": args.max_seq_len,
+                "lora_r": args.lora_r,
+                "steps": args.steps,
+                "nf4": not args.no_nf4,
+                "recompute_grain": args.recompute_grain,
+                "grad_scaler": args.grad_scaler_enabled,
+                "cpu_offload_optim": args.cpu_offload_optim,
+                "router_aux_loss_coef": args.router_aux_loss_coef,
+            })
+        except ImportError:
+            print("WARNING: mlflow not installed; --mlflow ignored", file=sys.stderr, flush=True)
+
     # Arg validation (same guards as RoundPipe)
     if args.recompute_grain == "none":
         args.checkpoint_decoder_layer = False
-        print({"checkpoint_decoder_layer": False, "reason": "recompute_grain=none"}, flush=True)
+        log_event({"event": "config", "checkpoint_decoder_layer": False, "reason": "recompute_grain=none"})
     if args.async_optimizer_step and not args.cpu_offload_optim:
         raise ValueError("--async-optimizer-step requires --cpu-offload-optim")
     if args.pad_to_multiple == 0:
         args.pad_to_multiple = 32
-        print({"pad_to_multiple": 32, "reason": "flash attention seq len constraint"}, flush=True)
+        log_event({"event": "config", "pad_to_multiple": 32, "reason": "flash_attention_seq_len_constraint"})
     if args.router_aux_loss_coef > 0 and not args.output_router_logits:
         raise ValueError("--router-aux-loss-coef requires --output-router-logits")
     if args.memory_flat_frozen_mlp:
@@ -348,10 +410,10 @@ def main():
     # Detect devices
     devices = get_device_info()
     if not devices:
-        print("ERROR: no CUDA devices found", flush=True)
+        print(json.dumps({"event": "error", "msg": "no CUDA devices found"}), file=sys.stderr, flush=True)
         return
 
-    print(f"Devices: {json.dumps(devices)}", flush=True)
+    log_event({"event": "devices", "devices": devices})
 
     n_gpu = len(devices)
     if args.tensor_split:
@@ -372,11 +434,11 @@ def main():
     nf4_cache_dir = None
     if not args.no_nf4 and args.nf4_cache_dir:
         nf4_cache_dir = str(Path(args.nf4_cache_dir) / _safe_cache_component(args.hf_model))
-        print({"nf4_cache_dir": nf4_cache_dir}, flush=True)
+        log_event({"event": "config", "nf4_cache_dir": nf4_cache_dir})
 
     # Load base model
     mark_phase("before_model_load")
-    print(f"Loading model {args.hf_model}...", flush=True)
+    print(f"Loading model {args.hf_model}...", file=sys.stderr, flush=True)
     hf_attn_impl = "eager" if args.attn_implementation == "flash" else args.attn_implementation
     if args.low_rss_nf4_build:
         config = AutoConfig.from_pretrained(
@@ -396,7 +458,7 @@ def main():
         if hasattr(hf_model, "tie_weights"):
             hf_model.tie_weights()
         hf_model.name_or_path = args.hf_model
-        print("Model skeleton initialized on meta device", flush=True)
+        print("Model skeleton initialized on meta device", file=sys.stderr, flush=True)
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(
             args.hf_model,
@@ -408,9 +470,9 @@ def main():
         )
     hf_model.config.use_cache = False
     hf_model.config._attn_implementation = hf_attn_impl
-    print({"attn_implementation": args.attn_implementation,
-           "hf_attn_implementation": hf_attn_impl}, flush=True)
-    print("Model loaded on CPU", flush=True)
+    log_event({"event": "config", "attn_implementation": args.attn_implementation,
+               "hf_attn_implementation": hf_attn_impl})
+    print("Model loaded on CPU", file=sys.stderr, flush=True)
 
     # Apply LoRA
     def _lora_target_modules(target_set: str) -> list[str]:
@@ -432,7 +494,7 @@ def main():
     hf_model = get_peft_model(hf_model, lora_cfg)
     if args.low_rss_nf4_build:
         n_materialized = materialize_trainable_meta_parameters(hf_model)
-        print({"trainable_meta_params_materialized": n_materialized}, flush=True)
+        log_event({"event": "config", "trainable_meta_params_materialized": n_materialized})
     hf_model.print_trainable_parameters()
 
     # Operator telemetry hooks (on base model before extraction)
@@ -445,12 +507,11 @@ def main():
             layer_indices=op_layers,
             module_names=op_modules,
         )
-        print(f"  operator telemetry: {registered} hooks on layers {sorted(op_layers)}", flush=True)
+        log_event({"event": "config", "operator_telemetry_hooks": registered, "layers": sorted(op_layers)})
 
-    # Build stratified pipeline
-    print("Building Stratum pipeline...", flush=True)
+    print("Building Stratum pipeline...", file=sys.stderr, flush=True)
     if args.nf4_layer_size_floor_gib > 0:
-        print({"nf4_layer_size_floor_gib": args.nf4_layer_size_floor_gib}, flush=True)
+        log_event({"event": "config", "nf4_layer_size_floor_gib": args.nf4_layer_size_floor_gib})
     pipeline = build_pipeline(
         args.model, hf_model,
         tensor_split=tensor_split,
@@ -484,7 +545,7 @@ def main():
     # modules are the same objects referenced by the pipeline; NF4 preparation
     # has already released or avoided the large FP16 frozen tensors.
     from stratum.utils import release_cached_memory
-    release_cached_memory(verbose=True)
+    release_cached_memory(log_file=_log_file)
     mark_memory_phase("after_pipeline_build", args.host_ram_limit_gib)
 
     timing_recorder = TimingRecorder(args.timing_jsonl, enabled=bool(args.timing_jsonl))
@@ -495,7 +556,7 @@ def main():
         layer_timer = ModelLayerTimer(n_layers=pipeline._total_layers)
         pipeline.set_layer_timer(layer_timer, adapt_every_n=args.adapt_plan_every)
         if args.adapt_plan_every > 0:
-            print(f"  layer timer: adapt plan every {args.adapt_plan_every} steps", flush=True)
+            log_event({"event": "config", "adapt_plan_every": args.adapt_plan_every})
 
     # Pin model memory for faster H2D (if enabled)
     if args.pin_model != "off":
@@ -505,13 +566,13 @@ def main():
             pin_module_register(pipeline.postfix)
             for stage in pipeline.stages:
                 pin_module_register(stage)
-            print("  pin_model: register (cudaHostRegister)", flush=True)
+            log_event({"event": "config", "pin_model": "register"})
         else:
             pin_module_alloc(pipeline.prefix)
             pin_module_alloc(pipeline.postfix)
             for stage in pipeline.stages:
                 pin_module_alloc(stage)
-            print("  pin_model: alloc (pin_memory)", flush=True)
+            log_event({"event": "config", "pin_model": "alloc"})
 
     # Determine input device (prefix location)
     input_device = pipeline.stages[0].device_id if pipeline.stages else 0
@@ -539,23 +600,23 @@ def main():
     )
     if args.cpu_offload_optim:
         optimizer.ensure_optim_params()
-        print({"cpu_offload_optim": True, "optim_dtype": args.optim_dtype}, flush=True)
+        log_event({"event": "config", "cpu_offload_optim": True, "optim_dtype": args.optim_dtype})
     scaler = make_grad_scaler(
         enabled=args.grad_scaler_enabled,
         cpu_offload=args.cpu_offload_optim,
     )
     if args.grad_scaler_enabled:
-        print({"grad_scaler_enabled": True, "init_scale": 2.0**16}, flush=True)
-    print({"lr": args.lr, "scheduler": args.lr_scheduler,
-           "warmup": args.warmup_steps, "batch_size": args.batch_size}, flush=True)
+        log_event({"event": "config", "grad_scaler_enabled": True, "init_scale": 2.0**16})
+    log_event({"event": "config", "lr": args.lr, "scheduler": args.lr_scheduler,
+               "warmup": args.warmup_steps, "batch_size": args.batch_size})
     if args.pytree_batch:
-        print({"pytree_batch": True, "reason": "arbitrary pytree input shapes"}, flush=True)
+        log_event({"event": "config", "pytree_batch": True})
 
     # Memory watchdog (OS-level RSS limit)
     if args.host_ram_limit_gib > 0:
         from stratum.watchdog import start_memory_watchdog
         start_memory_watchdog(args.host_ram_limit_gib)
-        print(f"Memory watchdog: {args.host_ram_limit_gib} GiB limit", flush=True)
+        log_event({"event": "config", "memory_watchdog_gib": args.host_ram_limit_gib})
 
     # Phase marker (same as RoundPipe)
     mark_phase("after_pipeline_build")
@@ -563,12 +624,13 @@ def main():
     # Load dataset
     ds = PretokJsonlDataset(args.data, max_seq_len=args.max_seq_len, shuffle=True,
                             longest_first=args.longest_first)
+    log_event({"event": "dataset", **ds.dataset_stats})
 
     if args.packing:
+        log_event({"event": "config", "packing": True, "max_seq_len": args.max_seq_len})
         from stratum.packing import pack_collate
         def collate(batch):
             return pack_collate(batch, max_seq_len=args.max_seq_len)
-        print({"packing": True, "max_seq_len": args.max_seq_len}, flush=True)
     else:
         def collate(batch):
             return collate_one(batch, pad_to_multiple=args.pad_to_multiple,
@@ -594,9 +656,9 @@ def main():
                 modules_by_device, optimizer, resume_dir,
                 peft_model=hf_model,
             )
-            print(f"Resumed from step {start_step}", flush=True)
+            log_event({"event": "resume", "step": start_step})
         else:
-            print(f"Checkpoint {resume_dir} not found, starting fresh", flush=True)
+            log_event({"event": "info", "msg": f"checkpoint {resume_dir} not found, starting fresh"})
 
     # Training loop
     t0 = time.time()
@@ -605,12 +667,9 @@ def main():
         desc="Training", unit="step",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         ncols=100,
+        file=sys.stderr,
     )
 
-    # Open log file for structured JSON logging
-    if args.out:
-        Path(args.out).mkdir(parents=True, exist_ok=True)
-    log_file = open(Path(args.out) / "training.jsonl", "w") if args.out else None
     pending_async_optimizer_step = False
 
     def finish_optimizer_step() -> None:
@@ -636,6 +695,11 @@ def main():
             max_seqlen = batch["max_seqlen"]
             packed_n_samples = batch.get("n_samples", 1)
             attention_mask = {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
+            # seq_idx resets ShortConv/SSM state at sample boundaries (LFM2.5).
+            # None for single-sample packs (no boundary reset needed).
+            packed_seq_idx = batch.get("seq_idx")
+            if packed_seq_idx is not None:
+                packed_seq_idx = packed_seq_idx.cuda(input_device)
         else:
             input_ids = batch["input_ids"].cuda(input_device)
             attention_mask = batch["attention_mask"].cuda(input_device)
@@ -670,9 +734,13 @@ def main():
                     reducer = TokenWeightedReducer()
                     for mb in mbs:
                         attn_mask = {"cu_seqlens": mb["cu_seqlens"], "max_seqlen": mb["max_seqlen"]}
+                        mb_seq_idx = mb.get("seq_idx")
+                        if mb_seq_idx is not None:
+                            mb_seq_idx = mb_seq_idx.to(input_device)
                         mb_out = pipeline(
                             mb["input_ids"], attention_mask=attn_mask,
                             labels=mb["labels"], position_ids=mb["position_ids"],
+                            seq_idx=mb_seq_idx,
                         )
                         scale = microbatch_loss_scale(mb["trainable_tokens"], total_trainable, len(mbs))
                         scaled_loss = scaler.scale(mb_out.loss * scale)
@@ -735,22 +803,26 @@ def main():
                         trainable_counts.append(mb.trainable_tokens)
                     loss = reduce_microbatch_losses(detached_losses, trainable_counts)
             else:
+                extra_kwargs = {}
+                if args.packing and packed_seq_idx is not None:
+                    extra_kwargs["seq_idx"] = packed_seq_idx
                 output = pipeline(
                     input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
                     position_ids=position_ids,
+                    **extra_kwargs,
                 )
                 scaled_loss = scaler.scale(output.loss)
                 with compute_stream_context_for(scaled_loss):
                     scaled_loss.backward()
                 loss = output.loss.detach()
         except RuntimeError:
-            print({"forward_backward_exception_step": step}, flush=True)
+            print(json.dumps({"event": "error", "msg": "forward_backward_exception", "step": step}), file=sys.stderr, flush=True)
             if args.cuda_memory_summary_on_exception and torch.cuda.is_available():
                 print(torch.cuda.memory_summary(
                     device=torch.cuda.current_device(), abbreviated=True
-                ), flush=True)
+                ), file=sys.stderr, flush=True)
             raise
 
         if args.async_optimizer_step:
@@ -768,34 +840,49 @@ def main():
             input_ids, attention_mask, labels
         )
         iter_loss = loss.item()
+        current_lr = list(optimizer.get_lr().values())[0] if optimizer.get_lr() else args.lr
+        rss_gib = memory_snapshot()["rss_gib"]
 
-        # Structured step log (same format as RoundPipe)
         log_entry = {
+            "event": "step",
             "step": step,
             "loss": round(iter_loss, 4),
+            "lr": current_lr,
             "sec": round(dt, 2),
             "tokens_total": total_tokens,
             "tokens_trainable": trainable_tokens,
             "tok_s": round(total_tokens / max(dt, 1e-9), 2),
             "elapsed_min": round((time.time() - t0) / 60, 2),
+            "rss_gib": rss_gib,
         }
+        gpu_snapshots = {}
         for d in devices:
             vs = gpu_memory_snapshot(d["id"])
             if vs:
                 log_entry[f"gpu{d['id']}_used"] = round(vs["alloc"], 2)
                 log_entry[f"gpu{d['id']}_peak"] = round(vs.get("peak_alloc", 0), 2)
+                gpu_snapshots[d["id"]] = vs
 
-        # Print to stdout every 10 steps (matching RoundPipe)
-        if step == 1 or step % 10 == 0:
-            print(json.dumps(log_entry), flush=True)
+        jprint(log_entry)
 
-        # Write to log file every step
-        if log_file:
-            log_file.write(json.dumps(log_entry) + "\n")
-            log_file.flush()
+        if _log_file:
+            _log_file.write(json.dumps(log_entry) + "\n")
+            _log_file.flush()
+
+        if _mlflow_run is not None:
+            _metrics = {
+                "train/loss": iter_loss,
+                "train/lr": current_lr,
+                "train/tok_s": total_tokens / max(dt, 1e-9),
+                "train/tokens_trainable": float(trainable_tokens),
+                "host/rss_gib": rss_gib,
+            }
+            for dev_id, vs in gpu_snapshots.items():
+                _metrics[f"gpu{dev_id}/used_gib"] = vs["alloc"]
+                _metrics[f"gpu{dev_id}/peak_gib"] = vs.get("peak_alloc", 0)
+            mlflow.log_metrics(_metrics, step=step)
 
         # tqdm progress bar
-        current_lr = list(optimizer.get_lr().values())[0] if optimizer.get_lr() else args.lr
         pbar.set_postfix({
             "loss": f"{iter_loss:.2f}",
             "tok/s": f"{total_tokens/max(dt,1e-9):.0f}",
@@ -813,7 +900,7 @@ def main():
                             peft_model=hf_model,
                             save_optimizer_state=args.save_optimizer_state,
                             save_legacy_device_state=args.save_legacy_device_state)
-            tqdm.write(f"Saved checkpoint {save_dir}")
+            jprint({"event": "checkpoint", "path": str(save_dir), "step": step})
 
     if pending_async_optimizer_step:
         finish_optimizer_step()
@@ -826,13 +913,15 @@ def main():
                         peft_model=hf_model,
                         save_optimizer_state=args.save_optimizer_state,
                         save_legacy_device_state=args.save_legacy_device_state)
-        tqdm.write(f"Saved final checkpoint to {save_dir}")
+        jprint({"event": "checkpoint", "path": str(save_dir), "step": step, "final": True})
     else:
-        tqdm.write("Skipping final save (--no-save)")
-    if log_file:
-        log_file.close()
+        log_event({"event": "info", "msg": "skipping final save (--no-save)"})
+    if _log_file:
+        _log_file.close()
     timing_recorder.close()
-    tqdm.write("Training complete")
+    if _mlflow_run is not None:
+        mlflow.end_run()
+    jprint({"event": "done", "elapsed_min": round((time.time() - t0) / 60, 2)})
 
 
 if __name__ == "__main__":

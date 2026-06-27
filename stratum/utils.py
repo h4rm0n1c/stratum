@@ -2,6 +2,7 @@
 
 import ctypes
 import gc
+import json
 import logging
 import os
 import sys
@@ -119,7 +120,7 @@ def host_rss_gib() -> float:
     return 0.0
 
 
-def release_cached_memory(*, verbose: bool = False) -> None:
+def release_cached_memory(*, log_file=None) -> None:
     """Force release of cached heap memory back to the OS.
 
     Calls ``gc.collect()`` to reap Python-level garbage and
@@ -138,10 +139,11 @@ def release_cached_memory(*, verbose: bool = False) -> None:
     except (OSError, AttributeError):
         pass  # not glibc
     after = host_rss_gib()
-    if verbose:
-        print({
+    if log_file is not None:
+        log_file.write(json.dumps({
             "event": "release_cached_memory",
             "rss_before_gib": round(before, 2),
             "rss_after_gib": round(after, 2),
             "freed_gib": round(before - after, 2),
-        }, flush=True)
+        }) + "\n")
+        log_file.flush()
