@@ -215,8 +215,6 @@ def main():
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--save-optimizer-state", action="store_true",
                     help="Also save same-layout optimizer .pt state. Default checkpoints are adapter safetensors + JSON only.")
-    ap.add_argument("--save-legacy-device-state", action="store_true",
-                    help="Also save legacy per-device trainable .pt state for debugging/backward compatibility.")
     ap.add_argument("--checkpoint-decoder-layer", action="store_true", default=True,
                     help="Activation checkpointing per decoder layer (reduces VRAM, ~30% slower)")
     ap.add_argument("--recompute-grain", default="layer", choices=["layer", "none"],
@@ -899,7 +897,7 @@ def main():
             save_checkpoint(modules_by_device, optimizer, step, save_dir,
                             peft_model=hf_model,
                             save_optimizer_state=args.save_optimizer_state,
-                            save_legacy_device_state=args.save_legacy_device_state)
+                            )
             jprint({"event": "checkpoint", "path": str(save_dir), "step": step})
 
     if pending_async_optimizer_step:

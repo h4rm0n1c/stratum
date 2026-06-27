@@ -230,10 +230,9 @@ CPU-offloaded async optimizer, GradScaler, router auxiliary loss, NF4 prefetch,
 and `--host-ram-limit-gib 80`.
 
 Use `--no-save` for disposable validation smokes unless save/resume behavior is
-the thing under test. Optimizer state files such as `optim_0.pt` and
-`optim_1.pt` are large and are not part of the normal safetensors adapter-save
-path; only request them with `--save-optimizer-state` for explicit optimizer
-checkpoint/resume validation.
+the thing under test. `optimizer_state.pt` is large and is not part of the
+normal safetensors adapter-save path; only request it with `--save-optimizer-state`
+for explicit optimizer checkpoint/resume validation.
 
 Docker-created smoke outputs may be root-owned on the host. Remove disposable
 smoke directories from inside the container:
@@ -277,7 +276,7 @@ Observed result:
 | Throughput | Warm steps around 3000 tokens/s for batch 2 / 2 microbatches |
 | Peaks | GPU0 ~4.6 GiB, GPU1 ~19.3 GiB |
 | Checkpoints | `checkpoint-5/` and `final/` wrote PEFT `adapter_model.safetensors` |
-| Legacy blobs | No `device_*.pt`, `optim_*.pt`, or `meta.pt` written by default |
+| Legacy blobs | No `device_*.pt`, `meta.pt` written; `optimizer_state.pt` only with `--save-optimizer-state` |
 
 This proves the current LFM2.5 NF4 + LoRA + host-staged multi-GPU path for the
 reference setup.
@@ -325,7 +324,7 @@ Observed result: finite losses `11.3813` then `10.8578`, standard
 `flash_attn` on the RTX 3080 full-attention layer, `flash_attn_v100` on the
 V100 full-attention layers, host-staged activation and gradient boundary
 transfers, GradScaler init scale `65536.0`, and both `checkpoint-2/` and
-`final/` wrote PEFT adapters plus `optim_0.pt` and `optim_1.pt`.
+`final/` wrote PEFT adapters plus `optimizer_state.pt`.
 
 RoundPipe scheduler stage-boundary wiring was then validated on 2026-06-25
 with a 1-step LFM2.5 smoke using CPU-offloaded async optimizer, GradScaler,
@@ -466,7 +465,7 @@ adapted. The table below is the complete parity ledger.
 | Timing-fed plan adaptation | `roundpipe/timer.py` + scheduler | **Done** — `set_layer_timer(timer, adapt_every_n=N)`; `_try_adapt_plan` fires every N steps; wired in `train.py` via `--adapt-plan-every N` |
 | Async H2D upload stream | `roundpipe/device.py` | **Done** — `param_upstream` stream per device; `_upload_group_with_fence`; `non_blocking=True` H2D copies |
 | Per-layer upload/compute overlap | RoundPipe scheduler | **Done** — layer i+1 H2D submitted before layer i fence-wait in `forward_range`; recompute path covered |
-| PEFT safetensors checkpoints | `train_lfm25_roundpipe_lora.py` | **Done** — `save_checkpoint` / `load_checkpoint`; optimizer `.pt` is opt-in |
+| PEFT safetensors checkpoints | `train_lfm25_roundpipe_lora.py` | **Done** — `save_checkpoint` / `load_checkpoint`; `optimizer_state.pt` (name-keyed, topology-portable) is opt-in |
 | MoE router aux loss | `train_lfm25_roundpipe_lora.py` | **Done** — `patch_moe_block_for_router_logits` / `pop_router_logits` / `load_balancing_loss_func` |
 | LFM2.5 adapter | reference script | **Done** — `stratum/model/lfm25.py`; smoked at batch 2 / 2 microbatch / 8K |
 | Qwen3.5 adapter | `train_qwen35_roundpipe_lora.py` | **Done** — `stratum/model/qwen35.py`; smoked at batch 2 / 2 microbatch / 8K |
@@ -494,7 +493,7 @@ adapted. The table below is the complete parity ledger.
 3. **Longer save/resume validation** — multi-step resume under CPU optimizer
    offload, checkpoint failure modes. Unit coverage exists; end-to-end
    integration runs are thin. Host unit coverage now verifies opt-in Adam
-   moment round-trip without legacy `device_*.pt` state.
+   moment round-trip with `optimizer_state.pt` and topology-portability.
 
 4. **NUMA coordination** — future Stratum optimization (binding staging
    buffers, NF4 prefetch, CPU optimizer, worker affinity to NUMA topology).
@@ -666,7 +665,7 @@ scripts/train.py
 | File | Purpose |
 |---|---|
 | `optim.py` | `PerDeviceOptimizer` — one AdamW per device, synchronised LR scheduling |
-| `checkpoint.py` | `save_checkpoint()` / `load_checkpoint()` — PEFT safetensors + JSON metadata by default; legacy `.pt` opt-in |
+| `checkpoint.py` | `save_checkpoint()` / `load_checkpoint()` — PEFT safetensors + JSON metadata by default; `optimizer_state.pt` (name-keyed) opt-in |
 | `utils.py` | device detection, `gpu_memory_snapshot()`, `host_rss_gib()`, `release_cached_memory()`, `get_optimal_tensor_split()` |
 
 ## Training Mechanics — How a Single Step Works
@@ -853,43 +852,31 @@ Default checkpoints are LoRA/QLoRA-style and portable:
 checkpoint-5000/
 ├── adapter_model.safetensors     ← PEFT-compatible LoRA weights (portable)
 ├── adapter_config.json            ← PEFT adapter config
+├── optimizer_state.pt             ← opt-in: Adam moments keyed by param name
 └── trainer_state.json             ← step number and lightweight metadata
 ```
 
 **Saving:** `hf_model.save_pretrained(out_dir)` produces `adapter_model.safetensors`
-+ `adapter_config.json`. This works because PEFT only saves LoRA parameters,
-not base model frozen weights. Even though `prepare_nf4()` has set frozen
-weights to `empty(0)`, PEFT ignores them.
++ `adapter_config.json`. PEFT only saves LoRA parameters; frozen base weights
+(`empty(0)` after NF4 prep) are ignored.
 
-Stratum no longer writes `device_{id}.pt`, `optim_{id}.pt`, or `meta.pt` by
-default. Those files are same-layout legacy/debug artifacts and are explicitly
-opt-in with:
-
-```bash
---save-legacy-device-state
---save-optimizer-state
-```
-
-Do not enable those flags for normal LoRA/QLoRA training unless same-layout
-optimizer resume is worth the extra disk use. `optim_{id}.pt` files are
-PyTorch optimizer `state_dict()` files sharded by Stratum device id; they are
-exact-resume state, not portable adapter artifacts. Portable adapter
-checkpoints should stay small and safetensors-first.
+`optimizer_state.pt` is written only with `--save-optimizer-state`. It is a
+single file keyed by parameter name (`{name: {exp_avg, exp_avg_sq, step}}`),
+not sharded by device. This makes it topology-portable: you can save on a
+2-GPU split and resume on a 1-GPU split or any other configuration.
 
 Disk policy:
 
 - Normal checkpoint: `adapter_model.safetensors`, `adapter_config.json`,
-  `README.md`, and `trainer_state.json`.
+  `README.md`, and `trainer_state.json`. No `.pt` files.
 - Exact-resume checkpoint: opt in with `--save-optimizer-state`; delete after
   the resume path has been validated unless the run must be continued exactly.
-- Legacy per-device weights: opt in with `--save-legacy-device-state` only for
-  debugging old layouts.
 - Smoke tests: do not use `--save-optimizer-state` unless the smoke is
   specifically about optimizer-state save/load.
 
 **Loading (resume):** `safetensors.torch.load_file()` → `hf_model.load_state_dict(strict=False)`.
-Prefers PEFT adapter, reads `trainer_state.json`, and falls back to legacy
-`.pt` files only for old checkpoints.
+Reads `trainer_state.json` for step, loads `optimizer_state.pt` if present
+and an optimizer was provided. No per-device files, no `meta.pt`.
 
 **Inference on another machine:**
 ```python
