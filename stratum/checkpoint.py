@@ -14,6 +14,7 @@ optimizer_state.safetensors layout:
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -112,6 +113,131 @@ def save_checkpoint(
     log_event("checkpoint_saved", step=step, out_dir=str(out_dir),
               seconds=round(dt, 2), peft_saved=peft_saved,
               optimizer_state_saved=bool(save_optimizer_state))
+
+
+class AsyncCheckpointHandle:
+    """Handle returned by save_checkpoint_async. Call .join() before the next save."""
+
+    def __init__(self, thread: threading.Thread, out_dir: Path, step: int) -> None:
+        self._thread = thread
+        self.out_dir = out_dir
+        self.step = step
+
+    def join(self) -> None:
+        if self._thread.is_alive():
+            self._thread.join()
+
+
+def save_checkpoint_async(
+    modules_per_device: dict,
+    optimizer,
+    step: int,
+    out_dir: Path,
+    peft_model: Optional[torch.nn.Module] = None,
+    *,
+    save_optimizer_state: bool = False,
+) -> AsyncCheckpointHandle:
+    """Like save_checkpoint but does disk I/O in a background thread.
+
+    LoRA adapter tensors and optimizer moment tensors are cloned synchronously
+    before this function returns, so the training loop can continue immediately
+    without risking a race between the writer thread and the next optimizer step.
+    The background thread has no access to live model or optimizer objects.
+
+    Call AsyncCheckpointHandle.join() before launching a new checkpoint write
+    to avoid concurrent writes and unbounded background resource use.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Synchronous extraction ---
+
+    # LoRA adapter: snapshot tensors + config JSON now, write later.
+    peft_tensors: Optional[dict[str, torch.Tensor]] = None
+    peft_config_json: Optional[str] = None
+    peft_saved_sync = False
+    if peft_model is not None:
+        try:
+            from peft import get_peft_model_state_dict
+            peft_tensors = {
+                k: v.detach().cpu().clone()
+                for k, v in get_peft_model_state_dict(peft_model).items()
+            }
+            active = getattr(peft_model, "active_adapter", "default")
+            cfg = peft_model.peft_config.get(active)
+            peft_config_json = cfg.to_json_string() if cfg is not None else None
+        except Exception as exc:
+            # Extraction failed — fall back to synchronous save_pretrained so
+            # the checkpoint is never silently skipped.
+            print(json.dumps({"event": "warning",
+                              "async_checkpoint_extract_failed": str(exc),
+                              "fallback": "synchronous"}),
+                  file=sys.stderr, flush=True)
+            try:
+                peft_model.save_pretrained(str(out_dir))
+                peft_saved_sync = True
+            except Exception as exc2:
+                print(json.dumps({"event": "error",
+                                  "checkpoint_peft_save_failed": str(exc2)}),
+                      file=sys.stderr, flush=True)
+                raise
+
+    # Optimizer state: clone moment tensors now.
+    optim_tensors: Optional[dict[str, torch.Tensor]] = None
+    optim_metadata: Optional[dict[str, str]] = None
+    if save_optimizer_state and optimizer is not None:
+        optim_tensors = {}
+        merged_groups = None
+        for device_id, modules in modules_per_device.items():
+            opt = optimizer.optimizers.get(device_id)
+            if opt is None:
+                continue
+            names = _optimizer_param_names(modules)
+            sd = opt.state_dict()
+            for i, name in enumerate(names):
+                if i in sd["state"]:
+                    for moment, val in sd["state"][i].items():
+                        t = val if isinstance(val, torch.Tensor) else torch.tensor(val)
+                        optim_tensors[f"{name}:{moment}"] = t.detach().cpu().contiguous().clone()
+            if merged_groups is None:
+                merged_groups = [
+                    {k: v for k, v in g.items() if k != "params"}
+                    for g in sd["param_groups"]
+                ]
+        optim_metadata = {"param_groups": json.dumps(merged_groups or [])}
+
+    trainer_state = {
+        "format_version": 2,
+        "step": int(step),
+        "peft_adapter_saved": peft_tensors is not None or peft_saved_sync,
+        "optimizer_state_saved": bool(save_optimizer_state),
+    }
+
+    # --- Background I/O thread ---
+
+    def _write() -> None:
+        t0 = time.time()
+        if peft_tensors is not None:
+            from safetensors.torch import save_file as _sf
+            _sf(peft_tensors, out_dir / "adapter_model.safetensors")
+        if peft_config_json is not None:
+            with (out_dir / "adapter_config.json").open("w", encoding="utf-8") as f:
+                f.write(peft_config_json)
+        if optim_tensors is not None:
+            from safetensors.torch import save_file as _sf2
+            _sf2(optim_tensors, out_dir / _OPTIM_FILE, metadata=optim_metadata)
+        with (out_dir / "trainer_state.json").open("w", encoding="utf-8") as f:
+            json.dump(trainer_state, f, indent=2, sort_keys=True)
+            f.write("\n")
+        dt = time.time() - t0
+        log_event("checkpoint_saved", step=step, out_dir=str(out_dir),
+                  seconds=round(dt, 2), async_write=True,
+                  peft_saved=peft_tensors is not None or peft_saved_sync,
+                  optimizer_state_saved=bool(save_optimizer_state))
+
+    thread = threading.Thread(target=_write, daemon=True, name=f"ckpt-{step}")
+    thread.start()
+    return AsyncCheckpointHandle(thread, out_dir, step)
 
 
 def load_checkpoint(

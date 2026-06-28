@@ -46,7 +46,7 @@ from stratum.batch import (
     training_token_counts,
 )
 from stratum.optim import PerDeviceOptimizer
-from stratum.checkpoint import save_checkpoint, load_checkpoint
+from stratum.checkpoint import save_checkpoint, save_checkpoint_async, load_checkpoint, AsyncCheckpointHandle
 from stratum.timing import ModelLayerTimer, TimingRecorder
 from stratum.utils import get_device_info, gpu_memory_snapshot
 from stratum.watchdog import mark_phase, mark_memory_phase, memory_snapshot, set_log_file as watchdog_set_log_file
@@ -669,6 +669,7 @@ def main():
     )
 
     pending_async_optimizer_step = False
+    pending_checkpoint: Optional[AsyncCheckpointHandle] = None
 
     def finish_optimizer_step() -> None:
         if args.async_optimizer_step:
@@ -893,16 +894,25 @@ def main():
             if pending_async_optimizer_step:
                 finish_optimizer_step()
                 pending_async_optimizer_step = False
+            # Join any previous background write before starting a new one.
+            if pending_checkpoint is not None:
+                pending_checkpoint.join()
             save_dir = Path(args.out) / f"checkpoint-{step}"
-            save_checkpoint(modules_by_device, optimizer, step, save_dir,
-                            peft_model=hf_model,
-                            save_optimizer_state=args.save_optimizer_state,
-                            )
+            pending_checkpoint = save_checkpoint_async(
+                modules_by_device, optimizer, step, save_dir,
+                peft_model=hf_model,
+                save_optimizer_state=args.save_optimizer_state,
+            )
             jprint({"event": "checkpoint", "path": str(save_dir), "step": step})
 
     if pending_async_optimizer_step:
         finish_optimizer_step()
         pending_async_optimizer_step = False
+
+    # Ensure any background checkpoint write completes before the final save.
+    if pending_checkpoint is not None:
+        pending_checkpoint.join()
+        pending_checkpoint = None
 
     # Final save
     if not args.no_save:
