@@ -12,7 +12,7 @@ from stratum.assign import assign_layers_to_devices
 from stratum.stage import DeviceStage
 from stratum.host_staging import HostStagingPool
 from stratum.grad_hooks import make_boundary_hook
-from stratum.upload import NF4Prefetch, ensure_prefetched_weights, ensure_weights, free_weights, prefetch_weights
+from stratum.upload import NF4Prefetch, ensure_prefetched_weights, ensure_weights, free_weights, prefetch_weights, restore_module_buffers, snapshot_module_buffers
 from stratum.timing import IterLayerTimer, ModelLayerTimer, TimingRecorder
 from stratum.utils import log_event
 from stratum.context import ForwardCtx, set_recompute_event_recorder
@@ -875,6 +875,13 @@ class StratumPipeline(nn.Module):
                 ):
                     group_input = _clone_pytree_containers(tuple_data)
                     group_input_hidden = group_input[0]
+                    # Snapshot mutable buffers before forward so recompute can
+                    # restore them to pre-forward state.  This is a no-op for
+                    # modules with no buffers (the common case for frozen LLM
+                    # decoder layers).
+                    _buf_snap = snapshot_module_buffers(
+                        self._fwd_group_modules[fwd_group_id]
+                    )
                     with _compute_stream_context(stage.device_id):
                         captured_group_input = capture_backward_input(group_input)
                         group_output = self._run_stage_group(
@@ -911,12 +918,18 @@ class StratumPipeline(nn.Module):
                     _iter_timer: Optional[IterLayerTimer] = iter_timer,
                     _param_stream: Optional["torch.cuda.Stream"] = _group_param_stream,
                     _fwd_group_id: int = fwd_group_id,
+                    _buf_snap: dict = _buf_snap,
+                    _group_mod: nn.Module = self._fwd_group_modules[fwd_group_id],
                 ) -> tuple:
                     # Consume any look-ahead fence pre-uploaded by the previous group's
                     # backward pass. On NF4 paths where weights stay on GPU from forward,
                     # this is a no-op fence (ensure_weights exits early). On paths where
                     # weights are freed after forward it provides real overlap.
                     _fence = self._pending_bwd_fences.pop(_fwd_group_id, None)
+                    # Restore buffers to pre-forward state before recompute so the
+                    # recompute sees the same buffer values as the original forward.
+                    # No-op when the module has no non-empty buffers.
+                    restore_module_buffers(_group_mod, _buf_snap)
                     return self._run_stage_group(
                         _stage,
                         input_data,

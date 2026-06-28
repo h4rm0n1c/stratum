@@ -1136,6 +1136,51 @@ def free_weights(module: torch.nn.Module) -> int:
 
 
 @torch.no_grad()
+def snapshot_module_buffers(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Clone all non-empty buffers to CPU for recompute restore.
+
+    Call this before a group's forward pass.  Pass the result to
+    ``restore_module_buffers`` inside the recompute closure so the recompute
+    sees the same pre-forward buffer state as the original forward.
+
+    Buffers that could be mutated during a forward pass (e.g. BatchNorm running
+    statistics, causal-conv hidden state) must be restored before recompute or
+    the recomputed activations will differ from the originals, producing wrong
+    gradients.  All non-empty buffers are snapshotted regardless of device so
+    the mechanism works in both CUDA and CPU (test) environments.
+    """
+    snap: dict[str, torch.Tensor] = {}
+    for name, buf in module.named_buffers():
+        if buf.numel() > 0:
+            snap[name] = buf.detach().to("cpu", non_blocking=False).clone()
+    return snap
+
+
+@torch.no_grad()
+def restore_module_buffers(
+    module: torch.nn.Module,
+    snapshot: dict[str, torch.Tensor],
+) -> int:
+    """Restore buffers from a pre-forward snapshot before a recompute pass.
+
+    Each entry in *snapshot* is copied back to the buffer's current device so
+    the recompute forward sees the same buffer values as the original forward.
+    Returns the number of buffers restored.
+    """
+    if not snapshot:
+        return 0
+    buf_map = dict(module.named_buffers())
+    restored = 0
+    for name, cpu_clone in snapshot.items():
+        buf = buf_map.get(name)
+        if buf is None:
+            continue
+        buf.data.copy_(cpu_clone.to(buf.device, non_blocking=False))
+        restored += 1
+    return restored
+
+
+@torch.no_grad()
 def prepare_nf4_from_cache(
     module: torch.nn.Module,
     cache_dir: str | Path | None,

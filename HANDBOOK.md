@@ -276,7 +276,7 @@ Observed result:
 | Throughput | Warm steps around 3000 tokens/s for batch 2 / 2 microbatches |
 | Peaks | GPU0 ~4.6 GiB, GPU1 ~19.3 GiB |
 | Checkpoints | `checkpoint-5/` and `final/` wrote PEFT `adapter_model.safetensors` |
-| Legacy blobs | No `device_*.pt`, `meta.pt` written; `optimizer_state.pt` only with `--save-optimizer-state` |
+| Legacy blobs | No `device_*.pt`, `meta.pt` written; `optimizer_state.safetensors` only with `--save-optimizer-state` |
 
 This proves the current LFM2.5 NF4 + LoRA + host-staged multi-GPU path for the
 reference setup.
@@ -439,6 +439,8 @@ The codebase has moved ahead of this document in several areas after the
 | `checkpoint_decoder_layer` defaults to `True` | Activation checkpointing is on by default in `train.py`. |
 | Qwen35 `_FlashBackend` NamedTuple pattern | Structured backend selection with hard failure on flash kernel error; no silent OOMs from eager fallback. |
 | LFM25 `Lfm25FlashAttention` | Uses the same `_FlashBackend` pattern as Qwen35; CUDA flash backend absence or kernel failure is fatal, not a silent eager fallback. |
+| **Forward-path per-group weight freeing** | `free_weights(group_module)` is called immediately after each scheduler group's `_run_stage_group` returns in the forward loop. This changes peak GPU weight memory from O(all groups' FP16) to O(one group's FP16). LoRA params (no `NF4_ATTR`/`FP16_ATTR`) are skipped. The backward `_free_stage_group` hook still fires but `free_weights` returns 0 (already empty) while scheduler notification and timing still fire normally. CUDA memory is safe: the caching allocator defers GPU memory reuse until in-flight stream work completes. |
+| **Cross-group backward look-ahead prefetch** | `_AnchorMeta.look_ahead_upload` field added to `stratum/runtime.py`. At the very start of `_ExplicitGroupBackward.backward()` for group k, `look_ahead_upload()` fires before recompute begins, pre-uploading group k-1's first layer on the `param_upstream` stream. The fence is stored in `pipeline._pending_bwd_fences` and consumed by `_run_group`'s `first_layer_fence` argument. `_start_bwd_look_ahead` mirrors `_upload_first_layer_with_fence`. For group 0 the callback is None. With per-group forward freeing active this provides real overlap; without it the ensure_weights call is a no-op fence (weights already on GPU). |
 
 ### Parity status (updated 2026-06-27)
 
@@ -465,14 +467,14 @@ adapted. The table below is the complete parity ledger.
 | Timing-fed plan adaptation | `roundpipe/timer.py` + scheduler | **Done** — `set_layer_timer(timer, adapt_every_n=N)`; `_try_adapt_plan` fires every N steps; wired in `train.py` via `--adapt-plan-every N` |
 | Async H2D upload stream | `roundpipe/device.py` | **Done** — `param_upstream` stream per device; `_upload_group_with_fence`; `non_blocking=True` H2D copies |
 | Per-layer upload/compute overlap | RoundPipe scheduler | **Done** — layer i+1 H2D submitted before layer i fence-wait in `forward_range`; recompute path covered |
-| PEFT safetensors checkpoints | `train_lfm25_roundpipe_lora.py` | **Done** — `save_checkpoint` / `load_checkpoint`; `optimizer_state.pt` (name-keyed, topology-portable) is opt-in |
+| PEFT safetensors checkpoints | `train_lfm25_roundpipe_lora.py` | **Done** — `save_checkpoint` / `load_checkpoint`; `optimizer_state.safetensors` (name-keyed, topology-portable) is opt-in |
 | MoE router aux loss | `train_lfm25_roundpipe_lora.py` | **Done** — `patch_moe_block_for_router_logits` / `pop_router_logits` / `load_balancing_loss_func` |
 | LFM2.5 adapter | reference script | **Done** — `stratum/model/lfm25.py`; smoked at batch 2 / 2 microbatch / 8K |
 | Qwen3.5 adapter | `train_qwen35_roundpipe_lora.py` | **Done** — `stratum/model/qwen35.py`; smoked at batch 2 / 2 microbatch / 8K |
 | Llama adapter | `roundpipe/models/llama.py` | **Done** — `stratum/model/llama.py`; TinyLlama-1.1B smoke passed |
 | Qwen3 dense adapter | `roundpipe/models/qwen3.py` | **Done** — `stratum/model/qwen3.py`; Qwen3-0.6B smoke passed |
 | Qwen3-MoE adapter | `roundpipe/models/qwen3_moe.py` | **Done** — `stratum/model/qwen3_moe.py`; Qwen3-30B-A3B smoke passed |
-| Non-NF4 layer-copy path | `roundpipe/transfer.py` | **Done** — `prepare_fp16_staged` / `copy_tensor_chunked` lifecycle; mutable-buffer snapshot for recompute is an open tail |
+| Non-NF4 layer-copy path | `roundpipe/transfer.py` | **Done** — `prepare_fp16_staged` / `copy_tensor_chunked` lifecycle; `snapshot_module_buffers` / `restore_module_buffers` fixes mutable-buffer recompute corruption |
 | Pytree batch API | `roundpipe/batch.py` | **Done** — `guess_split_spec` / `split_pytree` / `merge_pytree` / `TokenWeightedReducer`; `--pytree-batch` flag in `train.py` |
 | Sample packing | `roundpipe/batch.py` | **Done** — `pack_samples` / `pack_collate` / `split_packed_batch` in `stratum/packing.py`; `--packing` flag; flash_attn_varlen_func dispatch on LFM25 and Qwen35; LFM2.5 packing smoke passed 2026-06-27 (batch 2 / 2 microbatch / 8192 ctx, finite loss 7.883, 791 trainable tokens, host-staged boundary transfers, ShortConv seq_idx boundary reset, MoE packed-mode wrapper) |
 | Host RAM management | — | **Done for LFM2.5 / partial for Qwen35 depth** — `release_cached_memory()` frees cached FP16 pages after NF4 prep (measurable: 11+ GiB RSS drop on the normal path); `--low-rss-nf4-build` builds the HF skeleton on meta and streams checkpoint tensors during NF4 preparation. LFM2.5 low-RSS NF4 Docker smoke passed on 2026-06-27; Qwen35 low-RSS depth is still future validation |
@@ -480,10 +482,12 @@ adapted. The table below is the complete parity ledger.
 
 **What is not yet done (in priority order):**
 
-1. **Mutable-buffer snapshot/restore** — `--no-nf4` recompute paths that
-   mutate buffers (e.g., running stats in norms) could silently corrupt
-   recompute. Low priority: the `--no-nf4` path is rarely used and the
-   issue only surfaces when a layer mutates a buffer during forward.
+1. ~~**Mutable-buffer snapshot/restore**~~ **Done (2026-06-28)** —
+   `snapshot_module_buffers` / `restore_module_buffers` in `stratum/upload.py`.
+   `_run_group` (the recompute closure) captures a pre-forward buffer snapshot
+   and restores it before recompute so the recompute sees the same buffer
+   values as the original forward. No-op for modules with no non-empty buffers
+   (the common case for LFM2.5 and Qwen35 decoder layers).
 
 2. **Sliding-window mask audit** — Qwen3 sliding-window mask behavior
    against RoundPipe's reference is a future audit item. All public Qwen3
@@ -493,11 +497,18 @@ adapted. The table below is the complete parity ledger.
 3. **Longer save/resume validation** — multi-step resume under CPU optimizer
    offload, checkpoint failure modes. Unit coverage exists; end-to-end
    integration runs are thin. Host unit coverage now verifies opt-in Adam
-   moment round-trip with `optimizer_state.pt` and topology-portability.
+   moment round-trip with `optimizer_state.safetensors` and topology-portability.
 
 4. **NUMA coordination** — future Stratum optimization (binding staging
    buffers, NF4 prefetch, CPU optimizer, worker affinity to NUMA topology).
    Not a RoundPipe parity item.
+
+5. **Qwen35 packed training container smoke** — LFM2.5 packing is validated
+   end-to-end; Qwen35 packed training has not yet been run on the reference
+   heterogeneous hardware.
+
+6. **Qwen35 low-RSS NF4 build** — `--low-rss-nf4-build` is validated on
+   LFM2.5; Qwen35 equivalent smoke is future validation work.
 
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 
@@ -677,14 +688,19 @@ scripts/train.py
 2. For each microbatch:
    a. ensure_weights(self.prefix, 0)           # upload embed_tokens NF4→FP16 to GPU 0
    b. self.prefix(input_ids, ...)               # embed_tokens, pos_emb → 7-tuple
-   c. For each stage:
-        ensure_weights(stage, stage.device_id)  # upload stage's NF4 weights to its GPU
-        stage(tuple_data)                       # run all layers in this stage
+   c. For each scheduler group (sub-stage slice):
+        ensure_weights(group_module, device_id) # upload group's NF4 weights to GPU
+        group(tuple_data)                       # run all layers in this group
+        free_weights(group_module)              # free FP16 immediately (NEW — keeps
+                                                # peak weight memory to one group)
    d. ensure_weights(self.postfix, last_device) # upload lm_head weights
    e. self.postfix(tuple_data)                  # norm + chunked lm_head → loss
-   f. (loss / num_microbatch).backward()        # gradients flow back through all stages
+   f. (loss / num_microbatch).backward()        # gradients flow back:
+                                                # each group recomputes (ensure_weights
+                                                # again), backprops, then frees again
 3. optimizer.step()
-4. pipeline.free_all_weights()                  # free FP16 data, keep NF4 payload for next step
+4. pipeline.free_all_weights()                  # safety net: frees any residual weight
+                                                # data (typically already empty)
 ```
 
 ### The 7-tuple
@@ -725,11 +741,27 @@ ensure_weights() — at each step, before stage forward
   [ forward runs with FP16 weights ]
   │
   ▼
-free_weights() — after backward, before next step
+free_weights() — immediately after each scheduler group's forward (NEW)
   │
-  ├── param.data = empty(0)        ← frees FP16 on GPU
+  ├── param.data = empty(0)        ← frees FP16 on GPU (LoRA params skipped)
   └── NF4Payload kept on CPU       ← ready for next ensure_weights
+  │
+  │   (backward recompute calls ensure_weights again for this group)
+  │
+  ▼
+free_weights() — after each group's backward (via _free_stage_group hook)
+  │
+  ├── free_weights returns 0       ← params already empty from forward free
+  └── scheduler notification fires ← timing and group-complete hooks run normally
 ```
+
+**Peak GPU weight memory:** With per-group forward freeing active, GPU weight
+memory holds at most one scheduler group's dequantized FP16 weights at any
+time, rather than accumulating all groups' weights across the forward pass.
+CUDA memory safety: the caching allocator defers actual GPU memory reuse until
+all in-flight stream work on those buffers completes, so setting
+`param.data = empty(0)` immediately after a group forward is safe even with
+NF4/FP16 frozen params that have no `requires_grad`.
 
 **Crucial detail:** NF4 payloads are on CPU, NOT GPU. This is different from
 QLoRA's `Linear4bit` which keeps NF4 weights on GPU. The tradeoff: Stratum

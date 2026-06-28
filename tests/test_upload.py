@@ -21,6 +21,8 @@ from stratum.upload import (
     free_weights,
     prepare_fp16_staged,
     prepare_nf4,
+    restore_module_buffers,
+    snapshot_module_buffers,
 )
 
 
@@ -457,6 +459,166 @@ class PrepareNF4Tests(unittest.TestCase):
 
         expected_bytes = 4 * 16 * 8 * 2  # numel * sizeof(float16)
         self.assertEqual(stats.source_bytes, expected_bytes)
+
+
+class BufferSnapshotRestoreTests(unittest.TestCase):
+    """Tests for snapshot_module_buffers / restore_module_buffers."""
+
+    def _make_module_with_buffers(self):
+        """Module with two named buffers, mimicking a BN-style mutable buffer."""
+        m = nn.Module()
+        m.register_buffer("running_mean", torch.zeros(4))
+        m.register_buffer("running_var", torch.ones(4))
+        return m
+
+    def test_snapshot_captures_all_nonempty_buffers(self):
+        m = self._make_module_with_buffers()
+        snap = snapshot_module_buffers(m)
+        self.assertIn("running_mean", snap)
+        self.assertIn("running_var", snap)
+        self.assertEqual(len(snap), 2)
+
+    def test_snapshot_is_a_clone_not_a_view(self):
+        m = self._make_module_with_buffers()
+        snap = snapshot_module_buffers(m)
+        # Mutate the buffer
+        m.running_mean.fill_(99.0)
+        # Snapshot should not be affected
+        self.assertTrue(torch.all(snap["running_mean"] == 0.0))
+
+    def test_snapshot_empty_buffers_excluded(self):
+        m = nn.Module()
+        m.register_buffer("empty_buf", torch.empty(0))
+        m.register_buffer("real_buf", torch.ones(3))
+        snap = snapshot_module_buffers(m)
+        self.assertNotIn("empty_buf", snap)
+        self.assertIn("real_buf", snap)
+
+    def test_restore_reverts_buffer_mutation(self):
+        m = self._make_module_with_buffers()
+        snap = snapshot_module_buffers(m)
+        # Simulate what a forward pass that mutates running stats would do
+        m.running_mean.fill_(5.0)
+        m.running_var.fill_(2.0)
+        # Restore should bring them back to pre-forward values
+        restored = restore_module_buffers(m, snap)
+        self.assertEqual(restored, 2)
+        self.assertTrue(torch.all(m.running_mean == 0.0))
+        self.assertTrue(torch.all(m.running_var == 1.0))
+
+    def test_restore_empty_snapshot_is_noop(self):
+        m = self._make_module_with_buffers()
+        m.running_mean.fill_(7.0)
+        restored = restore_module_buffers(m, {})
+        self.assertEqual(restored, 0)
+        self.assertTrue(torch.all(m.running_mean == 7.0))
+
+    def test_snapshot_nested_module_buffers(self):
+        """Named buffers from nested submodules appear with qualified names."""
+        outer = nn.Module()
+        inner = nn.Module()
+        inner.register_buffer("stats", torch.zeros(2))
+        outer.add_module("sub", inner)
+        snap = snapshot_module_buffers(outer)
+        self.assertIn("sub.stats", snap)
+
+    def test_restore_nested_module_buffers(self):
+        outer = nn.Module()
+        inner = nn.Module()
+        inner.register_buffer("stats", torch.zeros(2))
+        outer.add_module("sub", inner)
+        snap = snapshot_module_buffers(outer)
+        inner.stats.fill_(3.0)
+        restored = restore_module_buffers(outer, snap)
+        self.assertEqual(restored, 1)
+        self.assertTrue(torch.all(inner.stats == 0.0))
+
+    def test_snapshot_module_with_no_buffers_returns_empty(self):
+        m = nn.Linear(4, 4)  # has no buffers, only parameters
+        snap = snapshot_module_buffers(m)
+        self.assertEqual(snap, {})
+
+    def test_restore_empty_snapshot_on_module_with_buffers_is_noop(self):
+        m = self._make_module_with_buffers()
+        m.running_mean.fill_(42.0)
+        # Empty snapshot — nothing to restore
+        restore_module_buffers(m, {})
+        self.assertTrue(torch.all(m.running_mean == 42.0))
+
+
+class BufferSnapshotPipelineIntegrationTest(unittest.TestCase):
+    """Verify pipeline wires buffer snapshot/restore into the recompute path."""
+
+    def _build_mini_pipeline(self, num_layers: int = 2):
+        from stratum.pipeline import StratumPipeline
+        from stratum.stage import DeviceStage
+        from stratum.scheduler import ModelExecutePlan
+
+        # Must create a NEW tensor (not passthrough) so anchor_explicit_group_backward
+        # creates an autograd node and _run_group actually fires during backward.
+        # DeviceStage passes the full 7-tuple to each layer.
+        class _ScaleLayer(nn.Module):
+            def forward(self, data):
+                h = data[0] * 2.0
+                return (h,) + data[1:]
+
+        layers = [_ScaleLayer() for _ in range(num_layers)]
+
+        class _P(nn.Module):
+            def forward(self, *, input_ids, attention_mask=None, labels=None, **kw):
+                h = torch.ones(1, 4, requires_grad=True)
+                return (h, None, None, None, None, None, None)
+
+        class _Q(nn.Module):
+            def forward(self, data):
+                return data[0].mean()
+
+        stage = DeviceStage(layers=layers, device_id=0)
+        plan = ModelExecutePlan.from_stage_lengths([num_layers])
+        return StratumPipeline(_P(), [stage], _Q(), execute_plan=plan)
+
+    def test_restore_module_buffers_called_in_run_group(self):
+        """restore_module_buffers is called once per group during backward recompute."""
+        from unittest.mock import patch, call
+
+        restore_calls = []
+
+        def _capture_restore(module, snapshot):
+            restore_calls.append((id(module), snapshot))
+            return 0
+
+        pipe = self._build_mini_pipeline(num_layers=2)
+        with patch("stratum.pipeline.restore_module_buffers", side_effect=_capture_restore):
+            try:
+                loss = pipe.forward(input_ids=torch.zeros(1, dtype=torch.long))
+                loss.backward()
+            except Exception:
+                pass
+
+        # restore_module_buffers should be called once per scheduler group per backward
+        self.assertGreater(len(restore_calls), 0,
+                           "restore_module_buffers must be called during backward recompute")
+
+    def test_snapshot_module_buffers_called_before_each_forward(self):
+        """snapshot_module_buffers is called once per group in the forward loop."""
+        from unittest.mock import patch
+
+        snap_calls = []
+
+        def _capture_snap(module):
+            snap_calls.append(id(module))
+            return {}
+
+        pipe = self._build_mini_pipeline(num_layers=2)
+        with patch("stratum.pipeline.snapshot_module_buffers", side_effect=_capture_snap):
+            try:
+                pipe.forward(input_ids=torch.zeros(1, dtype=torch.long))
+            except Exception:
+                pass
+
+        expected_groups = len(pipe._fwd_group_modules)
+        self.assertEqual(len(snap_calls), expected_groups,
+                         "snapshot_module_buffers must be called once per group")
 
 
 class _TempPath:

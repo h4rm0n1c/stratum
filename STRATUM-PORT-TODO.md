@@ -53,7 +53,7 @@ Multi-GPU parity work must stay aligned with that contract:
 
 ---
 
-## Current Remaining Work — 2026-06-27 (updated)
+## Current Remaining Work — 2026-06-28 (updated)
 
 Stratum has reached practical full-feature parity with qz-roundpipe on the
 reference no-P2P RTX 3080 + V100 machine. Every RoundPipe mechanism that is
@@ -98,6 +98,22 @@ The remaining open items are a narrow tail:
    `_upload_first_layer_with_fence` handles cross-group overlap. The `_run_group`
    recompute closure also passes `param_stream` so per-layer overlap applies
    during checkpoint recompute. All four sub-slices complete.
+
+   **(e) Forward-path per-group weight freeing (2026-06-28):** `free_weights(group_module)`
+   is called immediately after each scheduler group's `_run_stage_group` returns in
+   the forward loop. Peak GPU weight memory drops from O(all groups' FP16) to
+   O(one group's FP16). LoRA trainable params are untouched. The backward
+   `_free_stage_group` hook still fires but `free_weights` returns 0 (already
+   empty) while scheduler notification and timing run normally.
+
+   **(f) Cross-group backward look-ahead prefetch (2026-06-28):** When
+   `_ExplicitGroupBackward.backward()` runs for group k, `_AnchorMeta.look_ahead_upload`
+   fires before recompute begins. This calls `_start_bwd_look_ahead(k-1)`, which
+   reuses `_upload_first_layer_with_fence` to start group k-1's first layer upload
+   on `param_upstream`. The fence is stored in `_pending_bwd_fences[k-1]` and
+   consumed by `_run_group`'s `first_layer_fence` argument during k-1's recompute.
+   Group 0 gets `look_ahead_upload=None`. With forward-path freeing active this
+   provides real overlap; without it ensure_weights is a no-op (weights already on GPU).
 
    **`set_layer_timer` wired into `train.py` (2026-06-26):** `ModelLayerTimer` is
    now created and attached after `build_pipeline` via `--adapt-plan-every N`
@@ -228,11 +244,15 @@ wired via `--pytree-batch`. Sample packing (`stratum/packing.py`,
 `--packing`) is implemented with flash_attn_varlen_func dispatch on
 LFM25 and Qwen35. Host RAM trimming (`release_cached_memory()`) frees
 11+ GiB of cached FP16 pages after normal pipeline build. The opt-in
-`--low-rss-nf4-build` path passed a real LFM2.5 Docker runtime smoke with
-streamed HF safetensors, NF4 cache writes/hits, LoRA meta materialization,
-host RSS under 8 GiB after dataloader setup, and finite loss. Next practical
-smoke: Qwen35 low-RSS NF4 build, then packed training past the step log
-boundary plus an opt-in optimizer-state resume.
+`--low-rss-nf4-build` path passed a real LFM2.5 Docker runtime smoke.
+
+Added 2026-06-28: per-group forward weight freeing (`free_weights` after each
+`_run_stage_group` in the forward loop) and cross-group backward look-ahead
+prefetch (`_AnchorMeta.look_ahead_upload`, `_start_bwd_look_ahead`,
+`_pending_bwd_fences`). Tests in `tests/test_bwd_prefetch.py`.
+
+Next practical smokes: Qwen35 low-RSS NF4 build, Qwen35 packed training,
+and an opt-in optimizer-state resume.
 
 ---
 
@@ -512,8 +532,10 @@ yet wired into the active runtime.
   LFM2.5 smokes.
 - [A] Extend that trainable-gradient path into deeper per-layer download
   overlap only if Stratum ports RoundPipe's finer per-layer scheduler phases.
-- [A] Add buffer snapshot/restore support for recompute paths that mutate or
-  depend on buffers.
+- [x] Add buffer snapshot/restore support for recompute paths that mutate or
+  depend on buffers. `snapshot_module_buffers` / `restore_module_buffers` in
+  `upload.py`. `_run_group` captures a pre-forward snapshot and restores it
+  before recompute. No-op for modules with no non-empty buffers (2026-06-28).
 - [x] Add an async stage prefetch experiment: upload next stage's NF4 payloads
   while the current stage computes, with event fencing before use.
 - [/] Keep permanent in-place `DeviceStage` modules as the default; full
@@ -625,6 +647,18 @@ time-informed balancing; Stratum still needs analogous capabilities.
   attach to group outputs, backward completion/free now fires from explicit
   group backward completion, and the old `free_all_weights()` fallback remains
   only as a safety net for groups that never receive autograd.
+- [x] Tenth runtime wiring slice (2026-06-28): per-group forward weight freeing.
+  `free_weights(group_module)` called immediately after each group's
+  `_run_stage_group` in the forward loop. Peak GPU weight memory is now bounded
+  to one group's FP16 weights at any time. LoRA params skipped (no
+  `NF4_ATTR`/`FP16_ATTR`). Backward `_free_stage_group` hook still fires for
+  scheduler notification and timing.
+- [x] Eleventh runtime wiring slice (2026-06-28): cross-group backward look-ahead
+  prefetch. `_AnchorMeta.look_ahead_upload` field in `stratum/runtime.py`.
+  `_start_bwd_look_ahead` in `stratum/pipeline.py` mirrors
+  `_upload_first_layer_with_fence`. `_pending_bwd_fences` dict stores fence
+  events between `look_ahead_upload` calls and `_run_group` consumption.
+  Group 0 gets `look_ahead_upload=None`. Tested in `tests/test_bwd_prefetch.py`.
 - [A] Extend current scheduler-group execution into RoundPipe-style custom
   async upload/recompute/backward streams with finer per-layer stream/event
   fences.
@@ -1011,7 +1045,7 @@ Recommended order for reaching practical parity with qz-roundpipe/RoundPipe:
 | 14. RegisterBackwardEvent | **UTILITY PORTED / ADAPT** | Helper exists for future async prefetch/offload; not current sync path |
 | 15. async_d2h/h2d | **RUNTIME-WIRED / ADAPT** | Generic helpers are now used by HostStagingPool boundary transfers with graph-preserving preallocated buffers; future activation offload should reuse the same layer |
 | 16. upload_layers/download_layer | **PARTIAL / ADAPT** | Layer transfer utilities and experimental NF4 prefetch exist; CPU-offloaded trainable grad handling is ported through PerDeviceOptimizer; deeper per-layer transfer overlap remains |
-| 17. ModelExecutePlan | **PARTIAL / ADAPT** | Plan/tracker/tag/chunk primitives, stage memory splitting, stage-boundary runtime wiring, intra-stage scheduler groups, group-scoped upload/prefetch, group-level backward completion/free, per-layer forward/recompute timing, group backward timing, bidirectional boundary-transfer timing, the explicit group recompute/backward primitive, and active autograd anchor wiring are ported; custom async recompute/backward streams, deeper per-layer overlap, and timing-fed placement remain |
+| 17. ModelExecutePlan | **PARTIAL / ADAPT** | Plan/tracker/tag/chunk primitives, stage memory splitting, stage-boundary runtime wiring, intra-stage scheduler groups, group-scoped upload/prefetch, group-level backward completion/free, per-layer forward/recompute timing, group backward timing, bidirectional boundary-transfer timing, the explicit group recompute/backward primitive, active autograd anchor wiring, per-group forward weight freeing, and cross-group backward look-ahead prefetch are ported; custom async recompute/backward streams, deeper per-layer overlap, and timing-fed placement remain |
 | 20. Batch API | **PARTIAL / ADAPT** | Fixed training tensors use token-weighted helpers; generic pytrees remain |
 | 21. Recompute context/RNG | **PARTIAL / ADAPT** | ForwardCtx/RecomputeCtx ported, wired through PyTorch checkpoint context, and timed per layer; custom RoundPipe scheduler RNG/offload remains |
 | 22. Optimizer stream | **PORTED / ADAPT** | CPU fp32 optim copies + async safe deferral validated on LFM2.5; deeper per-layer overlap remains future work |
