@@ -225,10 +225,8 @@ def main():
     ap.add_argument("--pytree-batch", action="store_true",
                     help="Use pytree-based batch splitting (supports arbitrary input shapes, "
                          "mirrors RoundPipe's guess_split_spec). Default uses fixed-tensor path.")
-    ap.add_argument("--packing", action="store_true",
-                    help="Enable sample packing (padding-free training). Concatenates variable-length "
-                         "samples into a single 1D sequence with per-segment position IDs, eliminating "
-                         "wasted compute on padding tokens. Requires flash attention.")
+    ap.add_argument("--no-packing", action="store_true",
+                    help="Disable sample packing (padding-free training). Packing is on by default.")
     ap.add_argument("--no-nf4", action="store_true",
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
     ap.add_argument("--nf4-scope", default="all", choices=["all", "layers"],
@@ -239,8 +237,8 @@ def main():
                     help="Experimentally prefetch next stage NF4 payloads on a side stream before use")
     ap.add_argument("--nf4-cache-dir", default="/workspace/cache/nf4-frozen",
                     help="Directory to cache quantised NF4 payloads. A model-id subdirectory is added automatically.")
-    ap.add_argument("--low-rss-nf4-build", action="store_true",
-                    help="Build the HF module skeleton on meta and stream weights during NF4 preparation instead of loading the full FP16 model into host RAM.")
+    ap.add_argument("--no-low-rss-nf4-build", action="store_true",
+                    help="Disable low-RSS NF4 build (load full FP16 into host RAM). Low-RSS is on by default.")
     ap.add_argument("--resume", default="",
                     help="Checkpoint path to resume from")
     # MLP optimizations (mutually exclusive with each other)
@@ -399,8 +397,10 @@ def main():
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
     if args.stratum_stage_memory_limit_gib < 0:
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
-    if args.low_rss_nf4_build and args.no_nf4:
-        raise ValueError("--low-rss-nf4-build requires NF4; remove --no-nf4")
+    low_rss_nf4_build = not args.no_low_rss_nf4_build
+    packing = not args.no_packing
+    if low_rss_nf4_build and args.no_nf4:
+        low_rss_nf4_build = False  # silently skip; no-op when NF4 is off
 
     def _safe_cache_component(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "model"
@@ -438,7 +438,7 @@ def main():
     mark_phase("before_model_load")
     print(f"Loading model {args.hf_model}...", file=sys.stderr, flush=True)
     hf_attn_impl = "eager" if args.attn_implementation == "flash" else args.attn_implementation
-    if args.low_rss_nf4_build:
+    if low_rss_nf4_build:
         config = AutoConfig.from_pretrained(
             args.hf_model,
             trust_remote_code=True,
@@ -490,7 +490,7 @@ def main():
         target_modules=_lora_target_modules(args.lora_target_set),
     )
     hf_model = get_peft_model(hf_model, lora_cfg)
-    if args.low_rss_nf4_build:
+    if low_rss_nf4_build:
         n_materialized = materialize_trainable_meta_parameters(hf_model)
         log_event({"event": "config", "trainable_meta_params_materialized": n_materialized})
     hf_model.print_trainable_parameters()
@@ -624,7 +624,7 @@ def main():
                             longest_first=args.longest_first)
     log_event({"event": "dataset", **ds.dataset_stats})
 
-    if args.packing:
+    if packing:
         log_event({"event": "config", "packing": True, "max_seq_len": args.max_seq_len})
         from stratum.packing import pack_collate
         def collate(batch):
@@ -686,7 +686,7 @@ def main():
             finish_optimizer_step()
             pending_async_optimizer_step = False
 
-        if args.packing:
+        if packing:
             input_ids = batch["input_ids"].cuda(input_device)
             labels = batch["labels"].cuda(input_device)
             cu_seqlens = batch["cu_seqlens"].cuda(input_device)
@@ -717,7 +717,7 @@ def main():
         loss = None
         try:
             if nmb > 1:
-                if args.packing:
+                if packing:
                     from stratum.packing import split_packed_batch
                     from stratum.batch import TokenWeightedReducer
                     packed_gpu = {
@@ -803,7 +803,7 @@ def main():
                     loss = reduce_microbatch_losses(detached_losses, trainable_counts)
             else:
                 extra_kwargs = {}
-                if args.packing and packed_seq_idx is not None:
+                if packing and packed_seq_idx is not None:
                     extra_kwargs["seq_idx"] = packed_seq_idx
                 output = pipeline(
                     input_ids,
