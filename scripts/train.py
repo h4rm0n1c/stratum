@@ -233,8 +233,8 @@ def main():
                     help="Frozen weight NF4 preparation scope. 'all' includes prefix/stages/postfix; 'layers' matches qz-roundpipe layers-only prep.")
     ap.add_argument("--stratum-stage-memory-limit-gib", type=float, default=0.0,
                     help="Split per-device layer groups into substages below this upload footprint (0 = disabled)")
-    ap.add_argument("--prefetch-nf4", action="store_true",
-                    help="Experimentally prefetch next stage NF4 payloads on a side stream before use")
+    ap.add_argument("--no-prefetch-nf4", action="store_true",
+                    help="Disable NF4 prefetch. Prefetch is on by default.")
     ap.add_argument("--nf4-cache-dir", default="/workspace/cache/nf4-frozen",
                     help="Directory to cache quantised NF4 payloads. A model-id subdirectory is added automatically.")
     ap.add_argument("--no-low-rss-nf4-build", action="store_true",
@@ -262,9 +262,9 @@ def main():
                     help="Print CUDA memory summary when forward/backward raises RuntimeError")
     ap.add_argument("--timing-jsonl", default="",
                     help="Write pipeline timing spans to this JSONL file")
-    ap.add_argument("--adapt-plan-every", type=int, default=0, metavar="N",
+    ap.add_argument("--adapt-plan-every", type=int, default=2, metavar="N",
                     help="Re-derive the scheduler plan from per-layer timing every N steps "
-                         "(0 = disabled). Requires CUDA; no-op on CPU.")
+                         "(0 = disabled, default 2). Requires CUDA; no-op on CPU.")
     # Memory watchdog
     ap.add_argument("--host-ram-limit-gib", type=float, default=0.0,
                     help="Abort when host RSS exceeds this many GiB (0 = disabled)")
@@ -281,8 +281,8 @@ def main():
     ap.add_argument("--flash-window-right", type=int, default=0,
                     help="Right tokens for sliding-window flash attention (0 = causal)")
     # Data loading
-    ap.add_argument("--longest-first", action="store_true",
-                    help="Sort training data by sequence length descending")
+    ap.add_argument("--no-longest-first", action="store_true",
+                    help="Disable longest-first sort. Longest-first is on by default.")
     ap.add_argument("--pad-to-multiple", type=int, default=0,
                     help="Pad batch sequence length to this multiple")
     ap.add_argument("--pad-to-length", type=int, default=0,
@@ -303,13 +303,12 @@ def main():
                     choices=["all", "attention", "attention_input", "mlp"],
                     help="LoRA module set. Narrower sets reduce memory.")
     # CPU offloaded optimizer (VRAM saving)
-    ap.add_argument("--cpu-offload-optim", action="store_true",
-                    help="Keep AdamW optimizer state in fp32 on CPU instead of GPU. "
-                         "Frees ~2x trainable-param GPU memory. Gradients are moved "
-                         "to CPU copies before each step.")
-    ap.add_argument("--async-optimizer-step", action="store_true",
-                    help="Run CPU-offloaded optimizer.step() through the background "
-                         "optimizer queue. Requires --cpu-offload-optim.")
+    ap.add_argument("--no-cpu-offload-optim", action="store_true",
+                    help="Disable CPU-offloaded optimizer (keep AdamW state on GPU). "
+                         "CPU offload is on by default.")
+    ap.add_argument("--no-async-optimizer-step", action="store_true",
+                    help="Disable async optimizer step. Async step is on by default when "
+                         "CPU offload is active.")
     ap.add_argument("--optim-dtype", default="fp32", choices=["fp32", "fp16"],
                     help="Data type for CPU optimizer parameter copies (fp32 recommended).")
     # MoE auxiliary loss (router load balancing)
@@ -318,9 +317,8 @@ def main():
     ap.add_argument("--router-aux-loss-coef", type=float, default=0.0,
                     help="Coefficient for MoE router auxiliary loss (e.g. 0.02). Requires --output-router-logits.")
     # Gradient scaling (mixed precision)
-    ap.add_argument("--grad-scaler-enabled", action="store_true",
-                    help="Enable GradScaler for stable fp16 training. Scales loss before "
-                         "backward, unscales gradients before optimizer step.")
+    ap.add_argument("--no-grad-scaler", action="store_true",
+                    help="Disable GradScaler. GradScaler is on by default for fp16 training.")
     # Attention backend selection. "flash" means Stratum-owned dispatch:
     # flash_attn on SM80+/SM86 and flash_attn_v100 on SM70.
     ap.add_argument("--attn-implementation", default="flash",
@@ -368,8 +366,8 @@ def main():
                 "steps": args.steps,
                 "nf4": not args.no_nf4,
                 "recompute_grain": args.recompute_grain,
-                "grad_scaler": args.grad_scaler_enabled,
-                "cpu_offload_optim": args.cpu_offload_optim,
+                "grad_scaler": grad_scaler_enabled,
+                "cpu_offload_optim": cpu_offload_optim,
                 "router_aux_loss_coef": args.router_aux_loss_coef,
             })
         except ImportError:
@@ -379,8 +377,8 @@ def main():
     if args.recompute_grain == "none":
         args.checkpoint_decoder_layer = False
         log_event({"event": "config", "checkpoint_decoder_layer": False, "reason": "recompute_grain=none"})
-    if args.async_optimizer_step and not args.cpu_offload_optim:
-        raise ValueError("--async-optimizer-step requires --cpu-offload-optim")
+    if args.no_async_optimizer_step and not args.no_cpu_offload_optim:
+        pass  # explicit opt-out of async step while keeping offload is fine
     if args.pad_to_multiple == 0:
         args.pad_to_multiple = 32
         log_event({"event": "config", "pad_to_multiple": 32, "reason": "flash_attention_seq_len_constraint"})
@@ -399,8 +397,15 @@ def main():
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
     low_rss_nf4_build = not args.no_low_rss_nf4_build
     packing = not args.no_packing
+    prefetch_nf4 = not args.no_prefetch_nf4
+    longest_first = not args.no_longest_first
+    cpu_offload_optim = not args.no_cpu_offload_optim
+    async_optimizer_step = not args.no_async_optimizer_step
+    grad_scaler_enabled = not args.no_grad_scaler
     if low_rss_nf4_build and args.no_nf4:
         low_rss_nf4_build = False  # silently skip; no-op when NF4 is off
+    if async_optimizer_step and not cpu_offload_optim:
+        async_optimizer_step = False  # async step requires offload; silently disable
 
     def _safe_cache_component(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "model"
@@ -533,7 +538,7 @@ def main():
         torch_compile_loss=args.torch_compile_loss,
         stage_memory_limit_gib=args.stratum_stage_memory_limit_gib,
         nf4_layer_size_floor_gib=args.nf4_layer_size_floor_gib,
-        prefetch_nf4=args.prefetch_nf4,
+        prefetch_nf4=prefetch_nf4,
         hf_model_name_or_path=args.hf_model,
         output_router_logits=args.output_router_logits,
         router_aux_loss_coef=args.router_aux_loss_coef,
@@ -593,17 +598,17 @@ def main():
         scheduler=args.lr_scheduler,
         warmup_steps=args.warmup_steps,
         total_steps=args.steps,
-        cpu_offload=args.cpu_offload_optim,
+        cpu_offload=cpu_offload_optim,
         optim_dtype=optim_dtype,
     )
-    if args.cpu_offload_optim:
+    if cpu_offload_optim:
         optimizer.ensure_optim_params()
         log_event({"event": "config", "cpu_offload_optim": True, "optim_dtype": args.optim_dtype})
     scaler = make_grad_scaler(
-        enabled=args.grad_scaler_enabled,
-        cpu_offload=args.cpu_offload_optim,
+        enabled=grad_scaler_enabled,
+        cpu_offload=cpu_offload_optim,
     )
-    if args.grad_scaler_enabled:
+    if grad_scaler_enabled:
         log_event({"event": "config", "grad_scaler_enabled": True, "init_scale": 2.0**16})
     log_event({"event": "config", "lr": args.lr, "scheduler": args.lr_scheduler,
                "warmup": args.warmup_steps, "batch_size": args.batch_size})
@@ -621,7 +626,7 @@ def main():
 
     # Load dataset
     ds = PretokJsonlDataset(args.data, max_seq_len=args.max_seq_len, shuffle=True,
-                            longest_first=args.longest_first)
+                            longest_first=longest_first)
     log_event({"event": "dataset", **ds.dataset_stats})
 
     if packing:
@@ -672,7 +677,7 @@ def main():
     pending_checkpoint: Optional[AsyncCheckpointHandle] = None
 
     def finish_optimizer_step() -> None:
-        if args.async_optimizer_step:
+        if async_optimizer_step:
             optimizer.synchronize()
         if not optimizer.last_step_was_skipped():
             optimizer.scheduler_step()
@@ -824,7 +829,7 @@ def main():
                 ), file=sys.stderr, flush=True)
             raise
 
-        if args.async_optimizer_step:
+        if async_optimizer_step:
             optimizer.step(async_step=True, scaler=scaler)
             pending_async_optimizer_step = True
         else:

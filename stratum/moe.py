@@ -2,11 +2,14 @@
 
 Ported from roundpipe/models/qwen3_moe.py and HF transformers.
 
-Two utilities:
-  1. ``patch_moe_block_for_router_logits(module)`` — monkey-patches an
-     ``Lfm2MoeSparseMoeBlock`` (or similar) so its forward records router
-     logits without changing the block's normal tensor return value.
-  2. ``load_balancing_loss_func(router_logits, num_experts, top_k)`` —
+Three utilities:
+  1. ``patch_moe_block_for_packing(module)`` — wraps Lfm2MoeSparseMoeBlock so
+     its forward accepts 2D packed hidden states (unsqueeze/squeeze).  Must be
+     called whenever sample packing is active regardless of router logging.
+  2. ``patch_moe_block_for_router_logits(module)`` — calls
+     patch_moe_block_for_packing then also monkey-patches each block to record
+     router logits as side-channel state for auxiliary load-balancing loss.
+  3. ``load_balancing_loss_func(router_logits, num_experts, top_k)`` —
      computes the Switch Transformer auxiliary load-balancing loss.
 """
 
@@ -17,6 +20,64 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _collect_moe_block_types() -> list:
+    """Return available MoE block types from installed transformers."""
+    types = []
+    try:
+        from transformers.models.lfm2_moe.modeling_lfm2_moe import Lfm2MoeSparseMoeBlock
+        types.append(Lfm2MoeSparseMoeBlock)
+    except (ImportError, ModuleNotFoundError):
+        pass
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+        types.append(Qwen3MoeSparseMoeBlock)
+    except (ImportError, ModuleNotFoundError):
+        pass
+    return types
+
+
+def patch_moe_block_for_packing(module: nn.Module) -> int:
+    """Wrap MoE sparse blocks so their forward accepts 2D packed hidden states.
+
+    Lfm2MoeSparseMoeBlock.forward expects 3D (batch, seq, hidden) but in
+    sample-packing mode hidden_states arrives as 2D (total_tokens, hidden).
+    This wrapper unsqueezes to 3D before the block and squeezes back after.
+    No-op for blocks already patched by patch_moe_block_for_router_logits.
+
+    Must be called whenever packing is active, regardless of router logging.
+    Returns the number of blocks newly wrapped.
+    """
+    _moe_block_types = _collect_moe_block_types()
+    if not _moe_block_types:
+        return 0
+
+    patched = 0
+    for sub in module.modules():
+        if not any(isinstance(sub, t) for t in _moe_block_types):
+            continue
+        if getattr(sub, "_router_patched", False) or getattr(sub, "_packing_patched", False):
+            continue
+        orig_forward = sub.forward
+
+        def _make_pack_forward(
+            original_forward: Callable[[torch.Tensor], torch.Tensor | tuple],
+        ) -> Callable[[torch.Tensor], torch.Tensor | tuple]:
+            def patched_forward(hidden_states: torch.Tensor) -> torch.Tensor | tuple:
+                _packed = hidden_states.dim() == 2
+                hs_3d = hidden_states.unsqueeze(0) if _packed else hidden_states
+                result = original_forward(hs_3d)
+                if _packed and isinstance(result, torch.Tensor):
+                    result = result.squeeze(0)
+                return result
+            return patched_forward
+
+        sub.forward = _make_pack_forward(orig_forward)
+        sub._packing_patched = True
+        patched += 1
+
+    return patched
 
 
 def patch_moe_block_for_router_logits(module: nn.Module) -> int:
@@ -37,24 +98,7 @@ def patch_moe_block_for_router_logits(module: nn.Module) -> int:
     Returns:
         Number of MoE blocks patched.
     """
-    # Collect available MoE block types (guarded imports)
-    _moe_block_types = []
-
-    try:
-        from transformers.models.lfm2_moe.modeling_lfm2_moe import (
-            Lfm2MoeSparseMoeBlock,
-        )
-        _moe_block_types.append(Lfm2MoeSparseMoeBlock)
-    except (ImportError, ModuleNotFoundError):
-        pass
-    try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeSparseMoeBlock,
-        )
-        _moe_block_types.append(Qwen3MoeSparseMoeBlock)
-    except (ImportError, ModuleNotFoundError):
-        pass
-
+    _moe_block_types = _collect_moe_block_types()
     if not _moe_block_types:
         return 0
 
@@ -64,23 +108,31 @@ def patch_moe_block_for_router_logits(module: nn.Module) -> int:
             continue
         if getattr(sub, "_router_patched", False):
             continue
+        # If only packing-patched, wrap the already-patched forward to add logit capture.
         orig_forward = sub.forward
+
+        already_packing_patched = getattr(sub, "_packing_patched", False)
 
         def _make_patched_forward(
             block: nn.Module,
             original_forward: Callable[[torch.Tensor], torch.Tensor | tuple],
+            packing_already_handled: bool,
         ) -> Callable[[torch.Tensor], torch.Tensor | tuple]:
             def patched_forward(hidden_states: torch.Tensor) -> torch.Tensor | tuple:
-                # In packed mode hidden_states is 2D (total_tokens, hidden_dim);
-                # the HF block expects 3D (batch, seq, hidden_dim).
-                _packed = hidden_states.dim() == 2
-                hs_3d = hidden_states.unsqueeze(0) if _packed else hidden_states
-                result = original_forward(hs_3d)
-                if _packed and isinstance(result, torch.Tensor):
-                    result = result.squeeze(0)
-                # Recompute gate to capture router_logits (single linear layer).
-                hidden_dim = hidden_states.shape[-1]
-                flat_hidden = hidden_states.reshape(-1, hidden_dim)
+                if packing_already_handled:
+                    # Packing (unsqueeze/squeeze) already done; just call and capture logits.
+                    result = original_forward(hidden_states)
+                    hidden_dim = hidden_states.shape[-1]
+                    flat_hidden = hidden_states.reshape(-1, hidden_dim)
+                else:
+                    # Handle packed 2D hidden states inline.
+                    _packed = hidden_states.dim() == 2
+                    hs_3d = hidden_states.unsqueeze(0) if _packed else hidden_states
+                    result = original_forward(hs_3d)
+                    if _packed and isinstance(result, torch.Tensor):
+                        result = result.squeeze(0)
+                    hidden_dim = hidden_states.shape[-1]
+                    flat_hidden = hidden_states.reshape(-1, hidden_dim)
                 gate_output = block.gate(flat_hidden)
                 router_logits = gate_output[0] if isinstance(gate_output, tuple) else gate_output
                 block._last_router_logits = router_logits
@@ -88,7 +140,7 @@ def patch_moe_block_for_router_logits(module: nn.Module) -> int:
 
             return patched_forward
 
-        sub.forward = _make_patched_forward(sub, orig_forward)
+        sub.forward = _make_patched_forward(sub, orig_forward, already_packing_patched)
         sub._router_patched = True
         sub._last_router_logits = None
         patched += 1

@@ -167,6 +167,8 @@ class _PrefetchEntry:
     quantized: torch.Tensor
     absmax: torch.Tensor
     code: torch.Tensor
+    owner: Optional[torch.nn.Module] = None
+    pname: Optional[str] = None
 
 
 @dataclass
@@ -200,7 +202,11 @@ class NF4Prefetch:
                 if entry.param.data.numel() > 0:
                     if entry.param.data.device == self.device:
                         continue
-                    entry.param.data = torch.empty(0, dtype=entry.param.dtype, device=entry.param.device)
+                    _replace_param_data(
+                        entry.param,
+                        torch.empty(0, dtype=entry.param.dtype, device=entry.param.device),
+                        owner=entry.owner, pname=entry.pname,
+                    )
                 payload = entry.payload
                 q_state = QuantState(
                     absmax=entry.absmax,
@@ -210,7 +216,11 @@ class NF4Prefetch:
                     quant_type=payload.quant_type,
                     dtype=payload.dtype,
                 )
-                entry.param.data = dequantize_4bit(entry.quantized, q_state).contiguous()
+                _replace_param_data(
+                    entry.param,
+                    dequantize_4bit(entry.quantized, q_state).contiguous(),
+                    owner=entry.owner, pname=entry.pname,
+                )
                 tensors += 1
         return tensors
 
@@ -1060,6 +1070,7 @@ def prefetch_weights(module: torch.nn.Module, device_id: int) -> NF4Prefetch:
     If there is nothing to upload, the returned object is a cheap no-op.
     """
     device = torch.device(f"cuda:{device_id}")
+    owner_map = _build_param_owner_map(module)
     entries: list[_PrefetchEntry] = []
     for name, param in module.named_parameters():
         payload = getattr(param, NF4_ATTR, None)
@@ -1067,6 +1078,7 @@ def prefetch_weights(module: torch.nn.Module, device_id: int) -> NF4Prefetch:
             continue
         if param.data.numel() > 0 and param.data.device == device:
             continue
+        _owner, _pname = owner_map.get(id(param), (None, None))
         entries.append(
             _PrefetchEntry(
                 param=param,
@@ -1074,6 +1086,8 @@ def prefetch_weights(module: torch.nn.Module, device_id: int) -> NF4Prefetch:
                 quantized=cast(NF4Payload, payload).quantized,
                 absmax=cast(NF4Payload, payload).absmax,
                 code=cast(NF4Payload, payload).code,
+                owner=_owner,
+                pname=_pname,
             )
         )
 
@@ -1094,6 +1108,8 @@ def prefetch_weights(module: torch.nn.Module, device_id: int) -> NF4Prefetch:
                     quantized=entry.quantized.to(device, non_blocking=True),
                     absmax=entry.absmax.to(device, non_blocking=True),
                     code=entry.code.to(device, non_blocking=True),
+                    owner=entry.owner,
+                    pname=entry.pname,
                 )
             )
         event = torch.cuda.Event()

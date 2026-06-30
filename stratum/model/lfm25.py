@@ -32,7 +32,8 @@ from stratum.context import (
     get_recompute_data,
     save_for_recompute,
 )
-from stratum.moe import load_balancing_loss_func, patch_moe_block_for_router_logits, pop_router_logits
+from stratum.moe import (load_balancing_loss_func, patch_moe_block_for_packing,
+                         patch_moe_block_for_router_logits, pop_router_logits)
 
 
 # causal_conv1d is compiled for sm_70 + sm_86 — fast path works on both GPUs.
@@ -812,6 +813,11 @@ class LFM25Arch(ModelArch):
         n_conv = _patch_lfm25_short_conv_for_packing(hf_model)
         if n_conv > 0:
             vwrite(f"ShortConv packing wrapper: {n_conv} layers wrapped")
+        # Packing-safe SparseMoeBlock wrapper — SparseMoeBlock.forward expects
+        # 3D but packed hidden states arrive as 2D (total_tokens, hidden_dim).
+        n_moe = patch_moe_block_for_packing(hf_model)
+        if n_moe > 0:
+            vwrite(f"SparseMoeBlock packing wrapper: {n_moe} blocks wrapped")
         return super().build(hf_model, tensor_split, device_ids, **kwargs)
 
 
