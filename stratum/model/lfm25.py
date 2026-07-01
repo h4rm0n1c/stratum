@@ -705,8 +705,9 @@ class LFM25ForCausalLMPostfix(nn.Module):
         ) = input_data
 
         if self.memory_telemetry:
+            seq_dim = 0 if hidden_states.dim() == 2 else 1
             mark_model_gpu_phase("postfix_enter",
-                                 seq_len=int(hidden_states.shape[1]))
+                                 seq_len=int(hidden_states.shape[seq_dim]))
 
         loss = None
         if labels is not None and not kwargs.get("return_logits", False):

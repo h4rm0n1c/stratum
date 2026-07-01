@@ -55,6 +55,7 @@ class ModelArch:
         stage_memory_limit_gib: float = 0.0,
         nf4_layer_size_floor_gib: float = 0.0,
         prefetch_nf4: bool = False,
+        offload_stage_inputs: bool = False,
         hf_model_name_or_path: Optional[str] = None,
         verbose: bool = True,
         **kwargs,
@@ -133,7 +134,13 @@ class ModelArch:
             core, router_aux_loss_coef=_moe_coef, **kwargs,
         )
 
-        pipeline = StratumPipeline(prefix, stages, postfix, prefetch_nf4=prefetch_nf4)
+        pipeline = StratumPipeline(
+            prefix,
+            stages,
+            postfix,
+            prefetch_nf4=prefetch_nf4,
+            offload_stage_inputs=offload_stage_inputs,
+        )
 
         # Phase 1: Prepare frozen weight streaming.
         # NF4 mode: quantize frozen 2D weights, drop originals (upload per-step as FP16).
@@ -273,6 +280,7 @@ def build_pipeline(
     stage_memory_limit_gib: float = 0.0,
     nf4_layer_size_floor_gib: float = 0.0,
     prefetch_nf4: bool = False,
+    offload_stage_inputs: bool = False,
     hf_model_name_or_path: Optional[str] = None,
     flash_layers: str = "",
     flash_window_left: int = -1,
@@ -306,6 +314,7 @@ def build_pipeline(
         stage_memory_limit_gib=stage_memory_limit_gib,
         nf4_layer_size_floor_gib=nf4_layer_size_floor_gib,
         prefetch_nf4=prefetch_nf4,
+        offload_stage_inputs=offload_stage_inputs,
         hf_model_name_or_path=hf_model_name_or_path,
         flash_layers=flash_layers,
         flash_window_left=flash_window_left,

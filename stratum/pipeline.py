@@ -94,6 +94,7 @@ class StratumPipeline(nn.Module):
         postfix: nn.Module,
         *,
         prefetch_nf4: bool = False,
+        offload_stage_inputs: bool = False,
         execute_plan: Optional[ModelExecutePlan] = None,
     ):
         super().__init__()
@@ -101,6 +102,7 @@ class StratumPipeline(nn.Module):
         self.stages = nn.ModuleList(stages)
         self.postfix = postfix
         self.prefetch_nf4 = prefetch_nf4
+        self.offload_stage_inputs = offload_stage_inputs
         self.timing_recorder: Optional[TimingRecorder] = None
         self._stage_ranges = self._build_stage_ranges(stages)
         self.execute_plan = execute_plan or ModelExecutePlan.from_stage_lengths(
@@ -142,6 +144,7 @@ class StratumPipeline(nn.Module):
                 for stage_index, _, _, _ in self._fwd_group_locations
             ],
             stage_devices=[stage.device_id for stage in stages],
+            offload_stage_inputs=bool(self.offload_stage_inputs),
         )
 
         # Build boundary transfer infrastructure
@@ -883,7 +886,10 @@ class StratumPipeline(nn.Module):
                         self._fwd_group_modules[fwd_group_id]
                     )
                     with _compute_stream_context(stage.device_id):
-                        captured_group_input = capture_backward_input(group_input)
+                        captured_group_input = capture_backward_input(
+                            group_input,
+                            offload_to_cpu=self.offload_stage_inputs,
+                        )
                         group_output = self._run_stage_group(
                             stage,
                             tuple_data,

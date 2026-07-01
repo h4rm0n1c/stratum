@@ -235,10 +235,14 @@ def main():
     ap.add_argument("--save-optimizer-state", action="store_true",
                     help="Also save same-layout optimizer .pt state. Default checkpoints are adapter safetensors + JSON only.")
     ap.add_argument("--checkpoint-decoder-layer", action="store_true", default=True,
-                    help="Activation checkpointing per decoder layer (reduces VRAM, ~30% slower)")
-    ap.add_argument("--recompute-grain", default="layer", choices=["layer", "none"],
-                    help="Recompute granularity: 'layer' (default, checkpoint each decoder layer) "
-                         "or 'none' (disable per-layer checkpointing). Overrides --checkpoint-decoder-layer.")
+                    help="Activation checkpointing per decoder layer (reduces VRAM, ~30%% slower)")
+    ap.add_argument("--recompute-grain", default="layer", choices=["stage", "layer", "none"],
+                    help="Recompute granularity: 'stage' uses Stratum explicit stage/group recompute, "
+                         "'layer' checkpoints each decoder layer, or 'none' disables decoder-layer "
+                         "checkpointing while keeping pipeline autograd. Overrides --checkpoint-decoder-layer.")
+    ap.add_argument("--offload-stage-inputs", action=argparse.BooleanOptionalAction, default=None,
+                    help="Offload captured stage/group inputs to host RAM for explicit stage recompute. "
+                         "Defaults on for --recompute-grain stage and off otherwise.")
     ap.add_argument("--num-microbatch", type=int, default=1,
                     help="Split batch into N microbatches (gradient accumulation, saves VRAM)")
     ap.add_argument("--pytree-batch", action="store_true",
@@ -372,6 +376,28 @@ def main():
     async_optimizer_step = not args.no_async_optimizer_step
     grad_scaler_enabled = not args.no_grad_scaler
 
+    # Arg validation/defaults that affect run metadata.
+    if args.recompute_grain in {"stage", "none"}:
+        args.checkpoint_decoder_layer = False
+        log_event({
+            "event": "config",
+            "checkpoint_decoder_layer": False,
+            "reason": f"recompute_grain={args.recompute_grain}",
+        })
+    if args.offload_stage_inputs is None:
+        args.offload_stage_inputs = args.recompute_grain == "stage"
+    if args.offload_stage_inputs and args.recompute_grain != "stage":
+        log_event({
+            "event": "config",
+            "offload_stage_inputs": True,
+            "reason": f"explicit_with_recompute_grain={args.recompute_grain}",
+        })
+    log_event({
+        "event": "config",
+        "recompute_grain": args.recompute_grain,
+        "offload_stage_inputs": bool(args.offload_stage_inputs),
+    })
+
     # MLflow tracking (opt-in via --mlflow).
     # Writes directly to <out>/mlruns/ on the shared volume.
     # The UI server is managed by run-unified.sh as a separate named container.
@@ -399,6 +425,7 @@ def main():
                 "steps": args.steps,
                 "nf4": not args.no_nf4,
                 "recompute_grain": args.recompute_grain,
+                "offload_stage_inputs": args.offload_stage_inputs,
                 "grad_scaler": grad_scaler_enabled,
                 "cpu_offload_optim": cpu_offload_optim,
                 "router_aux_loss_coef": args.router_aux_loss_coef,
@@ -407,9 +434,6 @@ def main():
             print("WARNING: mlflow not installed; --mlflow ignored", file=sys.stderr, flush=True)
 
     # Arg validation (same guards as RoundPipe)
-    if args.recompute_grain == "none":
-        args.checkpoint_decoder_layer = False
-        log_event({"event": "config", "checkpoint_decoder_layer": False, "reason": "recompute_grain=none"})
     if args.no_async_optimizer_step and not args.no_cpu_offload_optim:
         pass  # explicit opt-out of async step while keeping offload is fine
     if args.pad_to_multiple == 0:
@@ -565,6 +589,7 @@ def main():
         stage_memory_limit_gib=args.stratum_stage_memory_limit_gib,
         nf4_layer_size_floor_gib=args.nf4_layer_size_floor_gib,
         prefetch_nf4=prefetch_nf4,
+        offload_stage_inputs=args.offload_stage_inputs,
         hf_model_name_or_path=args.hf_model,
         output_router_logits=args.output_router_logits,
         router_aux_loss_coef=args.router_aux_loss_coef,

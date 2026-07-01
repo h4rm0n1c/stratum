@@ -34,8 +34,8 @@ def _make_block_loss(
 ) -> torch.Tensor:
     """Compute cross-entropy loss for one block.
 
-    Hidden: [batch, chunk, hidden] after norm
-    Labels: [batch, chunk] pre-shift (the outer code handles shifting)
+    Hidden: [batch, chunk, hidden] or [chunk, hidden] after norm.
+    Labels: [batch, chunk] or [chunk] pre-shift (the outer code handles shifting).
     """
     logits = lm_head(block_hidden)
     loss = nn.functional.cross_entropy(
@@ -102,23 +102,40 @@ class BlockedPostfixCausalLMLoss(torch.autograd.Function):
             ctx.save_for_backward(grad_saved) if grad_saved is not None else ctx.save_for_backward()
             return hidden_states.new_zeros(())
 
-        batch, seq_len, _hidden_size = hidden_states.shape
-        if batch != 1:
-            raise ValueError("--postfix-loss-token-chunk-size currently expects batch-size 1")
+        if hidden_states.dim() == 2:
+            packed_tokens = True
+            seq_len = hidden_states.shape[0]
+        elif hidden_states.dim() == 3:
+            packed_tokens = False
+            batch, seq_len, _hidden_size = hidden_states.shape
+            if batch != 1:
+                raise ValueError("--postfix-loss-token-chunk-size currently expects batch-size 1")
+        else:
+            raise ValueError(
+                "--postfix-loss-token-chunk-size expects hidden states shaped "
+                "[tokens, hidden] or [batch, seq, hidden]"
+            )
 
         loss_sum = hidden_states.new_zeros(())
         with torch.enable_grad(), _compute_stream_context(hidden_states):
             for start in range(0, seq_len, token_chunk_size):
                 end = min(start + token_chunk_size, seq_len)
-                block_hidden = detached_hidden[:, start:end, :]
+                block_hidden = (
+                    detached_hidden[start:end, :]
+                    if packed_tokens
+                    else detached_hidden[:, start:end, :]
+                )
                 block_norm = norm(block_hidden) if norm is not None else block_hidden
                 if debug_finite:
                     assert_finite_tensor(f"post_norm_hidden_{start}_{end}", block_norm)
 
-                block_labels = flat_shifted_labels[start:end]
-                block_labels_2d = shifted_labels[:, start:end]
+                block_labels = (
+                    shifted_labels[start:end]
+                    if packed_tokens
+                    else shifted_labels[:, start:end]
+                )
                 block_loss = _make_block_loss(
-                    block_norm, lm_head, block_labels_2d,
+                    block_norm, lm_head, block_labels,
                     vocab_size, num_items, ignore_index,
                 )
                 if block_loss.requires_grad:

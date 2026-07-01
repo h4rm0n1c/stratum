@@ -26,8 +26,21 @@ class CapturedInput:
 
     flat: list[Any]
     spec: Any
+    tensor_devices: list[Optional[torch.device]]
+    tensor_requires_grad: list[Optional[bool]]
 
     def restore(self) -> Any:
+        for idx, item in enumerate(self.flat):
+            if not torch.is_tensor(item):
+                continue
+            device = self.tensor_devices[idx]
+            requires_grad = self.tensor_requires_grad[idx]
+            if device is None or requires_grad is None:
+                continue
+            if item.device != device:
+                item = item.detach().to(device, non_blocking=True)
+                item.requires_grad_(requires_grad)
+                self.flat[idx] = item
         return tree_unflatten(self.flat, self.spec)
 
 
@@ -72,15 +85,21 @@ def capture_backward_input(
 
     flat, spec = tree_flatten(value)
     captured: list[Any] = []
+    tensor_devices: list[Optional[torch.device]] = []
+    tensor_requires_grad: list[Optional[bool]] = []
     for item in flat:
         if torch.is_tensor(item):
+            tensor_devices.append(item.device)
+            tensor_requires_grad.append(item.requires_grad)
             tensor = item.detach()
             if offload_to_cpu and tensor.device.type != "cpu":
-                tensor = tensor.to("cpu", non_blocking=True)
+                tensor = tensor.to("cpu", non_blocking=False)
             captured.append(tensor.requires_grad_(item.requires_grad))
         else:
+            tensor_devices.append(None)
+            tensor_requires_grad.append(None)
             captured.append(copy.deepcopy(item))
-    return CapturedInput(captured, spec)
+    return CapturedInput(captured, spec, tensor_devices, tensor_requires_grad)
 
 
 def _matching_output_backward_tensors(

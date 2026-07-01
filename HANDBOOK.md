@@ -999,7 +999,8 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
 | `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
 | `--no-prefetch-nf4` | False | Disable NF4 payload prefetch (prefetch is ON by default: side-stream H2D copy of the next stage's NF4 payloads before they are needed) |
-| `--recompute-grain` | `layer` | `layer` keeps per-layer checkpointing; `none` disables decoder-layer recompute |
+| `--recompute-grain` | `layer` | `stage` uses explicit stage/group recompute, `layer` keeps per-layer checkpointing, `none` disables decoder-layer recompute |
+| `--offload-stage-inputs` | auto | Host-offload captured stage/group inputs; defaults on for `--recompute-grain stage` |
 | `--checkpoint-mlp` | False | Wrap MLP in activation checkpointing |
 | `--mlp-token-chunk-size` | 0 | Split MLP forward into token chunks (0 = disabled) |
 | `--memory-flat-frozen-mlp` | False | Frozen MLP with token-chunked backward recompute |

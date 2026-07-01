@@ -113,6 +113,49 @@ class BlockedPostfixCausalLMLossTests(unittest.TestCase):
         self.assertTrue(torch.allclose(test_loss, ref_loss, atol=1e-6, rtol=1e-6))
         self.assertTrue(torch.allclose(test_hidden.grad, ref_hidden.grad, atol=1e-6, rtol=1e-6))
 
+    def test_packed_2d_hidden_matches_regular_shifted_lm_loss(self):
+        torch.manual_seed(2026)
+        seq, hidden, vocab = 7, 5, 11
+        norm = nn.LayerNorm(hidden)
+        lm_head = nn.Linear(hidden, vocab, bias=False)
+        for param in norm.parameters():
+            param.requires_grad_(False)
+        for param in lm_head.parameters():
+            param.requires_grad_(False)
+
+        labels = torch.randint(0, vocab, (seq,))
+        labels[3] = -100
+        base_hidden = torch.randn(seq, hidden)
+
+        ref_hidden = base_hidden.clone().requires_grad_(True)
+        ref_normed = norm(ref_hidden)
+        ref_logits = lm_head(ref_normed[:-1, :])
+        ref_labels = labels[1:]
+        ref_loss = nn.functional.cross_entropy(
+            ref_logits.reshape(-1, vocab),
+            ref_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        ) / (ref_labels != -100).sum()
+        ref_loss.backward()
+
+        test_hidden = base_hidden.clone().requires_grad_(True)
+        test_loss = BlockedPostfixCausalLMLoss.apply(
+            test_hidden,
+            labels,
+            norm,
+            lm_head,
+            vocab,
+            3,
+            -100,
+            False,
+            False,
+        )
+        test_loss.backward()
+
+        self.assertTrue(torch.allclose(test_loss, ref_loss, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(test_hidden.grad, ref_hidden.grad, atol=1e-6, rtol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()

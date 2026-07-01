@@ -172,7 +172,8 @@ When CUDA peer access is available, boundary transfers go direct GPU→GPU. When
 | `--prefetch-nf4` | false | Side-stream NF4 payload prefetch |
 | `--pin-model` | `alloc` | CPU pinning: `alloc`, `register`, `off` |
 | `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device groups into sub-stages |
-| `--recompute-grain` | `layer` | Recompute granularity: `layer` or `none` |
+| `--recompute-grain` | `layer` | Recompute granularity: `stage`, `layer`, or `none` |
+| `--offload-stage-inputs` | auto | Host-offload captured stage inputs; defaults on for `--recompute-grain stage` |
 | `--checkpoint-decoder-layer` | true | Activation checkpointing per decoder layer |
 | `--checkpoint-mlp` | false | Wrap each MLP in activation checkpointing |
 | `--mlp-token-chunk-size` | 0 | Split MLPs over token chunks |

@@ -169,6 +169,30 @@ class ExplicitGroupBackwardTest(unittest.TestCase):
         self.assertIsNone(bias_grad)
         self.assertIsNone(hidden.grad)
 
+    def test_capture_records_original_tensor_device_and_requires_grad(self):
+        hidden = torch.tensor([[1.0, 2.0]], requires_grad=True)
+        bias = torch.tensor([[0.5, -0.5]])
+
+        captured = capture_backward_input((hidden, bias), offload_to_cpu=True)
+        restored_hidden, restored_bias = captured.restore()
+
+        self.assertEqual(restored_hidden.device, hidden.device)
+        self.assertEqual(restored_bias.device, bias.device)
+        self.assertTrue(restored_hidden.requires_grad)
+        self.assertFalse(restored_bias.requires_grad)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_offloaded_capture_restores_cuda_leaf_for_recompute(self):
+        hidden = torch.tensor([[1.0, 2.0]], device="cuda", requires_grad=True)
+        captured = capture_backward_input((hidden,), offload_to_cpu=True)
+
+        self.assertEqual(captured.flat[0].device.type, "cpu")
+        (restored,) = captured.restore()
+
+        self.assertEqual(restored.device.type, "cuda")
+        self.assertTrue(restored.requires_grad)
+        self.assertTrue(restored.is_leaf)
+
     def test_records_recompute_and_backward_timing(self):
         hidden = torch.tensor([2.0], requires_grad=True)
         captured = capture_backward_input((hidden,))

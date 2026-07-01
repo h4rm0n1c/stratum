@@ -228,7 +228,13 @@ class NF4Prefetch:
         return self.finalize()
 
 
+def _canonical_param_name(name: str) -> str:
+    """Return the checkpoint/cache name for parameters inside transparent wrappers."""
+    return name.replace(".module.", ".")
+
+
 def _cache_path(cache_dir: Path, name: str) -> Path:
+    name = _canonical_param_name(name)
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[-160:]
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
     return cache_dir / f"{digest}-{safe}.pt"
@@ -437,6 +443,7 @@ def _build_ckpt_key_fn(module: torch.nn.Module):
 
     def _ckpt_keys(pname: str) -> list[str]:
         keys: list[str] = []
+        pname = _canonical_param_name(pname)
 
         def _add(name: str) -> None:
             _variants = [name]
@@ -478,6 +485,7 @@ def _try_load_fused_experts(
     Returns the stacked tensor or ``None`` if *pname* is not a fused-expert
     parameter or the required per-expert keys are not present.
     """
+    pname = _canonical_param_name(pname)
     suffixes = {
         ".feed_forward.experts.gate_up_proj": ("gate_up",),
         ".feed_forward.experts.down_proj": ("down",),
