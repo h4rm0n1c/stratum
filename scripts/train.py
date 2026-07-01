@@ -48,7 +48,7 @@ from stratum.batch import (
 from stratum.optim import PerDeviceOptimizer
 from stratum.checkpoint import save_checkpoint, save_checkpoint_async, load_checkpoint, AsyncCheckpointHandle
 from stratum.timing import ModelLayerTimer, TimingRecorder
-from stratum.utils import get_device_info, gpu_memory_snapshot
+from stratum.utils import get_device_info, gpu_memory_snapshot, set_log_level
 from stratum.watchdog import mark_phase, mark_memory_phase, memory_snapshot, set_log_file as watchdog_set_log_file
 from stratum.grad_scaler import GradScaler as CPUOffloadGradScaler
 from stratum.output import set_verbose
@@ -190,6 +190,10 @@ def collate_one(batch, *, pad_to_multiple: int = 0, pad_to_length: int = 0):
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
+def _uses_lfm_low_memory_defaults(model_name: str, hf_model_name: str) -> bool:
+    return model_name == "lfm25-8b-a1b" or "lfm2.5" in hf_model_name.lower()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lfm25-8b-a1b")
@@ -227,17 +231,18 @@ def main():
     ap.add_argument("--tensor-split", type=float, nargs="+", default=None)
     ap.add_argument("--device-ids", type=int, nargs="+", default=None)
     ap.add_argument("--max-seq-len", type=int, default=49152)
-    ap.add_argument("--loss-token-chunk-size", type=int, default=4096,
+    ap.add_argument("--loss-token-chunk-size", type=int, default=None,
                     help="Token chunk size for chunked lm_head loss")
-    ap.add_argument("--postfix-loss-token-chunk-size", type=int, default=0,
+    ap.add_argument("--postfix-loss-token-chunk-size", type=int, default=None,
                     help="Split norm + lm_head into token blocks with per-block backward (saves VRAM)")
-    ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--save-optimizer-state", action="store_true",
                     help="Also save same-layout optimizer .pt state. Default checkpoints are adapter safetensors + JSON only.")
     ap.add_argument("--checkpoint-decoder-layer", action="store_true", default=True,
                     help="Activation checkpointing per decoder layer (reduces VRAM, ~30%% slower)")
-    ap.add_argument("--recompute-grain", default="layer", choices=["stage", "layer", "none"],
-                    help="Recompute granularity: 'stage' uses Stratum explicit stage/group recompute, "
+    ap.add_argument("--recompute-grain", default="auto", choices=["auto", "stage", "layer", "none"],
+                    help="Recompute granularity: 'auto' selects the validated low-memory profile for LFM2.5, "
+                         "'stage' uses Stratum explicit stage/group recompute, "
                          "'layer' checkpoints each decoder layer, or 'none' disables decoder-layer "
                          "checkpointing while keeping pipeline autograd. Overrides --checkpoint-decoder-layer.")
     ap.add_argument("--offload-stage-inputs", action=argparse.BooleanOptionalAction, default=None,
@@ -254,7 +259,7 @@ def main():
                     help="Disable NF4 frozen weight compression (FP16 direct upload)")
     ap.add_argument("--nf4-scope", default="all", choices=["all", "layers"],
                     help="Frozen weight NF4 preparation scope. 'all' includes prefix/stages/postfix; 'layers' matches qz-roundpipe layers-only prep.")
-    ap.add_argument("--stratum-stage-memory-limit-gib", type=float, default=0.0,
+    ap.add_argument("--stratum-stage-memory-limit-gib", type=float, default=None,
                     help="Split per-device layer groups into substages below this upload footprint (0 = disabled)")
     ap.add_argument("--no-prefetch-nf4", action="store_true",
                     help="Disable NF4 prefetch. Prefetch is on by default.")
@@ -267,9 +272,9 @@ def main():
     # MLP optimizations (mutually exclusive with each other)
     ap.add_argument("--checkpoint-mlp", action="store_true",
                     help="Wrap each decoder MLP in activation checkpointing")
-    ap.add_argument("--mlp-token-chunk-size", type=int, default=0,
+    ap.add_argument("--mlp-token-chunk-size", type=int, default=None,
                     help="Split decoder MLPs over sequence-token chunks")
-    ap.add_argument("--memory-flat-frozen-mlp", action="store_true",
+    ap.add_argument("--memory-flat-frozen-mlp", action=argparse.BooleanOptionalAction, default=None,
                     help="Replace frozen dense MLPs with token-chunked backward recompute")
     # Telemetry and debugging
     ap.add_argument("--memory-telemetry", action="store_true",
@@ -358,6 +363,8 @@ def main():
 
     # Activate verbose diagnostics before anything emits.
     set_verbose(args.verbose)
+    if args.verbose:
+        set_log_level("DEBUG")
     if args.optimizer == "muonclip":
         args.muon_qk_mode = "clip"
 
@@ -377,6 +384,19 @@ def main():
     grad_scaler_enabled = not args.no_grad_scaler
 
     # Arg validation/defaults that affect run metadata.
+    lfm_low_memory_defaults = _uses_lfm_low_memory_defaults(args.model, args.hf_model)
+    if args.recompute_grain == "auto":
+        args.recompute_grain = "stage" if lfm_low_memory_defaults else "layer"
+    if args.loss_token_chunk_size is None:
+        args.loss_token_chunk_size = 2048 if lfm_low_memory_defaults else 4096
+    if args.postfix_loss_token_chunk_size is None:
+        args.postfix_loss_token_chunk_size = 2048 if lfm_low_memory_defaults else 0
+    if args.mlp_token_chunk_size is None:
+        args.mlp_token_chunk_size = 2048 if (lfm_low_memory_defaults or args.memory_flat_frozen_mlp is True) else 0
+    if args.memory_flat_frozen_mlp is None:
+        args.memory_flat_frozen_mlp = lfm_low_memory_defaults
+    if args.stratum_stage_memory_limit_gib is None:
+        args.stratum_stage_memory_limit_gib = 1.0 if (lfm_low_memory_defaults or args.recompute_grain == "stage") else 0.0
     if args.recompute_grain in {"stage", "none"}:
         args.checkpoint_decoder_layer = False
         log_event({
@@ -396,6 +416,12 @@ def main():
         "event": "config",
         "recompute_grain": args.recompute_grain,
         "offload_stage_inputs": bool(args.offload_stage_inputs),
+        "lfm_low_memory_defaults": lfm_low_memory_defaults,
+        "loss_token_chunk_size": args.loss_token_chunk_size,
+        "postfix_loss_token_chunk_size": args.postfix_loss_token_chunk_size,
+        "mlp_token_chunk_size": args.mlp_token_chunk_size,
+        "memory_flat_frozen_mlp": bool(args.memory_flat_frozen_mlp),
+        "stratum_stage_memory_limit_gib": args.stratum_stage_memory_limit_gib,
     })
 
     # MLflow tracking (opt-in via --mlflow).

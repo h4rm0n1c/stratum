@@ -14,7 +14,7 @@ from stratum.host_staging import HostStagingPool
 from stratum.grad_hooks import make_boundary_hook
 from stratum.upload import NF4Prefetch, ensure_prefetched_weights, ensure_weights, free_weights, prefetch_weights, restore_module_buffers, snapshot_module_buffers
 from stratum.timing import IterLayerTimer, ModelLayerTimer, TimingRecorder
-from stratum.utils import log_event
+from stratum.utils import log_debug_event, log_event
 from stratum.context import ForwardCtx, set_recompute_event_recorder
 from stratum.runtime import anchor_explicit_group_backward, capture_backward_input
 from stratum.scheduler import ModelExecutePlan, ModelTracker
@@ -378,7 +378,7 @@ class StratumPipeline(nn.Module):
                 tensors=tensors,
                 **fields,
             )
-        log_event(
+        log_debug_event(
             "stage_group_free",
             device=stage.device_id,
             fwd_group_id=fwd_group_id,
@@ -725,10 +725,10 @@ class StratumPipeline(nn.Module):
                 # Transfer hidden state (tuple_data[0]) across devices
                 pool = self.boundary_pools[pool_idx]
                 hidden = tuple_data[0]
-                log_event("pipeline_transfer",
-                          src=prev_device, dst=next_device,
-                          hidden_shape=list(hidden.shape),
-                          hidden_dtype=str(hidden.dtype))
+                log_debug_event("pipeline_transfer",
+                                src=prev_device, dst=next_device,
+                                hidden_shape=list(hidden.shape),
+                                hidden_dtype=str(hidden.dtype))
                 with self._time(
                     "boundary_transfer",
                     device_id=next_device,

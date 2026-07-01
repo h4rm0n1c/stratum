@@ -34,6 +34,14 @@ def log_event(event: str, **fields) -> None:
     _log.info(" ".join(parts))
 
 
+def log_debug_event(event: str, **fields) -> None:
+    """Emit a structured log line at DEBUG level."""
+    parts = [f"[stratum] {event}"]
+    for k, v in fields.items():
+        parts.append(f"{k}={v}")
+    _log.debug(" ".join(parts))
+
+
 def get_device_info() -> list[dict]:
     """Return info for each visible CUDA device."""
     if not torch.cuda.is_available():

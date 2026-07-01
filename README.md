@@ -159,7 +159,7 @@ When CUDA peer access is available, boundary transfers go direct GPU→GPU. When
 | `--muon-qk-stat-mode` | `auto` | QK-Clip stat source: patched flash max logits when available, norm bound fallback in `auto`; `exact_flash` requires patched backend |
 | `--lora-r` | 16 | LoRA rank |
 | `--lora-target-set` | `all` | LoRA targeting: `all`, `attention`, `attention_input`, `mlp` |
-| `--save-every` | 500 | Checkpoint interval |
+| `--save-every` | 200 | Checkpoint interval |
 
 ### VRAM optimization
 
@@ -171,13 +171,13 @@ When CUDA peer access is available, boundary transfers go direct GPU→GPU. When
 | `--nf4-cache-dir` | `/workspace/cache/nf4-frozen` | NF4 payload cache directory |
 | `--prefetch-nf4` | false | Side-stream NF4 payload prefetch |
 | `--pin-model` | `alloc` | CPU pinning: `alloc`, `register`, `off` |
-| `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device groups into sub-stages |
-| `--recompute-grain` | `layer` | Recompute granularity: `stage`, `layer`, or `none` |
+| `--stratum-stage-memory-limit-gib` | auto | Split per-device groups into sub-stages; LFM2.5 defaults to `1.0` |
+| `--recompute-grain` | `auto` | Recompute granularity: LFM2.5 selects `stage`; other models select `layer` |
 | `--offload-stage-inputs` | auto | Host-offload captured stage inputs; defaults on for `--recompute-grain stage` |
 | `--checkpoint-decoder-layer` | true | Activation checkpointing per decoder layer |
 | `--checkpoint-mlp` | false | Wrap each MLP in activation checkpointing |
-| `--mlp-token-chunk-size` | 0 | Split MLPs over token chunks |
-| `--memory-flat-frozen-mlp` | false | Token-chunked backward recompute for frozen MLPs |
+| `--mlp-token-chunk-size` | auto | Split MLPs over token chunks; LFM2.5 defaults to `2048` |
+| `--memory-flat-frozen-mlp` | auto | Token-chunked backward recompute for frozen MLPs; on by default for LFM2.5 |
 | `--cpu-offload-optim` | false | Keep optimizer state in fp32 on CPU |
 | `--async-optimizer-step` | false | Run optimizer through background stream |
 | `--optim-dtype` | `fp32` | CPU optimizer param precision |

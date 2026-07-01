@@ -997,19 +997,19 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 | `--nf4-layer-size-floor-gib` | 0.0 | qz-roundpipe-style scheduler hint: floor each layer's estimated stage-planning size |
 | `--nf4-cache-dir` | `/workspace/cache/nf4-frozen` | Directory to cache NF4 payloads; a model-id subdirectory is added automatically |
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
-| `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
+| `--stratum-stage-memory-limit-gib` | auto | Split per-device layer groups into smaller upload/free stages; LFM2.5 defaults to `1.0`, other models default to `0.0` |
 | `--no-prefetch-nf4` | False | Disable NF4 payload prefetch (prefetch is ON by default: side-stream H2D copy of the next stage's NF4 payloads before they are needed) |
-| `--recompute-grain` | `layer` | `stage` uses explicit stage/group recompute, `layer` keeps per-layer checkpointing, `none` disables decoder-layer recompute |
+| `--recompute-grain` | `auto` | `auto` selects `stage` for LFM2.5 and `layer` for other adapters; `stage` uses explicit stage/group recompute, `layer` keeps per-layer checkpointing, `none` disables decoder-layer recompute |
 | `--offload-stage-inputs` | auto | Host-offload captured stage/group inputs; defaults on for `--recompute-grain stage` |
 | `--checkpoint-mlp` | False | Wrap MLP in activation checkpointing |
-| `--mlp-token-chunk-size` | 0 | Split MLP forward into token chunks (0 = disabled) |
-| `--memory-flat-frozen-mlp` | False | Frozen MLP with token-chunked backward recompute |
+| `--mlp-token-chunk-size` | auto | Split MLP forward into token chunks; LFM2.5 defaults to `2048`, other models default to disabled |
+| `--memory-flat-frozen-mlp` | auto | Frozen MLP with token-chunked backward recompute; on by default for LFM2.5 |
 
 ### Loss chunking
 | Flag | Default | Description |
 |---|---|---|
-| `--loss-token-chunk-size` | 4096 | Token chunk size for lm_head (always active) |
-| `--postfix-loss-token-chunk-size` | 0 | Enable blocked postfix loss (mode 2, saves norm memory) |
+| `--loss-token-chunk-size` | auto | Token chunk size for lm_head; LFM2.5 defaults to `2048`, other models default to `4096` |
+| `--postfix-loss-token-chunk-size` | auto | Enable blocked postfix loss (mode 2, saves norm memory); LFM2.5 defaults to `2048`, other models default to disabled |
 | `--torch-compile-loss` | False | Use `@torch.compile` on cross_entropy |
 
 ### Attention patching

@@ -15,7 +15,7 @@ Three paths, tried in order:
 
 import torch
 from stratum.transfer import async_d2h, async_h2d
-from stratum.utils import log_event
+from stratum.utils import log_debug_event, log_event
 
 
 def _element_size(dtype: torch.dtype) -> int:
@@ -90,8 +90,8 @@ class HostStagingPool:
 
         # Path 1: Peer access (fastest, no host RAM involvement)
         if _has_peer_access(src_device, dst_device):
-            log_event("transfer_peer", src=src_device, dst=dst_device,
-                      size_mib=round(size_bytes / 1024**2, 2))
+            log_debug_event("transfer_peer", src=src_device, dst=dst_device,
+                            size_mib=round(size_bytes / 1024**2, 2))
             src_ready = torch.cuda.Event()
             src_current = torch.cuda.current_stream(device=src_device)
             dst_current = torch.cuda.current_stream(device=dst_device)
@@ -102,8 +102,8 @@ class HostStagingPool:
             return result
 
         # Path 2: Host-staged fallback (same as ggml_cuda_copy_across_devices)
-        log_event("transfer_host_staged", src=src_device, dst=dst_device,
-                  size_mib=round(size_bytes / 1024**2, 2))
+        log_debug_event("transfer_host_staged", src=src_device, dst=dst_device,
+                        size_mib=round(size_bytes / 1024**2, 2))
         self._wait_pending()
         self.ensure(size_bytes)
 

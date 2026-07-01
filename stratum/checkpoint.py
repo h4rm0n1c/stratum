@@ -165,7 +165,14 @@ def save_checkpoint_async(
             }
             active = getattr(peft_model, "active_adapter", "default")
             cfg = peft_model.peft_config.get(active)
-            peft_config_json = cfg.to_json_string() if cfg is not None else None
+            if cfg is None:
+                peft_config_json = None
+            elif hasattr(cfg, "to_json_string"):
+                peft_config_json = cfg.to_json_string()
+            elif hasattr(cfg, "to_dict"):
+                peft_config_json = json.dumps(cfg.to_dict(), indent=2, sort_keys=True, default=str) + "\n"
+            else:
+                raise TypeError(f"unsupported PEFT config type: {type(cfg).__name__}")
         except Exception as exc:
             # Extraction failed — fall back to synchronous save_pretrained so
             # the checkpoint is never silently skipped.
