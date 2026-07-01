@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from stratum.checkpoint import load_checkpoint, save_checkpoint, save_checkpoint_async, AsyncCheckpointHandle
+from stratum.muon import MuonAdamW
 
 _have_safetensors = importlib.util.find_spec("safetensors") is not None
 _skip_no_safetensors = unittest.skipUnless(_have_safetensors, "safetensors not installed")
@@ -58,13 +59,16 @@ class CheckpointMetadataTest(unittest.TestCase):
             self.assertFalse((out_dir / "device_0.pt").exists())
             self.assertFalse((out_dir / "meta.pt").exists())
 
-            ckpt = torch.load(out_dir / "optimizer_state.safetensors", map_location="cpu",
-                              weights_only=False)
-            self.assertEqual(ckpt["format_version"], 1)
-            self.assertIsInstance(ckpt["state"], dict)
-            # Keys are parameter names, not device IDs
-            for key in ckpt["state"]:
-                self.assertIsInstance(key, str)
+            from safetensors import safe_open
+            with safe_open(out_dir / "optimizer_state.safetensors", framework="pt", device="cpu") as f:
+                keys = list(f.keys())
+            self.assertTrue(keys)
+            # Keys are parameter names plus optimizer state names, not device IDs.
+            for key in keys:
+                param_name, sep, state_name = key.rpartition(":")
+                self.assertEqual(sep, ":")
+                self.assertTrue(param_name)
+                self.assertTrue(state_name)
 
     @_skip_no_safetensors
     def test_optimizer_state_loads_lr_and_restores_step(self):
@@ -149,6 +153,53 @@ class CheckpointMetadataTest(unittest.TestCase):
                 self.assertTrue(torch.equal(saved_ps["step"], loaded_ps["step"]))
                 self.assertTrue(torch.allclose(saved_ps["exp_avg"], loaded_ps["exp_avg"]))
                 self.assertTrue(torch.allclose(saved_ps["exp_avg_sq"], loaded_ps["exp_avg_sq"]))
+
+    @_skip_no_safetensors
+    def test_optimizer_mixed_muon_adamw_state_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            module = nn.Linear(2, 2, bias=True)
+            saved_opt = MuonAdamW(module.parameters(), lr=0.01)
+
+            x = torch.ones(1, 2)
+            module(x).sum().backward()
+            saved_opt.step()
+
+            class SavedOptimizer:
+                cpu_offload = False
+                optimizers = {0: saved_opt}
+
+            save_checkpoint(
+                {0: [module]},
+                optimizer=SavedOptimizer(),
+                step=11,
+                out_dir=out_dir,
+                save_optimizer_state=True,
+            )
+
+            loaded_module = nn.Linear(2, 2, bias=True)
+            loaded_opt = MuonAdamW(loaded_module.parameters(), lr=0.001)
+
+            class LoadedOptimizer:
+                cpu_offload = False
+                optimizers = {0: loaded_opt}
+
+            step = load_checkpoint(
+                {0: [loaded_module]},
+                optimizer=LoadedOptimizer(),
+                checkpoint_dir=out_dir,
+            )
+
+            self.assertEqual(step, 11)
+            loaded_state = loaded_opt.state_dict()["state"]
+            self.assertIn("momentum_buffer", loaded_state[0])
+            self.assertIn("exp_avg", loaded_state[1])
+            saved_state = saved_opt.state_dict()["state"]
+            self.assertTrue(torch.allclose(
+                saved_state[0]["momentum_buffer"],
+                loaded_state[0]["momentum_buffer"],
+            ))
+            self.assertTrue(torch.allclose(saved_state[1]["exp_avg"], loaded_state[1]["exp_avg"]))
 
     @_skip_no_safetensors
     def test_optimizer_state_portable_across_device_split(self):
@@ -239,17 +290,12 @@ class AsyncCheckpointTest(unittest.TestCase):
             )
             handle.join()
 
-            async_ckpt = torch.load(
-                Path(tmp_async) / "optimizer_state.safetensors",
-                map_location="cpu", weights_only=False,
-            )
-            sync_ckpt = torch.load(
-                Path(tmp_sync) / "optimizer_state.safetensors",
-                map_location="cpu", weights_only=False,
-            )
-            self.assertEqual(async_ckpt["format_version"], sync_ckpt["format_version"])
-            for k in sync_ckpt["state"]:
-                self.assertIn(k, async_ckpt["state"])
+            from safetensors import safe_open
+            with safe_open(Path(tmp_async) / "optimizer_state.safetensors", framework="pt", device="cpu") as f:
+                async_keys = set(f.keys())
+            with safe_open(Path(tmp_sync) / "optimizer_state.safetensors", framework="pt", device="cpu") as f:
+                sync_keys = set(f.keys())
+            self.assertEqual(async_keys, sync_keys)
 
     def test_join_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:

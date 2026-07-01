@@ -32,6 +32,7 @@ from stratum.context import (
     get_recompute_data,
     save_for_recompute,
 )
+from stratum.qk_clip import flash_attention_with_qk_clip_stats, record_qk_clip_stats
 from stratum.moe import (load_balancing_loss_func, patch_moe_block_for_packing,
                          patch_moe_block_for_router_logits, pop_router_logits)
 
@@ -222,6 +223,8 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             q = q.permute(0, 2, 1, 3).squeeze(0)    # (total_tokens, n_heads, head_dim)
             k = k.permute(0, 2, 1, 3).squeeze(0)
+            q_for_qk_clip = q
+            k_for_qk_clip = k
 
             # GQA: repeat k/v heads to match q heads
             if self.num_key_value_groups > 1:
@@ -236,8 +239,16 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
                 )
 
             try:
-                attn_output = varlen_backend.fn(
-                    q, k, v,
+                attn_output = flash_attention_with_qk_clip_stats(
+                    self,
+                    varlen_backend.name,
+                    varlen_backend.fn,
+                    q,
+                    k,
+                    v,
+                    query_states=q_for_qk_clip,
+                    key_states=k_for_qk_clip,
+                    scaling=self.scaling,
                     cu_seqlens_q=cu_seqlens,
                     cu_seqlens_k=cu_seqlens,
                     max_seqlen_q=max_seqlen,
@@ -288,8 +299,19 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
             k = k_fa.transpose(1, 2).contiguous()
             v = v_fa.transpose(1, 2).contiguous()
             try:
-                attn_output = flash_backend.fn(
-                    q, k, v, dropout_p=0.0, softmax_scale=self.scaling, causal=True,
+                attn_output = flash_attention_with_qk_clip_stats(
+                    self,
+                    flash_backend.name,
+                    flash_backend.fn,
+                    q,
+                    k,
+                    v,
+                    query_states=query_states,
+                    key_states=key_states,
+                    scaling=self.scaling,
+                    dropout_p=0.0,
+                    softmax_scale=self.scaling,
+                    causal=True,
                 )
                 attn_output = attn_output.transpose(1, 2).contiguous()
             except RuntimeError as exc:
@@ -306,6 +328,7 @@ class Lfm25FlashAttention(Lfm2MoeAttention):
                 )
             # Eager fallback — pre-GQA tensors, GQA handled internally
             from transformers.models.llama.modeling_llama import eager_attention_forward
+            record_qk_clip_stats(self, query_states, key_states, scaling=self.scaling)
             attn_output, _ = eager_attention_forward(
                 self, query_states, key_states, value_states,
                 attention_mask, dropout=0.0, scaling=self.scaling,

@@ -54,7 +54,8 @@ New models register via `@register("name")` in `stratum/model/registry.py`.
 | **NF4 frozen-weight streaming** | 4x compressed upload per step; payloads stay on CPU; cache avoids re-quantization |
 | **Host-staged no-P2P transfers** | Pinned buffer pool for cross-device activation/gradient transfer when peer access is unavailable |
 | **Capability-dispatched flash attention** | `flash_attn` on SM80+/SM86, `flash_attn_v100` on SM70 — hard failure, no silent eager fallback |
-| **CPU-offloaded async optimizer** | AdamW state in fp32 on CPU; background optimizer stream; frees ~2x trainable-param GPU memory |
+| **MuonClip optimizer** | Hybrid Muon + AdamW with QK-Clip for attention Q/K projections; exact flash-logit stats when patched kernels support them |
+| **CPU-offloaded async optimizer** | AdamW or hybrid Muon state in fp32 on CPU; background optimizer stream; frees ~2x trainable-param GPU memory |
 | **GradScaler** | Async-safe dual-scaler design for mixed-precision training |
 | **Recompute context** | PyTorch checkpoint bridge; non-grad tensors saved/restored to avoid redundant allocation |
 | **Scheduler groups** | Explicit layer-group forward/backward with wait/notify semantics |
@@ -94,7 +95,9 @@ When CUDA peer access is available, boundary transfers go direct GPU→GPU. When
 | `stratum/scheduler.py` | `ModelExecutePlan`, `ModelTracker`, `BackwardScheduleSimulator` |
 | `stratum/runtime.py` | Explicit group backward: `anchor_explicit_group_backward()`, `run_explicit_group_backward()` |
 | `stratum/timing.py` | Per-layer CUDA-event timing: `LayerTimingContext`, `IterLayerTimer`, `ModelLayerTimer` |
-| `stratum/optim.py` | `PerDeviceOptimizer` — per-device AdamW with LR scheduling |
+| `stratum/optim.py` | `PerDeviceOptimizer` — per-device optimizer wrapper with LR scheduling |
+| `stratum/muon.py` | Hybrid Muon + AdamW optimizer for trainable adapter params |
+| `stratum/qk_clip.py` | QK-Clip stat capture and post-step Q/K scaling |
 | `stratum/optim_stream.py` | Background optimizer thread with kernel queue |
 | `stratum/attribute.py` | `ParamAttribute` — per-parameter grad/optim state tracking |
 | `stratum/grad_scaler.py` | Async-safe GradScaler with dual-scaler design |
@@ -146,7 +149,14 @@ When CUDA peer access is available, boundary transfers go direct GPU→GPU. When
 | `--lr` | 1e-4 | Learning rate |
 | `--lr-scheduler` | cosine_with_warmup | LR schedule |
 | `--warmup-steps` | 500 | Linear warmup steps |
-| `--weight-decay` | 0.1 | AdamW weight decay |
+| `--weight-decay` | 0.1 | Decoupled optimizer weight decay |
+| `--optimizer` | `adamw` | Optimizer: `adamw`, configurable hybrid `muon`, or stable `muonclip` |
+| `--muon-momentum` | 0.95 | Muon momentum for matrix trainable tensors |
+| `--muon-ns-steps` | 5 | Newton-Schulz iterations for Muon |
+| `--muon-update-scale` | 0.2 | Muon update scaling multiplier |
+| `--muon-qk-mode` | `clip` | Under `muon`, apply QK-Clip to Q/K params; alternatives: `adamw`, `muon`. `muonclip` always uses `clip` |
+| `--muon-qk-clip-threshold` | 100.0 | QK-Clip attention-logit threshold tau |
+| `--muon-qk-stat-mode` | `auto` | QK-Clip stat source: patched flash max logits when available, norm bound fallback in `auto`; `exact_flash` requires patched backend |
 | `--lora-r` | 16 | LoRA rank |
 | `--lora-target-set` | `all` | LoRA targeting: `all`, `attention`, `attention_input`, `mlp` |
 | `--save-every` | 500 | Checkpoint interval |

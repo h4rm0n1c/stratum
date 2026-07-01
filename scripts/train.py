@@ -204,6 +204,25 @@ def main():
                     choices=["constant", "cosine", "cosine_with_warmup"])
     ap.add_argument("--warmup-steps", type=int, default=500)
     ap.add_argument("--weight-decay", type=float, default=0.1)
+    ap.add_argument("--optimizer", default="adamw", choices=["adamw", "muon", "muonclip"],
+                    help="Optimizer algorithm. 'muonclip' uses Muon with QK-Clip for attention "
+                         "Q/K projections; 'muon' keeps the lower-level configurable Muon modes.")
+    ap.add_argument("--muon-momentum", type=float, default=0.95,
+                    help="Muon momentum for matrix trainable tensors.")
+    ap.add_argument("--muon-ns-steps", type=int, default=5,
+                    help="Newton-Schulz iterations for Muon orthogonalization.")
+    ap.add_argument("--muon-update-scale", type=float, default=0.2,
+                    help="Multiplier for Muon shape-scaled updates.")
+    ap.add_argument("--muon-qk-mode", default="clip", choices=["clip", "adamw", "muon"],
+                    help="Under --optimizer muon, use QK-Clip on Q/K params by default. "
+                         "'adamw' keeps Q/K on AdamW; 'muon' disables QK safeguards.")
+    ap.add_argument("--muon-qk-clip-threshold", type=float, default=100.0,
+                    help="QK-Clip attention-logit threshold tau.")
+    ap.add_argument("--muon-qk-stat-mode", default="auto",
+                    choices=["auto", "bound", "exact_flash"],
+                    help="QK-Clip statistic source: use patched flash max logits when available "
+                         "('auto'), force norm-product upper bounds ('bound'), or require "
+                         "patched flash max logits ('exact_flash').")
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--tensor-split", type=float, nargs="+", default=None)
     ap.add_argument("--device-ids", type=int, nargs="+", default=None)
@@ -335,6 +354,8 @@ def main():
 
     # Activate verbose diagnostics before anything emits.
     set_verbose(args.verbose)
+    if args.optimizer == "muonclip":
+        args.muon_qk_mode = "clip"
 
     # Open log file early — before any config events — so log_event has a target.
     global _log_file
@@ -342,6 +363,14 @@ def main():
         Path(args.out).mkdir(parents=True, exist_ok=True)
         _log_file = open(Path(args.out) / "training.jsonl", "w")
         watchdog_set_log_file(_log_file)
+
+    low_rss_nf4_build = not args.no_low_rss_nf4_build
+    packing = not args.no_packing
+    prefetch_nf4 = not args.no_prefetch_nf4
+    longest_first = not args.no_longest_first
+    cpu_offload_optim = not args.no_cpu_offload_optim
+    async_optimizer_step = not args.no_async_optimizer_step
+    grad_scaler_enabled = not args.no_grad_scaler
 
     # MLflow tracking (opt-in via --mlflow).
     # Writes directly to <out>/mlruns/ on the shared volume.
@@ -356,6 +385,10 @@ def main():
             mlflow.log_params({
                 "model": args.model,
                 "lr": args.lr,
+                "optimizer": args.optimizer,
+                "muon_qk_mode": args.muon_qk_mode,
+                "muon_qk_clip_threshold": args.muon_qk_clip_threshold,
+                "muon_qk_stat_mode": args.muon_qk_stat_mode,
                 "lr_scheduler": args.lr_scheduler,
                 "warmup_steps": args.warmup_steps,
                 "weight_decay": args.weight_decay,
@@ -395,13 +428,6 @@ def main():
         raise ValueError("--postfix-loss-token-chunk-size must be >= 0")
     if args.stratum_stage_memory_limit_gib < 0:
         raise ValueError("--stratum-stage-memory-limit-gib must be >= 0")
-    low_rss_nf4_build = not args.no_low_rss_nf4_build
-    packing = not args.no_packing
-    prefetch_nf4 = not args.no_prefetch_nf4
-    longest_first = not args.no_longest_first
-    cpu_offload_optim = not args.no_cpu_offload_optim
-    async_optimizer_step = not args.no_async_optimizer_step
-    grad_scaler_enabled = not args.no_grad_scaler
     if low_rss_nf4_build and args.no_nf4:
         low_rss_nf4_build = False  # silently skip; no-op when NF4 is off
     if async_optimizer_step and not cpu_offload_optim:
@@ -598,12 +624,33 @@ def main():
         scheduler=args.lr_scheduler,
         warmup_steps=args.warmup_steps,
         total_steps=args.steps,
+        optimizer=args.optimizer,
         cpu_offload=cpu_offload_optim,
         optim_dtype=optim_dtype,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
+        muon_update_scale=args.muon_update_scale,
+        muon_qk_mode=args.muon_qk_mode,
+        muon_qk_clip_threshold=args.muon_qk_clip_threshold,
+        muon_qk_stat_mode=args.muon_qk_stat_mode,
     )
     if cpu_offload_optim:
         optimizer.ensure_optim_params()
         log_event({"event": "config", "cpu_offload_optim": True, "optim_dtype": args.optim_dtype})
+    log_event({
+        "event": "config",
+        "optimizer": args.optimizer,
+        "muon_momentum": args.muon_momentum,
+        "muon_ns_steps": args.muon_ns_steps,
+        "muon_update_scale": args.muon_update_scale,
+        "muon_qk_mode": args.muon_qk_mode,
+        "muon_qk_clip_threshold": args.muon_qk_clip_threshold,
+        "muon_qk_stat_mode": args.muon_qk_stat_mode,
+        "muon_qk_adamw_params": {
+            str(device_id): len(names)
+            for device_id, names in optimizer.muon_adamw_param_names.items()
+        },
+    })
     scaler = make_grad_scaler(
         enabled=grad_scaler_enabled,
         cpu_offload=cpu_offload_optim,
@@ -859,6 +906,23 @@ def main():
             "elapsed_min": round((time.time() - t0) / 60, 2),
             "rss_gib": rss_gib,
         }
+        if args.optimizer in {"muon", "muonclip"} and args.muon_qk_mode == "clip":
+            qk_stats = list(optimizer.last_qk_clip_stats.values())
+            log_entry["qk_clip_max_s"] = round(
+                max((float(s.get("max_s", 0.0)) for s in qk_stats), default=0.0),
+                4,
+            )
+            log_entry["qk_clip_heads"] = sum(int(s.get("heads", 0)) for s in qk_stats)
+            log_entry["qk_clip_min_gamma"] = round(
+                min((float(s.get("min_gamma", 1.0)) for s in qk_stats), default=1.0),
+                6,
+            )
+            log_entry["qk_clip_exact_layers"] = sum(
+                int(s.get("exact_layers", 0)) for s in qk_stats
+            )
+            log_entry["qk_clip_bound_layers"] = sum(
+                int(s.get("bound_layers", 0)) for s in qk_stats
+            )
         gpu_snapshots = {}
         for d in devices:
             vs = gpu_memory_snapshot(d["id"])
@@ -924,8 +988,7 @@ def main():
         save_dir = Path(args.out) / "final"
         save_checkpoint(modules_by_device, optimizer, step, save_dir,
                         peft_model=hf_model,
-                        save_optimizer_state=args.save_optimizer_state,
-                        save_legacy_device_state=args.save_legacy_device_state)
+                        save_optimizer_state=args.save_optimizer_state)
         jprint({"event": "checkpoint", "path": str(save_dir), "step": step, "final": True})
     else:
         log_event({"event": "info", "msg": "skipping final save (--no-save)"})

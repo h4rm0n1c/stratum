@@ -97,9 +97,14 @@ RUN TORCH_CUDA_ARCH_LIST="7.0;8.6" \
 
 RUN rm -rf /tmp/causal-conv1d
 
+# FlashAttention QK-Clip stats patches are applied to the cloned upstream trees
+# before the existing build compatibility edits below.
+COPY patches/ /tmp/patches/
+
 # flash-attention-v100: patched for CUDA 12.6 + sm_70
 RUN git clone https://github.com/ai-bond/flash-attention-v100.git /tmp/fav100 && \
-    cd /tmp/fav100 && git checkout 6d53118
+    cd /tmp/fav100 && git checkout 6d53118 && \
+    git apply /tmp/patches/flash-attn-v100-6d53118-qk-max-logits.patch
 
 RUN cd /tmp/fav100 && python - <<'PY'
 from pathlib import Path
@@ -156,7 +161,9 @@ RUN rm -rf /workspace/venv/lib/python3.12/site-packages/flash_attn/ && \
 
 # Standard flash-attention 2.8.3 (Ampere+, targets sm_86 for RTX 3080).
 # Build from source restricted to sm_86. No pre-built wheel for torch2.12.
-RUN git clone --depth 1 --branch v2.8.3 https://github.com/Dao-AILab/flash-attention.git /tmp/fa2
+RUN git clone --depth 1 --branch v2.8.3 https://github.com/Dao-AILab/flash-attention.git /tmp/fa2 && \
+    cd /tmp/fa2 && \
+    git apply /tmp/patches/flash-attn-2.8.3-qk-max-logits.patch
 
 RUN cd /tmp/fa2 && python - <<'PY'
 from pathlib import Path

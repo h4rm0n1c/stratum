@@ -1,0 +1,479 @@
+diff --git a/flash_attn_v100/flash_attn_interface.py b/flash_attn_v100/flash_attn_interface.py
+index bb450cc..551d738 100644
+--- a/flash_attn_v100/flash_attn_interface.py
++++ b/flash_attn_v100/flash_attn_interface.py
+@@ -29,6 +29,7 @@ class FlashAttnFunc(torch.autograd.Function):
+         alibi_slopes: Optional[torch.Tensor],
+         deterministic: bool,
+         return_softmax: bool,
++        return_max_logits: bool,
+         is_grad_enabled: bool
+     ) -> torch.Tensor:
+         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+@@ -57,11 +58,11 @@ class FlashAttnFunc(torch.autograd.Function):
+ 
+         window_left, window_right = window_size
+ 
+-        out_, lse_, dmask_, rng_state = flash_attn_v100_cuda.fwd(
++        out_, lse_, dmask_, rng_state, max_logits = flash_attn_v100_cuda.fwd(
+             q_, k_, v_, None, alibi_slopes,
+             dropout_p, softmax_scale, causal,
+             window_left, window_right, softcap,
+-            return_softmax, None
++            return_softmax, None, return_max_logits
+         )
+ 
+         out = out_[..., :head_size_og].permute(0, 2, 1, 3).contiguous()
+@@ -78,7 +79,13 @@ class FlashAttnFunc(torch.autograd.Function):
+             ctx.head_size_og = head_size_og
+             ctx.pad_size = pad_size
+ 
+-        return (out, lse_, dmask_) if return_softmax else out
++        if return_softmax and return_max_logits:
++            return out, lse_, dmask_, max_logits
++        if return_softmax:
++            return out, lse_, dmask_
++        if return_max_logits:
++            return out, max_logits
++        return out
+ 
+     @staticmethod
+     def backward(ctx, dout, *args):
+@@ -109,7 +116,7 @@ class FlashAttnFunc(torch.autograd.Function):
+         dk = grads[1][..., :head_size_og].permute(0, 2, 1, 3).contiguous()
+         dv = grads[2][..., :head_size_og].permute(0, 2, 1, 3).contiguous()
+ 
+-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
++        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+ 
+ 
+ def flash_attn_func(
+@@ -123,7 +130,8 @@ def flash_attn_func(
+     softcap: float = 0.0,
+     alibi_slopes: Optional[torch.Tensor] = None,
+     deterministic: bool = False,
+-    return_attn_probs: bool = False
++    return_attn_probs: bool = False,
++    return_max_logits: bool = False
+ ):
+     """Dense Flash Attention (B, M, H, D)"""
+     if deterministic:
+@@ -143,6 +151,7 @@ def flash_attn_func(
+             alibi_slopes,
+             deterministic,
+             return_attn_probs,
++            return_max_logits,
+             torch.is_grad_enabled()
+         )
+     except Exception as e:
+@@ -174,6 +183,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
+         deterministic: bool,
+         return_attn_probs: bool,
+         block_table: Optional[torch.Tensor],
++        return_max_logits: bool,
+         is_grad_enabled: bool
+     ) -> torch.Tensor:
+ 
+@@ -207,12 +217,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
+         leftpad_k = None
+         num_splits = 0
+ 
+-        out, lse, dmask, rng_state = flash_attn_v100_cuda.varlen_fwd(
++        out, lse, dmask, rng_state, max_logits = flash_attn_v100_cuda.varlen_fwd(
+             q, k, v, None, cu_seqlens_q, cu_seqlens_k,
+             seqused_k, leftpad_k, block_table, alibi_slopes,
+             max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale,
+             False, causal, window_left, window_right, softcap,
+-            return_attn_probs and dropout_p > 0.0, None, num_splits
++            return_attn_probs and dropout_p > 0.0, None, num_splits, return_max_logits
+         )
+ 
+         out = out[..., :head_size_og].contiguous()
+@@ -231,7 +241,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
+             ctx.max_seqlen_q = max_seqlen_q
+             ctx.max_seqlen_k = max_seqlen_k
+ 
+-        return (out, lse, dmask) if return_attn_probs else out
++        if return_attn_probs and return_max_logits:
++            return out, lse, dmask, max_logits
++        if return_attn_probs:
++            return out, lse, dmask
++        if return_max_logits:
++            return out, max_logits
++        return out
+ 
+     @staticmethod
+     def backward(ctx, dout, *args):
+@@ -266,7 +282,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
+         dk = grads[1][..., :head_size_og].contiguous()
+         dv = grads[2][..., :head_size_og].contiguous()
+ 
+-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
++        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+ 
+ 
+ def flash_attn_varlen_func(
+@@ -286,6 +302,7 @@ def flash_attn_varlen_func(
+     deterministic: bool = False,
+     return_attn_probs: bool = False,
+     block_table: Optional[torch.Tensor] = None,
++    return_max_logits: bool = False,
+ ):
+     """Varlen Flash Attention (T, H, D)"""
+     if deterministic:
+@@ -310,6 +327,7 @@ def flash_attn_varlen_func(
+             deterministic,
+             return_attn_probs,
+             block_table,
++            return_max_logits,
+             torch.is_grad_enabled()
+         )
+     except Exception as e:
+diff --git a/include/mha.h b/include/mha.h
+index abf023b..894880e 100644
+--- a/include/mha.h
++++ b/include/mha.h
+@@ -37,7 +37,8 @@ std::vector<at::Tensor> flash_attention_forward(
+     int          window_right,
+     const float  softcap,
+     const bool   return_softmax,
+-    std::optional<at::Generator> gen
++    std::optional<at::Generator> gen,
++    const bool   return_max_logits = false
+ );
+ 
+ /**
+@@ -135,7 +136,8 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     const float  softcap,
+     const bool   return_softmax,
+     std::optional<at::Generator> gen,
+-    int          num_splits = 0
++    int          num_splits = 0,
++    const bool   return_max_logits = false
+ );
+ 
+ /**
+diff --git a/kernel/fused_mha_api.cpp b/kernel/fused_mha_api.cpp
+index e354563..d3e2f28 100644
+--- a/kernel/fused_mha_api.cpp
++++ b/kernel/fused_mha_api.cpp
+@@ -56,7 +56,8 @@ std::vector<at::Tensor> torchbind_fwd(
+     int64_t window_right,
+     double  softcap,
+     bool    return_softmax,
+-    std::optional<at::Generator> gen
++    std::optional<at::Generator> gen,
++    bool    return_max_logits
+ ) {
+     std::optional<at::Tensor> out_ref   = out;
+     std::optional<at::Tensor> alibi_ref = alibi_slopes;
+@@ -74,7 +75,8 @@ std::vector<at::Tensor> torchbind_fwd(
+         static_cast<int>(window_right),
+         static_cast<float>(softcap),
+         return_softmax,
+-        gen
++        gen,
++        return_max_logits
+     );
+ }
+ 
+@@ -152,7 +154,8 @@ std::vector<at::Tensor> torchbind_varlen_fwd(
+     double  softcap,
+     bool    return_softmax,
+     std::optional<at::Generator> gen,
+-    int64_t num_splits
++    int64_t num_splits,
++    bool    return_max_logits
+ ) {
+     std::optional<at::Tensor> out_ref           = out;
+     std::optional<at::Tensor> seqused_ref       = seqused_k;
+@@ -182,7 +185,8 @@ std::vector<at::Tensor> torchbind_varlen_fwd(
+         static_cast<float>(softcap),
+         return_softmax,
+         gen,
+-        static_cast<int>(num_splits)
++        static_cast<int>(num_splits),
++        return_max_logits
+     );
+ }
+ 
+@@ -311,7 +315,7 @@ TORCH_LIBRARY(flash_attn_v100, m) {
+         "Tensor? out, Tensor? alibi_slopes, "
+         "float p_dropout, float softmax_scale, bool is_causal, "
+         "int window_left, int window_right, float softcap, "
+-        "bool return_softmax, Generator? gen) -> Tensor[]",
++        "bool return_softmax, Generator? gen, bool return_max_logits) -> Tensor[]",
+         &torchbind_fwd);
+ 
+     m.def(
+@@ -331,7 +335,7 @@ TORCH_LIBRARY(flash_attn_v100, m) {
+         "int max_seqlen_q, int max_seqlen_k, "
+         "float p_dropout, float softmax_scale, bool zero_tensors, bool is_causal, "
+         "int window_left, int window_right, float softcap, "
+-        "bool return_softmax, Generator? gen, int num_splits) -> Tensor[]",
++        "bool return_softmax, Generator? gen, int num_splits, bool return_max_logits) -> Tensor[]",
+         &torchbind_varlen_fwd);
+ 
+     m.def(
+diff --git a/kernel/fused_mha_forward.cu b/kernel/fused_mha_forward.cu
+index 6f5e6b5..2943a68 100644
+--- a/kernel/fused_mha_forward.cu
++++ b/kernel/fused_mha_forward.cu
+@@ -19,6 +19,17 @@
+ #include "mat_mul.h"
+ #include "softmax.h"
+ 
++__device__ __forceinline__ void atomic_max_float(float* addr, float value) {
++    if (!isfinite(value)) return;
++    int* addr_as_i = reinterpret_cast<int*>(addr);
++    int old = *addr_as_i;
++    while (value > __int_as_float(old)) {
++        const int assumed = old;
++        old = atomicCAS(addr_as_i, assumed, __float_as_int(value));
++        if (old == assumed) break;
++    }
++}
++
+ // ======================================================================================
+ // FORWARD KERNEL
+ // ======================================================================================
+@@ -29,8 +40,9 @@ flash_attention_forward_kernel(
+     const __half* __restrict__ K,
+     const __half* __restrict__ V,
+           __half* __restrict__ Out,
+-           float* __restrict__ softmax_lse,
+-          __half* __restrict__ dmask,
++	   float* __restrict__ softmax_lse,
++	  __half* __restrict__ dmask,
++	   float* __restrict__ max_logits,
+     const int B,
+     const int H_Q,
+     const int H_K,
+@@ -217,10 +229,13 @@ flash_attention_forward_kernel(
+       nullptr, nullptr,
+       sRowSum, D, block.valid_q_rows, tid);
+ 
+-    if (tid < block.valid_q_rows) {
+-        const float sum = fmaxf(sRowSum[tid], 1e-24f);
+-        softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
+-    }
++	if (tid < block.valid_q_rows) {
++	    const float sum = fmaxf(sRowSum[tid], 1e-24f);
++	    softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
++	    if (max_logits != nullptr) {
++	        atomic_max_float(max_logits + block.head_idx, sRowMax[tid]);
++	    }
++	}
+ }
+ 
+ // ======================================================================================
+@@ -232,7 +247,8 @@ void launcher_flash_attention_forward(
+     const torch::Tensor& K,
+     const torch::Tensor& V,
+           torch::Tensor& Out,
+-          torch::Tensor& softmax_lse,
++	  torch::Tensor& softmax_lse,
++	  torch::Tensor& max_logits,
+     const torch::Tensor& dmask,
+     float        softmax_scale,
+     bool         is_causal,
+@@ -272,8 +288,9 @@ void launcher_flash_attention_forward(
+     const __half* k_ptr     = reinterpret_cast<const __half*>(K.data_ptr());
+     const __half* v_ptr     = reinterpret_cast<const __half*>(V.data_ptr());
+           __half* out_ptr   = reinterpret_cast<__half*>(Out.data_ptr());
+-           float* lse_ptr   = softmax_lse.data_ptr<float>();
+-          __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
++	       float* lse_ptr   = softmax_lse.data_ptr<float>();
++	       float* max_logits_ptr = max_logits.numel() > 0 ? max_logits.data_ptr<float>() : nullptr;
++	      __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
+ 
+     dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+     [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+@@ -287,7 +304,7 @@ void launcher_flash_attention_forward(
+         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+ 
+         kernel<<<grid, block, smem, stream>>>(
+-            q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr,
++	            q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr, max_logits_ptr,
+             B, H_Q, H_K, M, N,
+             softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
+             p_dropout, dropout_seed, dropout_offset
+@@ -311,7 +328,8 @@ std::vector<at::Tensor> flash_attention_forward(
+     int          window_right,
+     const float  softcap,
+     const bool   return_softmax,
+-    std::optional<at::Generator> gen
++    std::optional<at::Generator> gen,
++    const bool   return_max_logits
+ ) {
+     // Device guard for multi-GPU / pipeline-parallelism
+     at::cuda::CUDAGuard device_guard{q.device()};
+@@ -388,6 +406,10 @@ std::vector<at::Tensor> flash_attention_forward(
+     // output tensors
+     at::Tensor out_fp16 = out.has_value() ? out.value() : torch::empty_like(q);
+     auto softmax_lse = torch::empty({B, H_Q, M}, torch::dtype(torch::kFloat32).device(q.device()));
++    auto max_logits = return_max_logits ? torch::empty({H_Q}, torch::dtype(torch::kFloat32).device(q.device())) : torch::empty({0}, torch::dtype(torch::kFloat32).device(q.device()));
++    if (return_max_logits) {
++        max_logits.fill_(-std::numeric_limits<float>::infinity());
++    }
+ 
+     TORCH_CHECK(out_fp16.dtype() == q_dtype, "out must have the same dtype as q");
+     TORCH_CHECK(out_fp16.is_cuda(), "out must be on CUDA");
+@@ -409,14 +431,14 @@ std::vector<at::Tensor> flash_attention_forward(
+     if (N == 0) {
+         out_fp16.zero_();
+         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+-        return {out_fp16, softmax_lse, dmask, rng_state};
++        return {out_fp16, softmax_lse, dmask, rng_state, max_logits};
+     }
+ 
+     // run kernel
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+     #define LAUNCH_KERNEL(DIM) \
+-        launcher_flash_attention_forward<DIM>(q, k, v, out_fp16, softmax_lse, dmask, softmax_scale, is_causal, \
++        launcher_flash_attention_forward<DIM>(q, k, v, out_fp16, softmax_lse, max_logits, dmask, softmax_scale, is_causal, \
+                                         softcap, p_dropout, alibi_ptr, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
+     switch (D) {
+         case 16:  LAUNCH_KERNEL(16);  break;
+@@ -428,5 +450,8 @@ std::vector<at::Tensor> flash_attention_forward(
+     }
+     #undef LAUNCH_KERNEL
+ 
+-    return {out_fp16, softmax_lse, dmask, rng_state};
++    if (return_max_logits) {
++        max_logits.masked_fill_(max_logits == -std::numeric_limits<float>::infinity(), 0.0);
++    }
++    return {out_fp16, softmax_lse, dmask, rng_state, max_logits};
+ }
+diff --git a/kernel/fused_mha_forward_varlen.cu b/kernel/fused_mha_forward_varlen.cu
+index 7d93261..dd08016 100644
+--- a/kernel/fused_mha_forward_varlen.cu
++++ b/kernel/fused_mha_forward_varlen.cu
+@@ -19,6 +19,17 @@
+ #include "mat_mul.h"
+ #include "softmax.h"
+ 
++__device__ __forceinline__ void atomic_max_float(float* addr, float value) {
++    if (!isfinite(value)) return;
++    int* addr_as_i = reinterpret_cast<int*>(addr);
++    int old = *addr_as_i;
++    while (value > __int_as_float(old)) {
++        const int assumed = old;
++        old = atomicCAS(addr_as_i, assumed, __float_as_int(value));
++        if (old == assumed) break;
++    }
++}
++
+ // ======================================================================================
+ // FORWARD VARLEN KERNEL
+ // ======================================================================================
+@@ -29,8 +40,9 @@ flash_attention_forward_varlen_kernel(
+     const __half* __restrict__ K,
+     const __half* __restrict__ V,
+           __half* __restrict__ Out,
+-           float* __restrict__ softmax_lse,
+-          __half* __restrict__ dmask,
++	   float* __restrict__ softmax_lse,
++	  __half* __restrict__ dmask,
++	   float* __restrict__ max_logits,
+     const    int* __restrict__ cu_seqlens_q,
+     const    int* __restrict__ cu_seqlens_k,
+     const    int* __restrict__ seqused_k,
+@@ -268,10 +280,13 @@ flash_attention_forward_varlen_kernel(
+       nullptr, nullptr,
+       sRowSum, H_Q * D, block.valid_q_rows, tid);
+ 
+-    if (tid < block.valid_q_rows) {
+-        const float sum = fmaxf(sRowSum[tid], 1e-24f);
+-        softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
+-    }
++	if (tid < block.valid_q_rows) {
++	    const float sum = fmaxf(sRowSum[tid], 1e-24f);
++	    softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
++	    if (max_logits != nullptr) {
++	        atomic_max_float(max_logits + block.head_idx, sRowMax[tid]);
++	    }
++	}
+ }
+ 
+ // ======================================================================================
+@@ -283,7 +298,8 @@ void launcher_flash_attention_forward_varlen(
+     const torch::Tensor& K,
+     const torch::Tensor& V,
+           torch::Tensor& Out,
+-          torch::Tensor& softmax_lse,
++	  torch::Tensor& softmax_lse,
++	  torch::Tensor& max_logits,
+     const torch::Tensor& dmask,
+     const torch::Tensor& cu_seqlens_q,
+     const torch::Tensor& cu_seqlens_k,
+@@ -333,8 +349,9 @@ void launcher_flash_attention_forward_varlen(
+     const __half* k_ptr            = reinterpret_cast<const __half*>(K.data_ptr());
+     const __half* v_ptr            = reinterpret_cast<const __half*>(V.data_ptr());
+           __half* out_ptr          = reinterpret_cast<__half*>(Out.data_ptr());
+-           float* lse_ptr          = softmax_lse.data_ptr<float>();
+-          __half* dmask_ptr        = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
++	       float* lse_ptr          = softmax_lse.data_ptr<float>();
++	       float* max_logits_ptr   = max_logits.numel() > 0 ? max_logits.data_ptr<float>() : nullptr;
++	      __half* dmask_ptr        = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
+     const int*    cu_seqlens_q_ptr = cu_seqlens_q.data_ptr<int>();
+     const int*    cu_seqlens_k_ptr = cu_seqlens_k.data_ptr<int>();
+     const int*    seqused_k_ptr    = seqused_k.defined() ? seqused_k.data_ptr<int>() : nullptr;
+@@ -354,7 +371,7 @@ void launcher_flash_attention_forward_varlen(
+         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+ 
+         kernel<<<grid, block, smem, stream>>>(
+-            q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr,
++	            q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr, max_logits_ptr,
+             cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+             seqused_k_ptr, leftpad_k_ptr, block_table_ptr,
+             B, H_Q, H_K, T_Q, max_seqlen_q, max_seqlen_k,
+@@ -390,7 +407,8 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     const float  softcap,
+     const bool   return_softmax,
+     std::optional<at::Generator> gen,
+-    int          num_splits = 0
++    int          num_splits = 0,
++    const bool   return_max_logits = false
+ ) {
+     // Device guard for multi-GPU / pipeline-parallelism
+     at::cuda::CUDAGuard device_guard{q.device()};
+@@ -517,6 +535,10 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     // output tensors
+     at::Tensor out_fp16 = out.has_value() ? out.value() : torch::empty_like(q);
+     auto softmax_lse = torch::empty({H_Q, T_Q}, torch::dtype(torch::kFloat32).device(q.device()));
++    auto max_logits = return_max_logits ? torch::empty({H_Q}, torch::dtype(torch::kFloat32).device(q.device())) : torch::empty({0}, torch::dtype(torch::kFloat32).device(q.device()));
++    if (return_max_logits) {
++        max_logits.fill_(-std::numeric_limits<float>::infinity());
++    }
+ 
+     TORCH_CHECK(out_fp16.dtype() == q_dtype, "out must have the same dtype as q");
+     TORCH_CHECK(out_fp16.is_cuda(), "out must be on CUDA");
+@@ -542,14 +564,14 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     }
+ 
+     if (T_Q == 0 || max_seqlen_k == 0) {
+-        return {out_fp16, softmax_lse, dmask, rng_state};
++        return {out_fp16, softmax_lse, dmask, rng_state, max_logits};
+     }
+ 
+     // run kernel
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+     #define LAUNCH_KERNEL(DIM) \
+-        launcher_flash_attention_forward_varlen<DIM>(q, k, v, out_fp16, softmax_lse, dmask, cu_seqlens_q, cu_seqlens_k, seqused_tensor, leftpad_tensor, \
++        launcher_flash_attention_forward_varlen<DIM>(q, k, v, out_fp16, softmax_lse, max_logits, dmask, cu_seqlens_q, cu_seqlens_k, seqused_tensor, leftpad_tensor, \
+                                                      block_table_tensor, paged_KV, T_Q, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, softcap, p_dropout, \
+                                                      alibi_ptr, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
+     switch (D) {
+@@ -562,5 +584,8 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     }
+     #undef LAUNCH_KERNEL
+ 
+-    return {out_fp16, softmax_lse, dmask, rng_state};
++    if (return_max_logits) {
++        max_logits.masked_fill_(max_logits == -std::numeric_limits<float>::infinity(), 0.0);
++    }
++    return {out_fp16, softmax_lse, dmask, rng_state, max_logits};
+ }

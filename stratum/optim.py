@@ -2,10 +2,10 @@
 
 Ported from RoundPipe's PerDeviceOptimizer + RoundPipeBase optimizer methods.
 
-Two modes:
-  - **Synchronous** (default): AdamW on GPU, same as before. Optimizer state
+Placement modes:
+  - **Synchronous** (default): optimizer state
     lives on the same device as the trainable parameters.
-  - **CPU-offloaded** (``--cpu-offload-optim``): AdamW operates on fp32 CPU
+  - **CPU-offloaded** (``--cpu-offload-optim``): optimizer operates on fp32 CPU
     copies of trainable parameters. The GPU only holds fp16 forward params;
     gradients are moved to the CPU optimizer copies before each step, and
     updated params are copied back. Frees ~2× trainable-param GPU memory.
@@ -20,6 +20,13 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from stratum.attribute import ParamAttribute
+from stratum.muon import MuonAdamW
+from stratum.qk_clip import (
+    QK_CLIP_ENABLED_ATTR,
+    QK_CLIP_STAT_MODE_ATTR,
+    QK_CLIP_STAT_MODES,
+    apply_qk_clip_to_modules,
+)
 from stratum._threads import AnnotatedEvent
 from stratum.optim_stream import (
     launch_optim_kernel,
@@ -29,8 +36,41 @@ from stratum.optim_stream import (
 from stratum.utils import log_event
 
 
+_QK_PARAM_NAME_MARKERS = (
+    "q_proj",
+    "k_proj",
+    "query",
+    "key",
+    "query_key_value",
+    "in_proj_qkv",
+    "qkv",
+)
+
+_FUSED_QKV_MODULE_ATTRS = ("query_key_value", "qkv", "in_proj_qkv", "c_attn")
+
+
+def _is_qk_or_fused_qkv_param_name(name: str) -> bool:
+    parts = name.lower().split(".")
+    return any(
+        part == marker or marker in part
+        for part in parts
+        for marker in _QK_PARAM_NAME_MARKERS
+    )
+
+
+def _empty_qk_clip_stats() -> dict[str, int | float]:
+    return {
+        "layers": 0,
+        "heads": 0,
+        "max_s": 0.0,
+        "min_gamma": 1.0,
+        "exact_layers": 0,
+        "bound_layers": 0,
+    }
+
+
 class PerDeviceOptimizer:
-    """Manages one AdamW optimiser per device for local LoRA parameters.
+    """Manages one optimiser per device for local LoRA parameters.
 
     LR schedulers are synchronised across devices so all optimisers see the
     same LR at the same step.
@@ -43,6 +83,16 @@ class PerDeviceOptimizer:
         scheduler: LR scheduler type.
         warmup_steps: Warmup steps for cosine_with_warmup scheduler.
         total_steps: Total training steps.
+        optimizer: Optimizer algorithm. ``adamw`` preserves the legacy path;
+            ``muon`` uses Muon for ndim >= 2 tensors and AdamW fallback
+            otherwise. ``muonclip`` is the production Muon path: Muon plus
+            QK-Clip for attention Q/K projections.
+        muon_qk_mode: ``clip`` uses Muon on Q/K and applies post-step QK-Clip.
+            ``adamw`` keeps Q/K and fused-QKV attention parameters on AdamW.
+            ``muon`` uses raw Muon on those tensors for experiments.
+        muon_qk_stat_mode: ``auto`` uses patched flash max logits when the
+            backend exposes them and falls back to norm bounds. ``bound`` always
+            uses norm bounds. ``exact_flash`` requires patched flash max logits.
         cpu_offload: If True, maintain fp32 CPU copies of trainable params
             and move gradients/updates between GPU and CPU. Saves GPU memory.
         optim_dtype: Data type for CPU optimizer copies (default fp32).
@@ -58,12 +108,37 @@ class PerDeviceOptimizer:
         warmup_steps: int = 500,
         total_steps: int = 25000,
         *,
+        optimizer: str = "adamw",
         cpu_offload: bool = False,
         optim_dtype: torch.dtype = torch.float32,
+        muon_momentum: float = 0.95,
+        muon_ns_steps: int = 5,
+        muon_update_scale: float = 0.2,
+        muon_qk_mode: str = "clip",
+        muon_qk_clip_threshold: float = 100.0,
+        muon_qk_stat_mode: str = "auto",
     ):
+        if optimizer not in {"adamw", "muon", "muonclip"}:
+            raise ValueError(f"unsupported optimizer: {optimizer}")
+        if optimizer == "muonclip":
+            optimizer = "muon"
+            muon_qk_mode = "clip"
+        if muon_qk_mode not in {"clip", "adamw", "muon"}:
+            raise ValueError(f"unsupported muon_qk_mode: {muon_qk_mode}")
+        if muon_qk_clip_threshold < 0:
+            raise ValueError(f"invalid muon_qk_clip_threshold: {muon_qk_clip_threshold}")
+        if muon_qk_stat_mode not in QK_CLIP_STAT_MODES:
+            raise ValueError(f"unsupported muon_qk_stat_mode: {muon_qk_stat_mode}")
+        self.optimizer_kind = optimizer
+        self.muon_qk_mode = muon_qk_mode
+        self.muon_qk_clip_threshold = muon_qk_clip_threshold
+        self.muon_qk_stat_mode = muon_qk_stat_mode
         self.cpu_offload = cpu_offload
         self.optim_dtype = optim_dtype
         self.modules_per_device = modules_per_device
+        self.muon_adamw_param_names: dict[int, list[str]] = {}
+        self.last_qk_clip_stats: dict[int, dict[str, int | float]] = {}
+        self._set_qk_clip_enabled(optimizer == "muon" and muon_qk_mode == "clip")
 
         self.optimizers: dict[int, torch.optim.Optimizer | None] = {}
         self.schedulers: dict[int, object] = {}
@@ -72,23 +147,38 @@ class PerDeviceOptimizer:
         self._last_step_was_skipped = False
 
         for device_id, modules in modules_per_device.items():
-            if cpu_offload:
-                # Create AdamW on CPU fp32 copies of trainable params.
-                # The GPU still holds fp16 forward params; we move grads
-                # to the CPU optim copies after backward.
-                optim_params = list(self._cpu_optim_params(modules))
-            else:
-                # Original behaviour: AdamW on GPU params directly.
-                optim_params = [
-                    p for m in modules for p in m.parameters() if p.requires_grad
-                ]
+            named_optim_params = list(
+                self._named_optim_params(modules, cpu_offload=cpu_offload)
+            )
+            optim_params = [p for _, p in named_optim_params]
 
             if not optim_params:
                 self.optimizers[device_id] = None
                 self.schedulers[device_id] = None
+                self.muon_adamw_param_names[device_id] = []
+                self.last_qk_clip_stats[device_id] = _empty_qk_clip_stats()
                 continue
 
-            opt = AdamW(optim_params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+            forced_adamw = [
+                (name, param)
+                for name, param in named_optim_params
+                if optimizer == "muon"
+                and muon_qk_mode == "adamw"
+                and _is_qk_or_fused_qkv_param_name(name)
+            ]
+            self.muon_adamw_param_names[device_id] = [name for name, _ in forced_adamw]
+            self.last_qk_clip_stats[device_id] = _empty_qk_clip_stats()
+
+            opt = self._make_optimizer(
+                optim_params,
+                lr=lr,
+                weight_decay=weight_decay,
+                optimizer=optimizer,
+                muon_momentum=muon_momentum,
+                muon_ns_steps=muon_ns_steps,
+                muon_update_scale=muon_update_scale,
+                adamw_param_ids={id(param) for _, param in forced_adamw},
+            )
             self.optimizers[device_id] = opt
 
             if scheduler == "constant" or total_steps <= 0:
@@ -113,7 +203,59 @@ class PerDeviceOptimizer:
             else:
                 self.schedulers[device_id] = None
 
+    @staticmethod
+    def _make_optimizer(
+        params: list[torch.nn.Parameter],
+        *,
+        lr: float,
+        weight_decay: float,
+        optimizer: str,
+        muon_momentum: float,
+        muon_ns_steps: int,
+        muon_update_scale: float,
+        adamw_param_ids: set[int] | None = None,
+    ) -> torch.optim.Optimizer:
+        if optimizer == "adamw":
+            return AdamW(params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+        return MuonAdamW(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.95),
+            muon_momentum=muon_momentum,
+            muon_ns_steps=muon_ns_steps,
+            muon_update_scale=muon_update_scale,
+            adamw_param_ids=adamw_param_ids,
+        )
+
     # ---- CPU-offloaded param management ----
+
+    def _named_optim_params(
+        self,
+        modules: list[torch.nn.Module],
+        *,
+        cpu_offload: bool,
+    ) -> Iterator[tuple[str, torch.nn.Parameter]]:
+        """Yield unique trainable optimizer parameters with their module names."""
+        visited: set[int] = set()
+        for module_index, m in enumerate(modules):
+            for name, p in m.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if id(p) in visited:
+                    continue
+                visited.add(id(p))
+                full_name = f"module{module_index}.{name}"
+                if not cpu_offload:
+                    yield full_name, p
+                    continue
+                attr = ParamAttribute.ensure(p)
+                if attr.optim is None:
+                    attr.optim = torch.nn.Parameter(
+                        p.detach().to(dtype=self.optim_dtype, device="cpu", copy=True),
+                        requires_grad=True,
+                    )
+                yield full_name, attr.optim
 
     def _cpu_optim_params(self, modules: list[torch.nn.Module]) -> Iterator[torch.nn.Parameter]:
         """Yield lazy-created fp32 CPU copies of trainable params.
@@ -121,21 +263,8 @@ class PerDeviceOptimizer:
         Ported from RoundPipeBase.optim_named_parameters(). Each trainable
         parameter gets a ParamAttribute with an fp32 CPU copy on first access.
         """
-        visited: set[int] = set()
-        for m in modules:
-            for p in m.parameters():
-                if not p.requires_grad:
-                    continue
-                if id(p) in visited:
-                    continue
-                visited.add(id(p))
-                attr = ParamAttribute.ensure(p)
-                if attr.optim is None:
-                    attr.optim = torch.nn.Parameter(
-                        p.detach().to(dtype=self.optim_dtype, device="cpu", copy=True),
-                        requires_grad=True,
-                    )
-                yield attr.optim
+        for _, param in self._named_optim_params(modules, cpu_offload=True):
+            yield param
 
     def ensure_optim_params(self) -> None:
         """Ensure all CPU optim copies exist (call after LoRA setup)."""
@@ -279,6 +408,30 @@ class PerDeviceOptimizer:
 
     # ---- Step ----
 
+    def _set_qk_clip_enabled(self, enabled: bool) -> None:
+        visited: set[int] = set()
+        for modules in self.modules_per_device.values():
+            for root in modules:
+                for module in root.modules():
+                    if id(module) in visited:
+                        continue
+                    visited.add(id(module))
+                    if (
+                        hasattr(module, "q_proj")
+                        and hasattr(module, "k_proj")
+                    ) or any(hasattr(module, attr) for attr in _FUSED_QKV_MODULE_ATTRS):
+                        setattr(module, QK_CLIP_ENABLED_ATTR, enabled)
+                        setattr(module, QK_CLIP_STAT_MODE_ATTR, self.muon_qk_stat_mode)
+
+    def _apply_qk_clip(self, device_id: int) -> None:
+        if self.optimizer_kind != "muon" or self.muon_qk_mode != "clip":
+            return
+        self.last_qk_clip_stats[device_id] = apply_qk_clip_to_modules(
+            self.modules_per_device.get(device_id, []),
+            threshold=self.muon_qk_clip_threshold,
+            cpu_offload=self.cpu_offload,
+        )
+
     def step(self, *, async_step: bool = False,
              scaler: Any = None) -> None:
         """Run optimizer step on all devices.
@@ -300,15 +453,19 @@ class PerDeviceOptimizer:
             self._step_cpu_offload(async_step=async_step, scaler=scaler)
         else:
             # Synchronous original path
-            for opt in self.optimizers.values():
+            for device_id, opt in self.optimizers.items():
                 if opt is not None:
                     if scaler is not None:
                         scaler.step(opt)
-                        self._last_step_was_skipped |= _scaler_step_was_skipped(
+                        skipped = _scaler_step_was_skipped(
                             scaler, opt
                         )
+                        self._last_step_was_skipped |= skipped
+                        if not skipped:
+                            self._apply_qk_clip(device_id)
                     else:
                         opt.step()
+                        self._apply_qk_clip(device_id)
 
     def _step_cpu_offload(self, *, async_step: bool = False,
                           scaler: Any = None) -> None:
@@ -323,14 +480,18 @@ class PerDeviceOptimizer:
         for device_id, opt in self.optimizers.items():
             if opt is not None:
 
-                def _step_one(opt=opt) -> None:
+                def _step_one(device_id=device_id, opt=opt) -> None:
                     if scaler is not None:
                         scaler.step(opt)
-                        self._last_step_was_skipped |= _scaler_step_was_skipped(
+                        skipped = _scaler_step_was_skipped(
                             scaler, opt
                         )
+                        self._last_step_was_skipped |= skipped
+                        if not skipped:
+                            self._apply_qk_clip(device_id)
                     else:
                         opt.step()
+                        self._apply_qk_clip(device_id)
 
                 launch_optim_kernel(_step_one)
 

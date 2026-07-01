@@ -374,6 +374,34 @@ RSS stayed at `6.48 GiB` after pipeline build / `7.13 GiB` after dataloader
 construction, and the 1-step training run again completed with finite loss
 `11.8045`.
 
+**Defaults validation smokes passed 2026-07-01** (all 8 flags now on by default — no explicit flags required):
+
+| Smoke | Steps | Result |
+|---|---|---|
+| Standard 5-step (packing + low-RSS + prefetch + adapt-plan + GradScaler + async optim, no feature flags) | 5 | Finite loss, per-layer plan adapted at step 2 (2 coarse groups → 24 per-layer groups), packed `hidden_shape=[4095, 2048]`, meta-device skeleton init, RSS 9.86 GiB, host-staged transfers both directions |
+| Packing smoke (explicit `--output-router-logits --router-aux-loss-coef 0.02`) | 3 | `flash_attn_varlen_func` dispatched, finite loss, packed hidden_shape, MoE packed-mode working, boundary transfers both directions |
+| Low-RSS NF4 smoke (warm cache) | 3 | `nf4: all payloads loaded from cache`, RSS ~10 GiB, meta-device skeleton init, all cache hits, finite loss |
+
+Two latent bugs were found and fixed during the defaults validation:
+
+1. **`Lfm2MoeSparseMoeBlock` 2D packing fix** (`stratum/moe.py`): `SparseMoeBlock.forward` does `batch, seq, hidden = hidden_states.shape`, which fails with 2D packed input. Previously only patched when `--output-router-logits` was set (via `patch_moe_block_for_router_logits`). Fix: `patch_moe_block_for_packing()` is now called unconditionally whenever packing is active, regardless of router logit capture. `_collect_moe_block_types()` extracted as shared helper; `patch_moe_block_for_router_logits` wraps existing packed forward rather than double-patching.
+
+2. **`NF4Prefetch.finalize()` param assignment fix** (`stratum/upload.py`): Low-RSS meta-device init + `@use_experts_implementation` on `Lfm2MoeExperts` creates custom `nn.Parameter` subclasses that reject direct `.data =` assignment with `RuntimeError: Attempted to call variable.set_data(tensor), but variable and tensor have incompatible tensor type`. `ensure_weights()` already used `_replace_param_data()` with owner/pname fallback; `finalize()` now does too. `_PrefetchEntry` carries `owner` and `pname`; `prefetch_weights()` populates them via `_build_param_owner_map()`.
+
+**MuonClip validation passed 2026-07-01**:
+
+| Smoke | Steps | Result |
+|---|---|---|
+| Production threshold (`--optimizer muonclip --muon-qk-clip-threshold 100.0`) | 3 | Finite losses `11.5037`, `11.3189`, `11.3709`; exact QK logit stats collected on 6 flash-attention layers; max observed logit `22.7738`, so no clipping was expected |
+| Forced clipping (`--optimizer muonclip --muon-qk-clip-threshold 1.0`) | 2 | Finite losses `11.5037`, `11.3186`; exact QK logit stats collected on 6 layers; clipping applied to 192 heads with `min_gamma=0.044205` |
+
+Both smokes used the real Docker training path on the reference heterogeneous
+RTX 3080 + V100 host: LFM2.5, batch 2 / 2 microbatches, 8192 context,
+`--tensor-split 9 32`, low-RSS NF4 cache hits, packing, CPU-offloaded async
+optimizer, GradScaler, router aux loss, host-staged transfers, and `--no-save`.
+This proves both the stable production path and the active clamp path in the
+full training loop.
+
 Qwen3.5 status as of 2026-06-26:
 
 | Item | Result |
@@ -441,8 +469,12 @@ The codebase has moved ahead of this document in several areas after the
 | LFM25 `Lfm25FlashAttention` | Uses the same `_FlashBackend` pattern as Qwen35; CUDA flash backend absence or kernel failure is fatal, not a silent eager fallback. |
 | **Forward-path per-group weight freeing** | `free_weights(group_module)` is called immediately after each scheduler group's `_run_stage_group` returns in the forward loop. This changes peak GPU weight memory from O(all groups' FP16) to O(one group's FP16). LoRA params (no `NF4_ATTR`/`FP16_ATTR`) are skipped. The backward `_free_stage_group` hook still fires but `free_weights` returns 0 (already empty) while scheduler notification and timing still fire normally. CUDA memory is safe: the caching allocator defers GPU memory reuse until in-flight stream work completes. |
 | **Cross-group backward look-ahead prefetch** | `_AnchorMeta.look_ahead_upload` field added to `stratum/runtime.py`. At the very start of `_ExplicitGroupBackward.backward()` for group k, `look_ahead_upload()` fires before recompute begins, pre-uploading group k-1's first layer on the `param_upstream` stream. The fence is stored in `pipeline._pending_bwd_fences` and consumed by `_run_group`'s `first_layer_fence` argument. `_start_bwd_look_ahead` mirrors `_upload_first_layer_with_fence`. For group 0 the callback is None. With per-group forward freeing active this provides real overlap; without it the ensure_weights call is a no-op fence (weights already on GPU). |
+| **8 flags flipped to opt-out defaults (2026-07-01)** | `--packing`, `--low-rss-nf4-build`, `--prefetch-nf4`, `--longest-first`, `--cpu-offload-optim`, `--async-optimizer-step`, `--grad-scaler-enabled` are now ON by default; opt out with `--no-packing`, `--no-low-rss-nf4-build`, `--no-prefetch-nf4`, `--no-longest-first`, `--no-cpu-offload-optim`, `--no-async-optimizer-step`, `--no-grad-scaler`. `--adapt-plan-every` default changed from 0 (disabled) to 2. A local variable block in `train.py` translates `args.no_*` → booleans used throughout the file. `async_optimizer_step` is silently disabled when `cpu_offload_optim` is off rather than raising. |
+| **`patch_moe_block_for_packing` always applied (2026-07-01)** | `Lfm2MoeSparseMoeBlock` unpacks `batch, seq, hidden = hidden_states.shape`, which fails with 2D packed input. Previously the packing unsqueeze/squeeze wrapper was only applied when `--output-router-logits` was set (through `patch_moe_block_for_router_logits`). Now `patch_moe_block_for_packing` is called unconditionally alongside `_patch_lfm25_short_conv_for_packing` whenever packing is active. `_collect_moe_block_types()` extracted as a shared helper; `patch_moe_block_for_router_logits` detects already-packing-patched blocks and wraps the existing forward rather than double-patching. |
+| **`NF4Prefetch.finalize()` uses `_replace_param_data` (2026-07-01)** | Low-RSS NF4 build via meta-device init + `@use_experts_implementation` on `Lfm2MoeExperts` results in custom `nn.Parameter` subclasses that reject direct `.data =` assignment. `ensure_weights()` already used `_replace_param_data()` with owner/pname fallback (re-registers parameter) but `finalize()` did not. Fixed: `_PrefetchEntry` now carries `owner` and `pname`; `prefetch_weights()` populates them from `_build_param_owner_map()`; `finalize()` calls `_replace_param_data()` through the same path as `ensure_weights()`. |
+| **Training data symlink** | `/home/harri/stratum/data` symlinked to `/home/harri/qz-roundpipe/data` so `scripts/run-unified.sh` can mount `$repo_root/data` as `/workspace/data` inside the container without a separate volume flag. |
 
-### Parity status (updated 2026-06-27)
+### Parity status (updated 2026-07-01)
 
 Stratum has reached practical full-feature parity with qz-roundpipe on the
 reference no-P2P RTX 3080 + V100 machine. Every RoundPipe mechanism that is
@@ -476,8 +508,8 @@ adapted. The table below is the complete parity ledger.
 | Qwen3-MoE adapter | `roundpipe/models/qwen3_moe.py` | **Done** — `stratum/model/qwen3_moe.py`; Qwen3-30B-A3B smoke passed |
 | Non-NF4 layer-copy path | `roundpipe/transfer.py` | **Done** — `prepare_fp16_staged` / `copy_tensor_chunked` lifecycle; `snapshot_module_buffers` / `restore_module_buffers` fixes mutable-buffer recompute corruption |
 | Pytree batch API | `roundpipe/batch.py` | **Done** — `guess_split_spec` / `split_pytree` / `merge_pytree` / `TokenWeightedReducer`; `--pytree-batch` flag in `train.py` |
-| Sample packing | `roundpipe/batch.py` | **Done** — `pack_samples` / `pack_collate` / `split_packed_batch` in `stratum/packing.py`; `--packing` flag; flash_attn_varlen_func dispatch on LFM25 and Qwen35; LFM2.5 packing smoke passed 2026-06-27 (batch 2 / 2 microbatch / 8192 ctx, finite loss 7.883, 791 trainable tokens, host-staged boundary transfers, ShortConv seq_idx boundary reset, MoE packed-mode wrapper) |
-| Host RAM management | — | **Done for LFM2.5 / partial for Qwen35 depth** — `release_cached_memory()` frees cached FP16 pages after NF4 prep (measurable: 11+ GiB RSS drop on the normal path); `--low-rss-nf4-build` builds the HF skeleton on meta and streams checkpoint tensors during NF4 preparation. LFM2.5 low-RSS NF4 Docker smoke passed on 2026-06-27; Qwen35 low-RSS depth is still future validation |
+| Sample packing | `roundpipe/batch.py` | **Done** — `pack_samples` / `pack_collate` / `split_packed_batch` in `stratum/packing.py`; **ON by default** (`--no-packing` to disable); flash_attn_varlen_func dispatch on LFM25 and Qwen35; LFM2.5 packing smoke passed 2026-06-27 (batch 2 / 2 microbatch / 8192 ctx, finite loss 7.883, 791 trainable tokens, host-staged boundary transfers, ShortConv seq_idx boundary reset, MoE packed-mode wrapper); confirmed re-validated as default 2026-07-01 |
+| Host RAM management | — | **Done for LFM2.5 / partial for Qwen35 depth** — `release_cached_memory()` frees cached FP16 pages after NF4 prep (measurable: 11+ GiB RSS drop on the normal path); low-RSS NF4 build **ON by default** (`--no-low-rss-nf4-build` to disable): builds the HF skeleton on meta and streams checkpoint tensors during NF4 preparation; host RSS ~10 GiB vs ~26 GiB full-load path. LFM2.5 low-RSS NF4 Docker smoke passed on 2026-06-27; Qwen35 low-RSS depth is still future validation |
 | GPT-OSS adapter | `roundpipe/models/gpt_oss.py` | **Skipped** — no public HF model available |
 
 **What is not yet done (in priority order):**
@@ -504,11 +536,12 @@ adapted. The table below is the complete parity ledger.
    Not a RoundPipe parity item.
 
 5. **Qwen35 packed training container smoke** — LFM2.5 packing is validated
-   end-to-end; Qwen35 packed training has not yet been run on the reference
-   heterogeneous hardware.
+   end-to-end (smoke 2026-06-27; confirmed as default 2026-07-01); Qwen35
+   packed training has not yet been run on the reference heterogeneous hardware.
 
-6. **Qwen35 low-RSS NF4 build** — `--low-rss-nf4-build` is validated on
-   LFM2.5; Qwen35 equivalent smoke is future validation work.
+6. **Qwen35 low-RSS NF4 build** — low-RSS NF4 is validated on LFM2.5
+   (smoke 2026-06-27; confirmed as default 2026-07-01); Qwen35 equivalent
+   smoke is future validation work.
 
 ## RoundPipe Comparison — Ported, Adapted, Still Missing
 
@@ -955,17 +988,17 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 |---|---|---|
 | `--num-microbatch` | 1 | Split batch into N microbatches (gradient accumulation) |
 | `--pytree-batch` | False | Use pytree-based batch splitting for arbitrary input shapes |
-| `--packing` | False | Sample packing: concatenate variable-length samples into 1D sequences with per-segment position IDs, eliminating wasted compute on padding tokens |
+| `--no-packing` | False | Disable sample packing (packing is ON by default: concatenate variable-length samples into 1D sequences with per-segment position IDs, eliminating wasted compute on padding tokens) |
 | `--checkpoint-decoder-layer` | True | Activation checkpointing per decoder layer |
 | `--no-nf4` | False | Disable NF4 frozen weight compression (FP16 direct upload) |
 | `--nf4-scope` | `all` | NF4 prep scope: `all` includes prefix/stages/postfix; `layers` matches qz-roundpipe layers-only prep for large Qwen embedding/head tensors |
-| `--low-rss-nf4-build` | False | Build the HF module skeleton on meta and stream checkpoint tensors during NF4 preparation instead of loading the full FP16 model into host RAM |
+| `--no-low-rss-nf4-build` | False | Disable low-RSS NF4 build (low-RSS is ON by default: build the HF skeleton on meta and stream checkpoint tensors during NF4 preparation instead of loading the full FP16 model into host RAM) |
 | `--nf4-min-numel` | 4096 | Minimum frozen 2D parameter elements to NF4-quantize |
 | `--nf4-layer-size-floor-gib` | 0.0 | qz-roundpipe-style scheduler hint: floor each layer's estimated stage-planning size |
 | `--nf4-cache-dir` | `/workspace/cache/nf4-frozen` | Directory to cache NF4 payloads; a model-id subdirectory is added automatically |
 | `--pin-model` | `alloc` | CPU pinning: alloc (pin_memory), register (cudaHostRegister), off |
 | `--stratum-stage-memory-limit-gib` | 0.0 | Split per-device layer groups into smaller upload/free stages |
-| `--prefetch-nf4` | False | Experimental side-stream NF4 payload prefetch for the next stage/postfix |
+| `--no-prefetch-nf4` | False | Disable NF4 payload prefetch (prefetch is ON by default: side-stream H2D copy of the next stage's NF4 payloads before they are needed) |
 | `--recompute-grain` | `layer` | `layer` keeps per-layer checkpointing; `none` disables decoder-layer recompute |
 | `--checkpoint-mlp` | False | Wrap MLP in activation checkpointing |
 | `--mlp-token-chunk-size` | 0 | Split MLP forward into token chunks (0 = disabled) |
@@ -989,10 +1022,21 @@ model = PeftModel.from_pretrained(base_model, "./checkpoint-5000")
 ### Data loading
 | Flag | Default | Description |
 |---|---|---|
-| `--longest-first` | False | Sort dataset by seq_len descending |
+| `--no-longest-first` | False | Disable longest-first sort (longest-first is ON by default: sort dataset by seq_len descending for optimal sample packing) |
 | `--pad-to-multiple` | 0 | Pad batch length to multiple of N; flash attention automatically raises 0 to 32 |
 | `--pad-to-length` | 0 | Pad batch to exact length N |
 | `--dense-attention-masks` | False | Force HF dense attention mask construction |
+
+### Optimizer
+| Flag | Default | Description |
+|---|---|---|
+| `--no-cpu-offload-optim` | False | Disable CPU-offloaded optimizer (offload is ON by default: AdamW moments on CPU, saving GPU VRAM) |
+| `--no-async-optimizer-step` | False | Disable async optimizer step (async is ON by default; requires `--no-cpu-offload-optim` off; optimizer step runs on background queue) |
+| `--no-grad-scaler` | False | Disable GradScaler (scaler is ON by default: FP16 loss scaling to prevent underflow during backward) |
+| `--adapt-plan-every` | 2 | Re-derive scheduler forward/backward group layout from per-layer CUDA event timing every N steps; 0 = disabled |
+| `--output-router-logits` | False | Capture MoE router logits for auxiliary load-balancing loss |
+| `--router-aux-loss-coef` | 0.02 | Scale factor for the router auxiliary loss |
+| `--save-optimizer-state` | False | Write Adam moments to `optimizer_state.safetensors` (large; opt-in for exact resume) |
 
 ### Telemetry and debugging
 | Flag | Default | Description |

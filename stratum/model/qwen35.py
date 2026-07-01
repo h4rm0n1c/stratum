@@ -31,6 +31,7 @@ from stratum.context import (
     get_recompute_data,
     save_for_recompute,
 )
+from stratum.qk_clip import flash_attention_with_qk_clip_stats, record_qk_clip_stats
 from stratum.moe import load_balancing_loss_func, patch_moe_block_for_router_logits, pop_router_logits
 
 
@@ -166,7 +167,18 @@ class Qwen35FlashAttention(Qwen3_5Attention):
                 )
                 if self.window_size is not None:
                     flash_kwargs["window_size"] = self.window_size
-                attn_output = varlen_backend.fn(query_states, key_states, value_states, **flash_kwargs)
+                attn_output = flash_attention_with_qk_clip_stats(
+                    self,
+                    varlen_backend.name,
+                    varlen_backend.fn,
+                    query_states,
+                    key_states,
+                    value_states,
+                    query_states=query_states,
+                    key_states=key_states,
+                    scaling=self.scaling,
+                    **flash_kwargs,
+                )
             except RuntimeError as exc:
                 raise RuntimeError(
                     f"{varlen_backend.name} failed for Qwen3.5 layer {self.layer_idx}; "
@@ -215,7 +227,18 @@ class Qwen35FlashAttention(Qwen3_5Attention):
                     flash_kwargs["window_size"] = self.window_size
                 # flash-attn consumes and returns (batch, seq, heads, head_dim),
                 # matching qz-roundpipe's Qwen3.5 patch contract.
-                attn_output = flash_backend.fn(q, k, v, **flash_kwargs)
+                attn_output = flash_attention_with_qk_clip_stats(
+                    self,
+                    flash_backend.name,
+                    flash_backend.fn,
+                    q,
+                    k,
+                    v,
+                    query_states=query_states,
+                    key_states=key_states,
+                    scaling=self.scaling,
+                    **flash_kwargs,
+                )
             except RuntimeError as exc:
                 raise RuntimeError(
                     f"{flash_backend.name} failed for Qwen3.5 layer {self.layer_idx}; "
@@ -229,6 +252,7 @@ class Qwen35FlashAttention(Qwen3_5Attention):
                     f"on {hidden_states.device}; not falling back to quadratic eager attention"
                 )
             from transformers.models.llama.modeling_llama import eager_attention_forward
+            record_qk_clip_stats(self, query_states, key_states, scaling=self.scaling)
             attn_output, _ = eager_attention_forward(
                 self, query_states, key_states, value_states,
                 attention_mask, dropout=0.0, scaling=self.scaling,

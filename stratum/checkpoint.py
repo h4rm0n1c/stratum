@@ -3,12 +3,12 @@
 Checkpoint format is LoRA/QLoRA-style and topology-portable:
   1. PEFT adapter files: adapter_model.safetensors + adapter_config.json.
   2. trainer_state.json for step metadata.
-  3. optimizer_state.safetensors (opt-in): Adam moments keyed by parameter
-     name, not by device — portable across GPU split changes.
+  3. optimizer_state.safetensors (opt-in): optimizer state keyed by
+     parameter name, not by device — portable across GPU split changes.
 
 optimizer_state.safetensors layout:
-  tensors: "{param_name}:exp_avg", "{param_name}:exp_avg_sq",
-           "{param_name}:step" — one entry per moment per LoRA param.
+  tensors: "{param_name}:{state_name}" — one entry per optimizer-state tensor
+           per LoRA param, e.g. AdamW moments or Muon momentum buffers.
   metadata["param_groups"]: JSON list of param_group dicts (lr, betas, etc.).
 """
 

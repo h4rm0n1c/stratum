@@ -53,7 +53,7 @@ Multi-GPU parity work must stay aligned with that contract:
 
 ---
 
-## Current Remaining Work — 2026-06-28 (updated)
+## Current Remaining Work — 2026-07-01 (updated)
 
 Stratum has reached practical full-feature parity with qz-roundpipe on the
 reference no-P2P RTX 3080 + V100 machine. Every RoundPipe mechanism that is
@@ -166,8 +166,8 @@ The remaining open items are a narrow tail:
     pipeline outputs across calls (lower priority, eval/debug paths covered).
 
 
-5. **[x] Sample packing** (updated 2026-06-27): `pack_samples`, `pack_collate`,
-    `split_packed_batch` in `stratum/packing.py`. `--packing` flag in `train.py`.
+5. **[x] Sample packing** (updated 2026-07-01): `pack_samples`, `pack_collate`,
+    `split_packed_batch` in `stratum/packing.py`. **ON by default** (`--no-packing` to opt out).
     Flash attention dispatches to `flash_attn_varlen_func` on LFM25 and Qwen35
     when the packed cu_seqlens metadata is present.
 
@@ -197,6 +197,11 @@ The remaining open items are a narrow tail:
       for packed mode (HF block unpacks `batch, seq, hidden = hidden_states.shape`).
     - 234 unit tests pass, 15 skipped.
 
+    **Bug fix 2026-07-01**: `patch_moe_block_for_packing()` is now called unconditionally
+    whenever packing is active (not only when `--output-router-logits` is set). Exposed
+    when packing became a default and `Lfm2MoeSparseMoeBlock.forward` unpacked
+    `batch, seq, hidden = hidden_states.shape` on 2D packed input.
+
     **LFM2.5 multi-sample packing container smoke passed 2026-06-27:**
     batch 2 / 2 microbatch / 8192 ctx, finite loss 7.883, 791 trainable tokens,
     host-staged boundary transfers both directions, ShortConv seq_idx boundary
@@ -205,15 +210,15 @@ The remaining open items are a narrow tail:
 
     Remaining: container smoke of multi-sample Qwen35 packed training.
 
-6. **[x] Host RAM management for LFM2.5** (added 2026-06-27): `release_cached_memory()` in
+6. **[x] Host RAM management for LFM2.5** (updated 2026-07-01 — now default): `release_cached_memory()` in
     `stratum/utils.py` calls `gc.collect()` + glibc `malloc_trim(0)` to return
     cached heap pages to the OS after `prepare_nf4()` frees the FP16 model
     weights. Measurable: RSS drops from ~33 GiB to ~21.7 GiB after pipeline
-    build (11+ GiB freed). `--low-rss-nf4-build` now builds the HF module
-    skeleton on meta, then `build_pipeline()` streams module tensors from the
-    HF safetensors checkpoint during NF4 preparation. Cached NF4 runs attach
-    precomputed payloads and stream only remaining non-NF4 tensors such as
-    norms/biases. Normal `train.py` remains the default full CPU FP16 path.
+    build (11+ GiB freed). Low-RSS NF4 build is **ON by default** (`--no-low-rss-nf4-build`
+    to disable): builds the HF skeleton on meta, then `build_pipeline()` streams
+    module tensors from the HF safetensors checkpoint during NF4 preparation.
+    Cached NF4 runs attach precomputed payloads and stream only remaining non-NF4
+    tensors such as norms/biases. Host RSS drops from ~26 GiB to ~10 GiB.
     2026-06-27 audit fixed the staged-load trim import, removed the hardcoded
     LFM checkpoint fallback/undefined variable, forwards `--nf4-min-numel` to
     cache loading, keeps the PEFT wrapper for checkpoint save/load, and
@@ -227,32 +232,52 @@ The remaining open items are a narrow tail:
     `nf4: all payloads loaded from cache`, completed pipeline build in
     `12.3s`, and produced the same finite loss without rebuilding NF4 payloads.
 
+    **Bug fix 2026-07-01**: `NF4Prefetch.finalize()` now uses `_replace_param_data()`
+    with owner/pname fallback for custom `nn.Parameter` subclasses (from meta-device
+    init + `@use_experts_implementation`). `_PrefetchEntry` carries `owner`/`pname`;
+    `prefetch_weights()` populates via `_build_param_owner_map()`. Exposed when
+    both low-RSS build and NF4 prefetch became defaults simultaneously.
+
 7. [~] **Validation depth** — unit coverage exists for the core ported
    infrastructure, but longer LFM2.5/Qwen35 runs, resume/save-load checks under
    CPU optimizer offload, and failure-mode tests remain useful. Added
    2026-06-27 host checks for packed-mode training token accounting and
    optimizer Adam moment round-trip without legacy `device_*.pt` state.
+   Added 2026-07-01 MuonClip real-run validation on the reference RTX 3080 +
+   V100 host: 3-step production-threshold smoke passed with finite losses and
+   exact QK logit stats on 6 flash-attention layers; 2-step forced-threshold
+   smoke clipped 192 heads (`min_gamma=0.044205`) while keeping loss finite.
 8. [A] **NUMA-aware host coordination** — this is a future Stratum-specific
    optimization, not a current RoundPipe parity blocker. See section 16a.
 
 ### Next handover slice
 
-Items 1–6 are complete for the LFM2.5 validation target. `set_layer_timer` is wired into `train.py`
-(`--adapt-plan-every N`). The pytree batch API (`guess_split_spec` /
-`split_pytree` / `merge_pytree` / `TokenWeightedReducer`) is ported and
-wired via `--pytree-batch`. Sample packing (`stratum/packing.py`,
-`--packing`) is implemented with flash_attn_varlen_func dispatch on
-LFM25 and Qwen35. Host RAM trimming (`release_cached_memory()`) frees
-11+ GiB of cached FP16 pages after normal pipeline build. The opt-in
-`--low-rss-nf4-build` path passed a real LFM2.5 Docker runtime smoke.
+Items 1–6 are complete for the LFM2.5 validation target (2026-07-01).
 
-Added 2026-06-28: per-group forward weight freeing (`free_weights` after each
-`_run_stage_group` in the forward loop) and cross-group backward look-ahead
-prefetch (`_AnchorMeta.look_ahead_upload`, `_start_bwd_look_ahead`,
-`_pending_bwd_fences`). Tests in `tests/test_bwd_prefetch.py`.
+**Defaults locked in (2026-07-01):** packing, low-RSS NF4 build, NF4 prefetch,
+longest-first sort, CPU-offloaded async optimizer, GradScaler, and adapt-plan-every 2
+are all ON by default. Two latent bugs fixed: `patch_moe_block_for_packing` called
+unconditionally; `NF4Prefetch.finalize()` uses `_replace_param_data()` with owner/pname.
+253 tests pass, 20 skipped. Defaults validated end-to-end with 3 container smokes.
 
-Next practical smokes: Qwen35 low-RSS NF4 build, Qwen35 packed training,
-and an opt-in optimizer-state resume.
+**MuonClip locked in (2026-07-01):** `--optimizer muonclip` is the stable Muon
+path with QK-Clip forced on attention Q/K parameters. Unit tests cover 2D,
+batched 3D, CPU-offload, async step, separate Q/K projections, and fused QKV
+row scaling. Docker smokes validated production threshold behavior and forced
+clipping behavior in the full LFM2.5 training loop.
+
+Next practical work:
+
+1. **Qwen35 packed training container smoke** — LFM2.5 packing is end-to-end
+   validated; Qwen35 has the wiring but needs a real heterogeneous hardware smoke.
+
+2. **Qwen35 low-RSS NF4 build** — same: wired, not yet smoked.
+
+3. **Opt-in optimizer-state resume** — save with `--save-optimizer-state`, confirm
+   the name-keyed safetensors round-trip on the reference hardware.
+
+4. **Auto-fit / profiling** (`scripts/profile.py`, `stratum/autofit.py`) — future
+   slice; not a RoundPipe parity blocker.
 
 ---
 
