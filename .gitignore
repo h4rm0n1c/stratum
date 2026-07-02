@@ -9,13 +9,11 @@ build/
 runs/
 out/
 cache/
+/data
 
 # Agent config (internal)
 .claude/
 CLAUDE.md
-
-# Documentation (separate from runtime)
-docs/
 
 # Environment / IDE
 .env

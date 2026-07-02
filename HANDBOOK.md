@@ -402,6 +402,81 @@ optimizer, GradScaler, router aux loss, host-staged transfers, and `--no-save`.
 This proves both the stable production path and the active clamp path in the
 full training loop.
 
+**48K Fable training knobs that worked 2026-07-02**:
+
+The long-context Stratum validation used the merged Fable 48K dataset:
+`/workspace/data/lfm25_fable_merged_48k_train.labels.jsonl`. The reference
+host was the same no-P2P heterogeneous pair: RTX 3080 10GB as `cuda:0` and
+V100 32GB as `cuda:1`.
+
+Keep these settings enabled for LFM2.5 long-context training:
+
+- Batch shape: `--batch-size 2 --num-microbatch 2`.
+- Optimizer: `--optimizer muonclip --muon-qk-clip-threshold 100.0`.
+- Memory path: packing, low-RSS NF4 build, NF4 prefetch, CPU-offloaded async
+  optimizer, GradScaler, `--pin-model alloc`, stage recompute, and host-offload
+  of stage inputs. These are defaults for the current LFM2.5 path unless
+  explicitly disabled.
+- Long-context pressure controls: `loss_token_chunk_size=2048`,
+  `postfix_loss_token_chunk_size=2048`, `mlp_token_chunk_size=2048`,
+  `memory_flat_frozen_mlp=true`, and `stratum_stage_memory_limit_gib=1.0`.
+  These are the settings that avoided the giant LM-head and frozen-MLP
+  activation allocations seen during 48K debugging.
+- Checkpointing: production runs should use `--save-every 200`. The saved
+  checkpoints are normal PEFT adapter checkpoints and stay small unless
+  `--save-optimizer-state` is requested.
+
+The tensor split is context-dependent. Do not blindly reuse `9 32` at 32K+:
+
+| Context | Split | Evidence | Result |
+|---|---:|---|---|
+| 2048 | `9 32` | `out/lfm25-batch2-smoke/training.jsonl` | 3 finite steps, final loss `11.4453`, GPU peaks ~2.60 / 2.83 GiB |
+| 4096 | `9 32` | `out/lfm25-batch2-4096-smoke/training.jsonl` | 3 finite steps, final loss `11.6797`, GPU peaks ~2.99 / 3.23 GiB |
+| 8192 | `9 32` | `out/lfm25-batch2-8192-smoke/training.jsonl` | 3 finite steps, final loss `11.7578`, GPU peaks ~3.88 / 4.29 GiB |
+| 16384 | `9 32` | `out/lfm25-batch2-16384-smoke/training.jsonl` | 3 finite steps, final loss `11.5312`, GPU peaks ~5.68 / 6.97 GiB |
+| 32768 | `6 36` | `out/lfm25-batch2-32768-split6-36-smoke/training.jsonl` | 3 finite steps, final loss `11.7891`, GPU peaks ~8.27 / 13.31 GiB |
+| 49152 | `1 41` | `out/lfm25-batch2-49152-split1-41-smoke/training.jsonl` | 3 finite steps, final loss `12.5859`, GPU peaks ~3.83 / 20.58 GiB |
+
+The 48K smoke command shape was:
+
+```bash
+STRATUM_DATA_DIR=/home/harri/qz-roundpipe/data \
+STRATUM_OUT_DIR=/home/harri/stratum/out \
+scripts/run-unified.sh timeout 900 python scripts/train.py \
+  --model lfm25-8b-a1b \
+  --data /workspace/data/lfm25_fable_merged_48k_train.labels.jsonl \
+  --out /workspace/out/lfm25-batch2-49152-split1-41-smoke \
+  --steps 3 \
+  --save-every 3 \
+  --no-save \
+  --batch-size 2 \
+  --num-microbatch 2 \
+  --tensor-split 1 41 \
+  --max-seq-len 49152 \
+  --longest-first \
+  --pin-model alloc \
+  --host-ram-limit-gib 80 \
+  --optimizer muonclip \
+  --muon-qk-clip-threshold 100.0
+```
+
+For a real run, remove the timeout/3-step cap, remove `--no-save`, set
+`--save-every 200`, and keep the V100-heavy `--tensor-split 1 41` at 48K.
+
+The partial MuonClip training run at 2048 context also worked beyond smoke
+depth: `out/lfm25-fable-muonclip-stage-2048/training.jsonl` reached at least
+step 518 and wrote adapter checkpoints at steps 200 and 400. It used MuonClip
+with QK-Clip, batch 1, stage recompute, CPU-offloaded optimizer, GradScaler,
+packing, and `pin_model=alloc`; QK-Clip was active in the logged steps. Treat
+this as optimizer/checkpoint evidence, not as 48K memory evidence.
+
+Important limit: the 32K/48K ladder proves that the long-context memory path,
+packing, chunked loss, memory-flat frozen MLP, host staging, and V100-heavy
+placement can execute finite train steps. It is not yet a 10k-step stability
+run. QK-Clip itself was proven in the 8K MuonClip validation and the 2048
+partial run; the 32K/48K smokes ran MuonClip but did not collect exact QK stats
+in their logged steps.
+
 Qwen3.5 status as of 2026-06-26:
 
 | Item | Result |
